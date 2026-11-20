@@ -1,0 +1,1 @@
+Package { name: "toml", version: "0.1.0", deps: [], source: Dep::git("https://github.com/nabi-lang/toml", rev: "19e671bdf028ce0015ccda90a8914f28bd45337c"), tree: "b4e1089cd1c0766382fbdc5c0e858eb2ad5cd44c", yanked: false, nabi_version: "0.1.0", official: true }

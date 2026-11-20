@@ -1,0 +1,1 @@
+Package { name: "interpolate", version: "0.1.0", deps: [{ name: "autodiff", req: "^0.1", kind: "normal" }, { name: "linalg", req: "^0.1", kind: "normal" }], source: Dep::git("https://github.com/nabi-lang/interpolate", rev: "50628f5aad333bae66f80a95dfabc3dc53d3363d"), tree: "2111a8ba1476c7bbd3c9fd1d5ee2f4b3944d2df6", yanked: false, nabi_version: "0.1.0", official: true }

@@ -1,0 +1,1168 @@
+// Index writes for the API: an entry checked as `nabi publish` checks it,
+// appended to its file (or its `yanked` flipped), committed and pushed.
+// The checkout first follows its upstream, so direct pushes by the
+// index maintainers are fine.
+
+use pkg::meta;
+use pkg::packages;
+use core::cmp::Ordering;
+use core::crypto::HashAlgorithm;
+use core::encoding::hex;
+use std::fs;
+use std::nabion;
+use std::nabion::Value;
+
+/// A refused request: HTTP status and message.
+pub struct ApiError {
+    pub status: i32;
+    pub msg: str;
+}
+
+impl Display for ApiError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.msg) }
+}
+
+impl Debug for ApiError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"ApiError({self.status}, {self.msg})") }
+}
+
+impl Error for ApiError {}
+
+pub fn err(status: i32, msg: str) -> ApiError { ApiError { status: status, msg: msg } }
+
+fn bad(msg: str) -> ApiError { err(400, msg) }
+
+/// One package up to case and `-` / `_`.
+pub fn key(name: str) -> str { name.to_lowercase().replace("-", "_") }
+
+fn check_name(name: str, what: str) throws (ApiError) {
+    if !packages::is_name(name) {
+        throw bad(f"`{name}` is not a valid {what} name: lowercase ASCII letters, digits, `-` and `_`, starting with a letter");
+    }
+}
+
+/// A version part: digits, no leading zero.
+fn is_num(s: str) -> bool {
+    if s.is_empty() || s.len() > 19 || (s.len() > 1 && s.starts_with("0")) { return false; }
+    for c in s.chars() {
+        if !c.is_ascii_digit() { return false; }
+    }
+    true
+}
+
+fn is_ident(s: str) -> bool {
+    if s.is_empty() { return false; }
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-') { return false; }
+    }
+    true
+}
+
+/// `x.y.z-pre+build`: the core, or none when the pre-release or build
+/// part is malformed.
+fn core_of(s: str) -> str | none {
+    let v = s;
+    if let p: (str, str) = v.split_once("+") {
+        for b in p.1.split(".") {
+            if !is_ident(b) { return none; }
+        }
+        v = p.0;
+    }
+    if let p: (str, str) = v.split_once("-") {
+        for b in p.1.split(".") {
+            if !is_ident(b) { return none; }
+        }
+        v = p.0;
+    }
+    v
+}
+
+/// `major.minor.patch[-pre][+build]`.
+pub fn is_version(s: str) -> bool {
+    let core = core_of(s.trim()) ?? "";
+    let parts: List<str> = List::new();
+    for p in core.split(".") { parts.push(p); }
+    parts.len() == 3 && is_num(parts[0]) && is_num(parts[1]) && is_num(parts[2])
+}
+
+/// One comparator of a requirement (`^1.2`, `>=1.0.0-rc.1`, `1.*`, `*`).
+fn is_comparator(c: str) -> bool {
+    let op = "^";
+    let rest = c;
+    for o in ["<=", ">=", "=", "<", ">", "^", "~"] {
+        if let r: str = c.strip_prefix(o) {
+            op = o;
+            rest = r.trim_start();
+            break;
+        }
+    }
+    if rest.is_empty() { return false; }
+    let core = core_of(rest) ?? "";
+    let pre = core.len() < rest.len() && !rest[core.len():].starts_with("+");
+    if core.is_empty() { return false; }
+    let parts: List<str> = List::new();
+    for p in core.split(".") { parts.push(p); }
+    if parts.len() > 3 { return false; }
+    let wild = false;
+    let have = 0usize;
+    for p in parts {
+        if p == "*" || p == "x" || p == "X" {
+            wild = true;
+        } else if wild || !is_num(p) {
+            // A number after a wildcard (`1.*.3`), or not a number.
+            return false;
+        } else {
+            have += 1;
+        }
+    }
+    if wild && op != "^" && op != "=" { return false; }
+    if have == 0 { return core == "*" && !pre; }
+    !pre || have == 3
+}
+
+/// A requirement: comparators joined by `,`.
+pub fn is_req(s: str) -> bool {
+    for c in s.split(",") {
+        if !is_comparator(c.trim()) { return false; }
+    }
+    true
+}
+
+fn is_hex(s: str, lens: List<usize>) -> bool {
+    if !lens.contains(s.len()) { return false; }
+    for c in s.chars() {
+        if !(c.is_ascii_digit() || (c >= 'a' && c <= 'f')) { return false; }
+    }
+    true
+}
+
+/// What an API publish adds: the entry's name, version, index file and line.
+pub struct Entry {
+    pub name: str;
+    pub version: str;
+    pub native: bool;
+    pub file: str;
+    pub line: str;
+}
+
+fn record(v: Value, want: str) -> Dict<str, Value> | none {
+    if let Value::Struct { name: n, fields } = v {
+        if (n ?? "") == want { return fields; }
+    }
+    none
+}
+
+fn only(f: Dict<str, Value>, allowed: List<str>, what: str) throws (ApiError) {
+    for k in f.keys() {
+        if !allowed.contains(k) { throw bad(f"{what}: unknown field `{k}`"); }
+    }
+}
+
+fn str_field(f: Dict<str, Value>, k: str, what: str) throws (ApiError) -> str {
+    if let v: Value = f.get(k) {
+        if let Value::Str(s) = v { return s; }
+        throw bad(f"{what}: `{k}` is a string");
+    }
+    throw bad(f"{what}: no `{k}`");
+}
+
+fn opt_str(f: Dict<str, Value>, k: str, what: str) throws (ApiError) -> str | none {
+    if f.contains_key(k) { return try str_field(f, k, what); }
+    none
+}
+
+fn not_yanked(f: Dict<str, Value>, what: str) throws (ApiError) {
+    if let v: Value = f.get("yanked") {
+        if v != Value::Bool(false) { throw bad(f"{what}: a new version has `yanked: false`"); }
+    }
+}
+
+fn https(url: str) -> bool {
+    url.starts_with("https://") && url.len() > 8 && !url.contains(" ") && !url.contains("\"")
+}
+
+/// Whether `h` is an IPv4 address in a range that is not the internet:
+/// loopback, private, link-local, shared, multicast and reserved.
+fn private_v4(h: str) -> bool {
+    let parts: List<u32> = List::new();
+    for p in h.split(".") {
+        if p.is_empty() || p.len() > 3 { return false; }
+        parts.push(try p.parse::<u32>() catch _ { return false; });
+    }
+    if parts.len() != 4 { return false; }
+    let (a, b) = (parts[0], parts[1]);
+    a == 0u32 || a == 10u32 || a == 127u32 || a >= 224u32 || (a == 100u32 && b >= 64u32 && b < 128u32) || (a == 169u32 && b == 254u32) || (a == 172u32 && b >= 16u32 && b < 32u32) || (a == 192u32 && b == 168u32) || (a == 198u32 && (b == 18u32 || b == 19u32))
+}
+
+/// Why the server will not fetch a package source from `url`; none when
+/// it will: https on the default port to a named public host, so a
+/// publish cannot make the server reach its own network. A host that
+/// resolves to a private address is refused by the proxy in front, not
+/// here.
+pub fn source_problem(url: str) -> str | none {
+    if !https(url) { return f"the source url `{url}` is not https"; }
+    let rest = url["https://".len():];
+    let host = (rest.split_once("/") ?? (rest, "")).0.to_lowercase();
+    let what = f"the source url `{url}`";
+    if host.contains("@") { return f"{what} carries a user name; give the plain https address"; }
+    if host.contains(":") && !host.ends_with(":443") { return f"{what} names a port; sources are fetched from the default https port"; }
+    let name = host.strip_suffix(":443") ?? host;
+    if name.starts_with("[") { return f"{what} is an IP address; use the host's name"; }
+    if !name.contains(".") || name.ends_with(".") || name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local") || name.ends_with(".internal") {
+        return f"{what} is not a public host";
+    }
+    let digits = true;
+    for c in name.chars() {
+        if !(c.is_ascii_digit() || c == '.') { digits = false; }
+    }
+    if digits || private_v4(name) { return f"{what} is an IP address; use the host's name"; }
+    for c in name.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '.') { return f"{what} has a host name with `{c}` in it"; }
+    }
+    none
+}
+
+fn opt_bool(f: Dict<str, Value>, k: str) throws (ApiError) -> bool {
+    match f.get(k) {
+        v: Value => {
+            let Value::Bool(b) = v else { throw bad(f"`{k}` is true or false"); };
+            b
+        },
+        none => false,
+    }
+}
+
+/// A feature name: `[a-z0-9][a-z0-9_-]*`.
+fn is_feature(s: str) -> bool {
+    if s.is_empty() { return false; }
+    let first = true;
+    for c in s.chars() {
+        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || (!first && (c == '_' || c == '-'));
+        if !ok { return false; }
+        first = false;
+    }
+    true
+}
+
+/// A list of feature names.
+fn str_list(v: Value, what: str) throws (ApiError) -> List<str> {
+    let Value::List(xs) = v else { throw bad(f"{what} is a list of names"); };
+    let out: List<str> = List::new();
+    for x in xs {
+        let Value::Str(n) = x else { throw bad(f"{what} is a list of names"); };
+        if !is_feature(n) { throw bad(f"`{n}` is not a feature name"); }
+        out.push(n);
+    }
+    out
+}
+
+/// A package's `features` table against its normal dependencies (`normal`:
+/// name -> optional), as the client's manifest check does.
+fn check_features(v: Value, normal: Dict<str, bool>) throws (ApiError) {
+    let Value::Dict(d) = v else { throw bad("`features` is a dict of name → list"); };
+    let table: Dict<str, List<str>> = Dict::new();
+    for k in d.keys() {
+        let Value::Str(name) = k else { throw bad("a feature name is a string"); };
+        if !is_feature(name) { throw bad(f"`{name}` is not a feature name"); }
+        let entries: List<str> = List::new();
+        let Value::List(xs) = d[k] else { throw bad(f"feature `{name}` is a list"); };
+        for x in xs {
+            let Value::Str(e) = x else { throw bad(f"feature `{name}` lists strings"); };
+            entries.push(e);
+        }
+        table.insert(name, entries);
+    }
+    let enabled: Set<str> = Set::new();
+    for (name, entries) in table {
+        for e in entries {
+            if let dn: str = e.strip_prefix("dep:") {
+                if !(normal.get(dn) ?? false) { throw bad(f"feature `{name}`: `{e}` needs `{dn}` to be an optional normal dependency"); }
+                enabled.insert(dn);
+            } else if let (dp, fname): (str, str) = e.split_once("/") {
+                let weak = dp.ends_with("?");
+                let dn = if weak { dp[0:dp.len() - 1] } else { dp };
+                let o = normal.get(dn) ?? { throw bad(f"feature `{name}`: `{dn}` is not a normal dependency"); };
+                if !is_feature(fname) { throw bad(f"`{fname}` is not a feature name"); }
+                if weak && !o { throw bad(f"feature `{name}`: `{e}` needs `{dn}` to be optional"); }
+                if !weak { enabled.insert(dn); }
+            } else if !table.contains_key(e) {
+                throw bad(f"feature `{name}`: `{e}` is not a feature");
+            }
+        }
+    }
+    // Feature -> feature entries form no cycle: 1 visiting, 2 done.
+    let state: Dict<str, i32> = Dict::new();
+    for start in table.keys() { try no_cycle(table, start, state); }
+    for (dn, opt) in normal {
+        if opt && !enabled.contains(dn) { throw bad(f"optional dependency `{dn}` is not enabled by any feature (`dep:{dn}`)"); }
+    }
+}
+
+fn no_cycle(table: Dict<str, List<str>>, name: str, state: Dict<str, i32>) throws (ApiError) {
+    let s = state.get(name) ?? 0;
+    if s == 2 { return; }
+    if s == 1 { throw bad(f"features form a cycle through `{name}`"); }
+    state.insert(name, 1);
+    for e in table[name] {
+        if table.contains_key(e) { try no_cycle(table, e, state); }
+    }
+    state.insert(name, 2);
+}
+
+/// A `nabi_version`: a full toolchain version, `x.y.z`, nothing more.
+pub fn is_nabi_version(s: str) -> bool {
+    let n = 0usize;
+    for p in s.split(".") {
+        if !is_num(p) { return false; }
+        n += 1;
+    }
+    n == 3
+}
+
+/// A native library name (`links`): letters, digits, `_`, `-`, `.`, `+`.
+fn is_lib(s: str) -> bool {
+    if s.is_empty() || s.len() > 64 { return false; }
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '+') { return false; }
+    }
+    true
+}
+
+/// A dependency's `target`: a target triple, or `cfg(..)` with balanced
+/// parentheses. The client evaluates it; the server only checks its shape.
+fn is_target(s: str) -> bool {
+    if s.is_empty() || s.len() > 256 { return false; }
+    if let inner: str = s.strip_prefix("cfg(") {
+        if !inner.ends_with(")") { return false; }
+        let depth = 1;
+        for c in inner.chars() {
+            if c < ' ' || c > '~' { return false; }
+            if c == '(' { depth += 1; }
+            if c == ')' {
+                depth -= 1;
+                if depth < 0 { return false; }
+            }
+        }
+        return depth == 0 && inner.len() > 1;
+    }
+    if !s.contains("-") { return false; }
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') { return false; }
+    }
+    true
+}
+
+/// A `Package { .. }` line, checked.
+fn check_package(f: Dict<str, Value>) throws (ApiError) -> (str, str) {
+    if f.contains_key("official") { throw bad("`official` is set by the registry, not sent with a publish; leave it out of the entry"); }
+    try only(f, ["name", "version", "deps", "features", "source", "tree", "yanked", "nabi_version", "links"], "Package");
+    // Normal dependencies: whether each is optional.
+    let normal: Dict<str, bool> = Dict::new();
+    let name = try str_field(f, "name", "Package");
+    try check_name(name, "package");
+    let version = try str_field(f, "version", "Package");
+    if !is_version(version) { throw bad(f"`{version}` is not a version (major.minor.patch)"); }
+    if let d: Value = f.get("deps") {
+        let Value::List(xs) = d else { throw bad("`deps` is a list"); };
+        for x in xs {
+            let q = record(x, "") ?? (record(x, "Req") ?? Dict::new());
+            if q.len() == 0 { throw bad("a dependency is `{ name: .., req: .., kind: .. }`"); }
+            try only(q, ["name", "req", "kind", "registry", "optional", "features", "default_features", "package", "target"], "dependency");
+            let dn = try str_field(q, "name", "dependency");
+            try check_name(dn, "dependency");
+            if let pk: str = try opt_str(q, "package", "dependency") {
+                try check_name(pk, "package");
+            }
+            if let t: str = try opt_str(q, "target", "dependency") {
+                if !is_target(t) { throw bad(f"`{dn}`: `{t}` is not a target: a triple (`x86_64-unknown-linux-gnu`) or `cfg(..)`"); }
+            }
+            let req = try str_field(q, "req", "dependency");
+            if !is_req(req) { throw bad(f"`{req}` is not a version requirement"); }
+            let kind = (try opt_str(q, "kind", "dependency")) ?? "normal";
+            if kind != "normal" && kind != "dev" && kind != "native" { throw bad("`kind` is \"normal\", \"dev\" or \"native\""); }
+            _ = try opt_str(q, "registry", "dependency");
+            let opt = try opt_bool(q, "optional");
+            if opt && kind != "normal" { throw bad(f"`{dn}`: only a normal dependency is optional"); }
+            if let fv: Value = q.get("features") {
+                if kind == "native" { throw bad(f"`{dn}`: a native package has no features"); }
+                _ = try str_list(fv, f"`{dn}` features");
+            }
+            _ = try opt_bool(q, "default_features");
+            if kind == "normal" { normal.insert(dn, opt); }
+        }
+    }
+    if let fv: Value = f.get("features") { try check_features(fv, normal); }
+    let src = f.get("source") ?? Value::None;
+    let ok = false;
+    if let Value::Variant { path, args, named } = src {
+        if path == "Dep::git" && args.len() == 1 && named.len() == 1 {
+            if let Value::Str(url) = args[0] {
+                if let Value::Str(rev) = named.get("rev") ?? Value::None {
+                    if let why: str = source_problem(url) { throw bad(why); }
+                    // SHA-1 object names, as the index and `nabi` read them.
+                    ok = is_hex(rev, [40usize]);
+                }
+            }
+        }
+    }
+    if !ok { throw bad("a package's source is `Dep::git(\"https://..\", rev: \"<40-hex commit>\")`"); }
+    let tree = try str_field(f, "tree", "Package");
+    if !is_hex(tree, [40usize]) { throw bad("`tree` is the commit's git tree hash (40 hex digits)"); }
+    try not_yanked(f, "Package");
+    let nv = (try opt_str(f, "nabi_version", "Package")) ?? { throw bad("a version needs `nabi_version: \"x.y.z\"`, the oldest nabi it builds with; set `nabi_version` in nabi.nabion and publish again"); };
+    if !is_nabi_version(nv) { throw bad(f"`nabi_version: \"{nv}\"` is not a toolchain version: write all three parts, e.g. `nabi_version: \"0.1.0\"`"); }
+    if let l: str = try opt_str(f, "links", "Package") {
+        if !is_lib(l) { throw bad(f"`{l}` is not a native library name"); }
+    }
+    (name, version)
+}
+
+/// A `Native { .. }` value, checked: every build an https archive with
+/// its SHA-256, dependencies on indexed native packages only.
+fn check_native(f: Dict<str, Value>) throws (ApiError) -> (str, str) {
+    try only(f, ["name", "version", "deps", "targets", "yanked"], "Native");
+    let name = try str_field(f, "name", "Native");
+    try check_name(name, "native package");
+    let version = try str_field(f, "version", "Native");
+    if !is_version(version) { throw bad(f"`{version}` is not a version (major.minor.patch)"); }
+    if let d: Value = f.get("deps") {
+        let Value::Dict(xs) = d else { throw bad("native `deps` is a dict"); };
+        let seen: Set<str> = Set::new();
+        for k in xs.keys() {
+            let Value::Str(dn) = k else { throw bad("a dependency name is a string"); };
+            try check_name(dn, "dependency");
+            if seen.contains(key(dn)) { throw bad(f"`{dn}` is listed twice (`-` and `_` are one)"); }
+            seen.insert(key(dn));
+            let v = xs[k];
+            let req = "";
+            let named: Dict<str, Value> = Dict::new();
+            if let Value::Str(r) = v {
+                req = r;
+            } else if let Value::Variant { path, args, named: n } = v {
+                if path != "Dep::native" || args.len() != 1 {
+                    throw bad(f"dependency `{dn}` is not in an index: an indexed native package depends on `Dep::native(\"<req>\")` ones");
+                }
+                if let Value::Str(r) = args[0] { req = r; }
+                named = n;
+            }
+            if !is_req(req) { throw bad(f"`{req}` is not a version requirement"); }
+            try only(named, ["registry"], "Dep::native");
+            _ = try opt_str(named, "registry", "Dep::native");
+        }
+    }
+    let Value::Dict(ts) = f.get("targets") ?? Value::None else { throw bad("`targets` is a dict of target triple -> Artifact"); };
+    if ts.len() == 0 { throw bad(f"native package `{name}` has no `targets`"); }
+    for t in ts.keys() {
+        let Value::Str(triple) = t else { throw bad("a target is a string"); };
+        let a = record(ts[t], "Artifact") ?? Dict::new();
+        if a.len() == 0 { throw bad(f"{triple}: a build is `Artifact {{ .. }}`"); }
+        try only(a, ["url", "sha256", "links", "runtime"], "Artifact");
+        let url = try str_field(a, "url", "Artifact");
+        if !https(url) { throw bad(f"{triple}: url `{url}` is not https"); }
+        let sha = (try str_field(a, "sha256", "Artifact")).to_lowercase();
+        if !is_hex(sha, [64usize]) { throw bad(f"{triple}: a SHA-256 is 64 hex digits"); }
+        if let l: Value = a.get("links") {
+            let Value::Dict(ls) = l else { throw bad("`links` is a dict"); };
+            for lk in ls.keys() {
+                let kind = ls[lk];
+                if kind != Value::Str("static") && kind != Value::Str("dylib") { throw bad("a link kind is \"static\" or \"dylib\""); }
+            }
+        }
+        if let r: Value = a.get("runtime") {
+            let Value::List(rs) = r else { throw bad("`runtime` is a list"); };
+            for x in rs {
+                let Value::Str(p) = x else { throw bad("a runtime path is a string"); };
+                let okp = !p.is_empty() && !p.starts_with("/") && !p.contains("\\");
+                for s in p.split("/") {
+                    if s.is_empty() || s == "." || s == ".." { okp = false; }
+                }
+                if !okp { throw bad("a path inside the archive (relative, no `..`)"); }
+            }
+        }
+    }
+    try not_yanked(f, "Native");
+    (name, version)
+}
+
+/// `v` on one line, as the client writes an index line.
+fn flat(v: Value) throws (ApiError) -> str {
+    try nabion::to_str_flat(v) catch e { throw bad(f"not writable as NABION: {e}"); }
+}
+
+/// An index entry (`Package { .. }` or `Native { .. }`), checked on its own.
+fn entry_of(v: Value) throws (ApiError) -> Entry {
+    if let f: Dict<str, Value> = record(v, "Package") {
+        let (name, version) = try check_package(f);
+        return Entry { name: name, version: version, native: false, file: packages::shard(name), line: try flat(v) };
+    }
+    if let f: Dict<str, Value> = record(v, "Native") {
+        let (name, version) = try check_native(f);
+        return Entry { name: name, version: version, native: true, file: "native/" + packages::shard(name), line: try flat(v) };
+    }
+    throw bad("`entry` is a `Package { .. }` or `Native { .. }` index entry");
+}
+
+const META_STRS: [str; 4] = ["description", "license", "default_run", "links"];
+const META_URLS: [str; 3] = ["homepage", "documentation", "repository"];
+const META_PATHS: [str; 2] = ["license_file", "readme"];
+const META_LISTS: [str; 5] = ["authors", "keywords", "categories", "include", "exclude"];
+
+/// A path inside the package's tree: relative, no `..`.
+fn is_rel_path(p: str) -> bool {
+    if p.is_empty() || p.len() > 256 || p.starts_with("/") || p.contains("\\") { return false; }
+    for s in p.split("/") {
+        if s.is_empty() || s == "." || s == ".." { return false; }
+    }
+    true
+}
+
+/// String `k` of `f`, at most `max` bytes; `""` when absent.
+fn meta_str(f: Dict<str, Value>, k: str, max: usize) throws (ApiError) -> str {
+    let s = (try opt_str(f, k, "meta")) ?? "";
+    if s.len() > max { throw bad(f"meta: `{k}` is longer than {max} bytes"); }
+    s
+}
+
+fn meta_list(f: Dict<str, Value>, k: str, most: usize, max: usize) throws (ApiError) -> List<str> {
+    let out: List<str> = List::new();
+    let Value::List(xs) = f.get(k) ?? Value::List(List::new()) else { throw bad(f"meta: `{k}` is a list of strings"); };
+    if xs.len() > most { throw bad(f"meta: `{k}` has more than {most} entries"); }
+    for x in xs {
+        let Value::Str(t) = x else { throw bad(f"meta: `{k}` is a list of strings"); };
+        if t.trim().is_empty() || t.len() > max { throw bad(f"meta: `{k}` entries are 1 to {max} bytes"); }
+        out.push(t);
+    }
+    out
+}
+
+/// The largest README a publish carries.
+pub const README_MAX: usize = 524288;
+
+/// At most this many unknown `meta` keys, and this many bytes of them.
+const EXTRA_KEYS: usize = 32;
+const EXTRA_BYTES: usize = 16384;
+
+/// The descriptive metadata of a publish (the manifest's fields, what the
+/// client measured, the README text), checked. `links` comes from the
+/// index entry. Keys this server does not know are kept as sent in
+/// `Meta.extra` and named in `warnings`, so a newer client's fields reach
+/// the API before the server learns them.
+pub fn check_meta(v: Value, links: str, warnings: List<str>) throws (ApiError) -> (meta::Meta, str) {
+    let f = record(v, "") ?? (record(v, "Meta") ?? { throw bad("`meta` is `{ description: .., license: .., .. }`"); });
+    let known: List<str> = ["publish", "metadata", "has_lib", "bin_names", "size", "readme_content"];
+    for k in META_STRS { known.push(k); }
+    for k in META_URLS { known.push(k); }
+    for k in META_PATHS { known.push(k); }
+    for k in META_LISTS { known.push(k); }
+    let extra: Dict<str, Value> = Dict::new();
+    for k in f.keys() {
+        if !known.contains(k) {
+            extra.insert(k, f[k]);
+            warnings.push(f"meta: `{k}` is not known to this registry; kept as sent");
+        }
+    }
+    let m = meta::empty();
+    if extra.len() > 0 {
+        if extra.len() > EXTRA_KEYS { throw bad(f"meta: more than {EXTRA_KEYS} unknown keys"); }
+        let ev = Value::Struct { name: none, fields: extra };
+        if (try flat(ev)).len() > EXTRA_BYTES { throw bad(f"meta: unknown keys take more than {EXTRA_BYTES} bytes"); }
+        m.extra = ev;
+    }
+    m.description = try meta_str(f, "description", 1000);
+    m.license = try meta_str(f, "license", 256);
+    m.default_run = try meta_str(f, "default_run", 64);
+    m.links = try meta_str(f, "links", 64);
+    if !m.links.is_empty() && m.links != links { throw bad(f"meta: `links` is `{m.links}` but the entry's is `{links}`"); }
+    m.links = links;
+    m.homepage = try meta_str(f, "homepage", 512);
+    m.documentation = try meta_str(f, "documentation", 512);
+    m.repository = try meta_str(f, "repository", 512);
+    for u in [m.homepage, m.documentation, m.repository] {
+        if !u.is_empty() && !((u.starts_with("https://") || u.starts_with("http://")) && !u.contains(" ") && !u.contains("\"")) {
+            throw bad(f"meta: `{u}` is not an http(s) address");
+        }
+    }
+    m.license_file = try meta_str(f, "license_file", 256);
+    m.readme = try meta_str(f, "readme", 256);
+    for p in [m.license_file, m.readme] {
+        if !p.is_empty() && !is_rel_path(p) { throw bad(f"meta: `{p}` is not a path inside the package (relative, no `..`)"); }
+    }
+    m.authors = try meta_list(f, "authors", 64, 256);
+    m.keywords = try meta_list(f, "keywords", 5, 32);
+    m.categories = try meta_list(f, "categories", 5, 64);
+    m.include = try meta_list(f, "include", 256, 256);
+    m.exclude = try meta_list(f, "exclude", 256, 256);
+    let p = f.get("publish") ?? Value::None;
+    match p {
+        Value::None => {},
+        Value::Bool(_) => {},
+        Value::List(_) => { _ = try meta_list(f, "publish", 16, 512); },
+        _ => throw bad("meta: `publish` is true, false or a list of registries"),
+    }
+    m.publish = p;
+    let md = f.get("metadata") ?? Value::None;
+    match md {
+        Value::None => {},
+        Value::Dict(_) => {},
+        Value::Struct { name: n, fields: _ } => {
+            if n is str { throw bad("meta: `metadata` is a table (`{ .. }`)"); }
+        },
+        _ => throw bad("meta: `metadata` is a table (`{ .. }`)"),
+    }
+    m.metadata = md;
+    if let hl: Value = f.get("has_lib") {
+        let Value::Bool(b) = hl else { throw bad("meta: `has_lib` is true or false"); };
+        m.has_lib = b;
+    }
+    m.bin_names = try meta_list(f, "bin_names", 256, 64);
+    for b in m.bin_names {
+        if !packages::is_name(b) { throw bad(f"meta: `{b}` is not a binary name"); }
+    }
+    if let sv: Value = f.get("size") {
+        let Value::Int(n) = sv else { throw bad("meta: `size` is a byte count"); };
+        let z = try i64::try_from(n) catch _ { throw bad("meta: `size` is a byte count"); };
+        if z < 0i64 { throw bad("meta: `size` is a byte count"); }
+        m.size = z;
+    }
+    let readme = try meta_str(f, "readme_content", README_MAX);
+    (m, readme)
+}
+
+/// A publish request: the index entry, the metadata kept beside it, its
+/// README text (`""`: none sent) and what the reply warns about.
+pub struct Publish {
+    pub entry: Entry;
+    pub meta: meta::Meta;
+    pub readme: str;
+    pub warnings: List<str>;
+}
+
+/// A publish body, `Publish { entry: Package { .. } | Native { .. }, meta: { .. } }`
+/// (`meta` optional), checked on its own.
+pub fn parse_publish(body: str) throws (ApiError) -> Publish {
+    let v = try nabion::parse(body) catch e { throw bad(f"not NABION: {e}"); };
+    let f = record(v, "Publish") ?? { throw bad("the body is `Publish { entry: Package { .. }, meta: { .. } }`"); };
+    try only(f, ["entry", "meta"], "Publish");
+    let e = try entry_of(f.get("entry") ?? Value::None);
+    let links = "";
+    if let ef: Dict<str, Value> = record(f.get("entry") ?? Value::None, "Package") {
+        links = (try opt_str(ef, "links", "Package")) ?? "";
+    }
+    let warnings: List<str> = List::new();
+    let (m, readme) = match f.get("meta") {
+        mv: Value => try check_meta(mv, links, warnings),
+        none => (meta::empty(), ""),
+    };
+    m.links = links;
+    Publish { entry: e, meta: m, readme: readme, warnings: warnings }
+}
+
+/// Seconds an index command (a fetch or push to its upstream) may take.
+const INDEX_SECS: i64 = 60i64;
+
+/// `git args..` in `dir`, stopped after INDEX_SECS; its stdout. A failure
+/// is logged (git's stderr holds no secrets of ours) and thrown as
+/// `status`.
+fn git(dir: str, args: List<str>, status: i32) throws (ApiError) -> str {
+    let full: List<str> = ["-C", dir];
+    full.extend(args);
+    packages::git_limited(full, INDEX_SECS, dir + "/.git", "") ?? { throw err(status, "the index is unavailable; try again later"); }
+}
+
+/// Make the checkout its upstream's state; before every write.
+pub fn sync(dir: str) throws (ApiError) {
+    _ = try git(dir, ["fetch", "-q", "origin"], 503);
+    _ = try git(dir, ["reset", "-q", "--hard", "@{u}"], 500);
+}
+
+/// Commit `rel` as `who`, push; on a failed push, back to upstream and 503.
+fn commit_push(dir: str, rel: str, msg: str, who: str) throws (ApiError) {
+    _ = try git(dir, ["add", "--", rel], 500);
+    _ = try git(dir, ["-c", "user.name=packages.nabi-lang.org", "-c", "user.email=index@packages.nabi-lang.org", "commit", "-q", "--no-gpg-sign", f"--author={who}", "-m", msg, "--", rel], 500);
+    _ = try git(dir, ["push", "-q", "origin", "HEAD"], 503) catch e {
+        _ = try git(dir, ["reset", "-q", "--hard", "@{u}"], 500) catch _ { "" };
+        throw e;
+    };
+}
+
+/// Text of `rel` in the checkout, `""` when absent.
+fn read_rel(dir: str, rel: str) throws (ApiError) -> str {
+    let p = dir + "/" + rel;
+    if !fs::exists(p) { return ""; }
+    try fs::read_to_str(p) catch e { throw err(500, f"{rel}: {e}"); }
+}
+
+/// The name, version and yanked flag of each line of an index file.
+fn lines_of(text: str) -> List<(str, str, bool)> {
+    let out: List<(str, str, bool)> = List::new();
+    for line in text.split("\n") {
+        if line.trim().is_empty() { continue; }
+        let v = try nabion::parse(line) catch _ { continue; };
+        if let Value::Struct { name: _, fields } = v {
+            let nm = if let Value::Str(s) = fields.get("name") ?? Value::None { s } else { "" };
+            let vs = if let Value::Str(s) = fields.get("version") ?? Value::None { s } else { "" };
+            out.push((nm, vs, fields.get("yanked") == Value::Bool(true)));
+        }
+    }
+    out
+}
+
+/// The name and version of each line of an index file.
+fn versions(text: str) -> List<(str, str)> {
+    let out: List<(str, str)> = List::new();
+    for (n, v, _) in lines_of(text) { out.push((n, v)); }
+    out
+}
+
+/// The versions of a package in the checkout and whether each is yanked,
+/// in index order; empty when it has none.
+pub fn releases(dir: str, native: bool, name: str) throws (ApiError) -> List<(str, bool)> {
+    let rel = (if native { "native/" } else { "" }) + packages::shard(name);
+    let out: List<(str, bool)> = List::new();
+    for (n, v, y) in lines_of(try read_rel(dir, rel)) {
+        if key(n) == key(name) { out.push((v, y)); }
+    }
+    out
+}
+
+/// Each index line of a package in the checkout, parsed, in index order.
+pub fn lines_for(dir: str, native: bool, name: str) throws (ApiError) -> List<Dict<str, Value>> {
+    let rel = (if native { "native/" } else { "" }) + packages::shard(name);
+    let out: List<Dict<str, Value>> = List::new();
+    for line in (try read_rel(dir, rel)).split("\n") {
+        if line.trim().is_empty() { continue; }
+        let v = try nabion::parse(line) catch _ { continue; };
+        if let Value::Struct { name: _, fields } = v {
+            if let Value::Str(n) = fields.get("name") ?? Value::None {
+                if key(n) == key(name) { out.push(fields); }
+            }
+        }
+    }
+    out
+}
+
+/// The `tree` of the line of `name` `version` in the checkout ("" when
+/// it has none, as a native package's); none when there is no such line.
+pub fn tree_at(dir: str, native: bool, name: str, version: str) throws (ApiError) -> str | none {
+    for f in try lines_for(dir, native, name) {
+        let v = if let Value::Str(x) = f.get("version") ?? Value::None { x } else { "" };
+        if is_version(v) && packages::cmp_vers(v, version) == Ordering::Equal {
+            return if let Value::Str(t) = f.get("tree") ?? Value::None { t } else { "" };
+        }
+    }
+    none
+}
+
+/// Fail when the checkout has `name` spelled another way (`a-b` / `a_b`).
+fn taken(dir: str, native: bool, name: str) throws (ApiError) {
+    for f in (try git(dir, ["ls-files"], 500)).split("\n") {
+        if f.is_empty() || f.starts_with("native/") != native { continue; }
+        let n = match f.rfind("/") {
+            at: usize => f[at + 1:],
+            none => f,
+        };
+        if n != name && key(n) == key(name) {
+            throw err(409, f"the index has `{n}`; `{name}` is the same name (`-` / `_` and case are one)");
+        }
+    }
+}
+
+/// Whether the checkout has any version of the package (`native/` or not).
+pub fn exists(dir: str, native: bool, name: str) throws (ApiError) -> bool {
+    let rel = (if native { "native/" } else { "" }) + packages::shard(name);
+    let text = try read_rel(dir, rel);
+    for (n, _) in versions(text) {
+        if key(n) == key(name) { return true; }
+    }
+    false
+}
+
+/// What a fetch of a package source may take: slow transfers give up
+/// after 30 s under 1 KiB/s, and redirects are not followed.
+const FETCH_CFG: [str; 6] = ["-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=30", "-c", "http.followRedirects=false"];
+
+fn source_git(db: str, cache: str, args: List<str>, protocols: str) -> str | none {
+    let full: List<str> = ["-C", db];
+    for x in FETCH_CFG { full.push(x); }
+    full.extend(args);
+    packages::git_limited(full, packages::FETCH_SECS, cache, protocols)
+}
+
+/// Commit `rev` of `url` in its own cache under `cache` (fetched over
+/// `protocols`, at most FETCH_SECS and about 256 MiB a fetch), checked to
+/// be `url`'s own: the tip of one of its branches or tags, or an
+/// ancestor of one. A fetch alone proves nothing, since GitHub serves a
+/// fork's commits through the parent's address too. The repository.
+pub fn fetch_source(cache: str, url: str, rev: str, protocols: str) throws (ApiError) -> str {
+    let db = packages::source_db(cache, url);
+    if !fs::exists(db) {
+        try fs::create_dir_all(cache + "/git") catch x { throw err(500, f"{x}"); };
+        if packages::git(["init", "-q", "--bare", db]) is none { throw err(500, "cannot make the source cache"); }
+    }
+    let cannot = bad(f"cannot fetch {url} at {rev} (within {packages::FETCH_SECS} s and 256 MiB)");
+    if packages::git(["-C", db, "cat-file", "-e", rev + "^{commit}"]) is none {
+        _ = source_git(db, cache, ["fetch", "-q", "--depth", "1", "--no-tags", url, rev], protocols) ?? { throw cannot; };
+    }
+    let refs = source_git(db, cache, ["ls-remote", "--heads", "--tags", url], protocols) ?? { throw cannot; };
+    for line in refs.split("\n") {
+        if (line.split_once("\t") ?? (line, "")).0 == rev { return db; }
+    }
+    // Not a tip: bring the branches and tags, and look for one that has it.
+    _ = source_git(db, cache, ["fetch", "-q", "--no-tags", "--force", url, "+refs/heads/*:refs/src/heads/*", "+refs/tags/*:refs/src/tags/*"], protocols) ?? { throw cannot; };
+    let holding = packages::git(["-C", db, "for-each-ref", "--contains", rev, "--format=%(refname)", "refs/src/"]) ?? "";
+    if holding.trim().is_empty() {
+        throw bad(f"commit {rev} is on no branch or tag of {url}; push it there (a commit of a fork does not count) and publish again");
+    }
+    db
+}
+
+/// A package's source commit, fetched into `cache` (fetch_source), is a
+/// package (has `src/lib.nabi`, `src/main.nabi` or both) whose tree hash
+/// is the line's `tree`. The repository that holds it; "" for a native package.
+pub fn check_source(cache: str, e: Entry, protocols: str) throws (ApiError) -> str {
+    if e.native { return ""; }
+    let (_, v) = try packages::parse_line(e.line) catch x { throw bad(x.msg); };
+    let db = try fetch_source(cache, v.url, v.rev, protocols);
+    if !packages::has_file(db, v.rev, "src/lib.nabi") && !packages::has_file(db, v.rev, "src/main.nabi") {
+        throw bad("not a package: no src/lib.nabi (a library) or src/main.nabi (an executable)");
+    }
+    let tree = packages::tree_of(db, v.rev) ?? "";
+    if tree != v.tree { throw bad(f"`tree` {v.tree} is not the tree hash of commit {v.rev} ({tree})"); }
+    db
+}
+
+/// The most a source archive may be.
+pub const MAX_ARCHIVE: i64 = 67108864i64;
+
+/// Write `git archive` of `rev` in repository `db` to `out` (gzipped tar,
+/// every path under `prefix/`), at most MAX_ARCHIVE: its SHA-256 and
+/// size.
+pub fn archive(db: str, rev: str, out: str, prefix: str) throws (ApiError) -> (str, i64) {
+    let dir = web::build::dir_of(out);
+    try fs::create_dir_all(dir) catch x { throw err(500, f"archive: {x}"); };
+    let tmp = out + ".tmp";
+    _ = packages::git_limited(["-C", db, "archive", "--format=tar.gz", f"--prefix={prefix}/", "-o", tmp, rev], 60i64, dir, "") ?? {
+        try fs::remove_file(tmp) catch _ {};
+        throw err(500, "cannot archive the source");
+    };
+    let data = try fs::read(tmp) catch x { throw err(500, f"archive: {x}"); };
+    if data.len() as i64 > MAX_ARCHIVE {
+        try fs::remove_file(tmp) catch _ {};
+        throw bad(f"the source is {data.len() / 1048576usize} MiB packed; a version is at most {MAX_ARCHIVE / 1048576i64} MiB (leave large files out of the repository)");
+    }
+    try fs::rename(tmp, out) catch x { throw err(500, f"archive: {x}"); };
+    (hex::encode(HashAlgorithm::Sha256.digest(data)), data.len() as i64)
+}
+
+/// `line` with `archive: "<sum>"` after its `tree`, where the client's
+/// canonical line puts it: `nabi` downloads the archive and checks it
+/// against this.
+pub fn with_archive(line: str, tree: str, sum: str) -> str {
+    let at = f"tree: \"{tree}\", ";
+    if !line.contains(at) { return line; }
+    line.replace(at, f"tree: \"{tree}\", archive: \"{sum}\", ")
+}
+
+/// Every package name in the checkout (native ones apart), from its
+/// file names.
+pub fn names(dir: str, native: bool) throws (ApiError) -> List<str> {
+    let out: List<str> = List::new();
+    for f in (try git(dir, ["ls-files"], 500)).split("\n") {
+        if f.is_empty() || f.starts_with("native/") != native || !f.contains("/") { continue; }
+        let n = match f.rfind("/") {
+            at: usize => f[at + 1:],
+            none => f,
+        };
+        if packages::is_name(n) { out.push(n); }
+    }
+    out
+}
+
+/// Whether the file of `name` holds a standard library tier's `Library`
+/// line: the library ships with the toolchain, and its entry takes no
+/// versions.
+pub fn is_library(dir: str, name: str) throws (ApiError) -> bool {
+    for line in (try read_rel(dir, packages::shard(name))).split("\n") {
+        if let lib: str = packages::library_line(line) {
+            if key(lib) == key(name) { return true; }
+        }
+    }
+    false
+}
+
+/// The refusal of a publish under a standard library tier's name.
+pub fn library_refused(name: str) -> ApiError {
+    err(403, f"`{name}` is the standard library, which ships with the toolchain; no version of it can be published here")
+}
+
+pub fn publish(dir: str, e: Entry, who: str) throws (ApiError) {
+    if !e.native && (try is_library(dir, e.name)) { throw library_refused(e.name); }
+    try taken(dir, e.native, e.name);
+    let text = try read_rel(dir, e.file);
+    for (n, v) in versions(text) {
+        if key(n) == key(e.name) && packages::cmp_vers(v, e.version) == Ordering::Equal {
+            throw err(409, f"{e.name} {e.version} is already in the index");
+        }
+    }
+    let out = text;
+    if !out.is_empty() && !out.ends_with("\n") { out = out + "\n"; }
+    out = out + e.line + "\n";
+    let full = dir + "/" + e.file;
+    try fs::create_dir_all(web::build::dir_of(full)) catch x { throw err(500, f"{x}"); };
+    try fs::write(full, out) catch x { throw err(500, f"{x}"); };
+    let what = if e.native { "native " } else { "" };
+    try commit_push(dir, e.file, f"Publish {what}{e.name} {e.version}", who);
+}
+
+/// `line` with `official: true` added as its last field.
+pub fn with_official(line: str) throws (ApiError) -> str {
+    let v = try nabion::parse(line) catch e { throw bad(f"not NABION: {e}"); };
+    if let Value::Struct { name: n, fields } = v {
+        fields.insert("official", Value::Bool(true));
+        return try flat(Value::Struct { name: n, fields: fields });
+    }
+    throw bad("not an index entry");
+}
+
+/// Whether any line of `name` in the checkout has `official: true`.
+pub fn has_official(dir: str, name: str) throws (ApiError) -> bool {
+    for f in try lines_for(dir, false, name) {
+        if f.get("official") == Value::Bool(true) { return true; }
+    }
+    false
+}
+
+/// Set `yanked` of `name` `version`; false when it already was.
+pub fn yank(dir: str, name: str, version: str, yanked: bool, native: bool, who: str) throws (ApiError) -> bool {
+    if !packages::is_name(name) || !is_version(version) { throw bad("bad name or version"); }
+    let rel = (if native { "native/" } else { "" }) + packages::shard(name);
+    let text = try read_rel(dir, rel);
+    let out = StrBuf::new();
+    let found = false;
+    let changed = false;
+    for line in text.split("\n") {
+        if line.trim().is_empty() {
+            if !line.is_empty() { out.push_str(line + "\n"); }
+            continue;
+        }
+        let v = try nabion::parse(line) catch _ { Value::None };
+        let hit = false;
+        if let Value::Struct { name: n, fields } = v {
+            let nm = if let Value::Str(s) = fields.get("name") ?? Value::None { s } else { "" };
+            let vs = if let Value::Str(s) = fields.get("version") ?? Value::None { s } else { "" };
+            if key(nm) == key(name) && packages::cmp_vers(vs, version) == Ordering::Equal {
+                hit = true;
+                found = true;
+                if fields.get("yanked") != Value::Bool(yanked) {
+                    fields.insert("yanked", Value::Bool(yanked));
+                    changed = true;
+                }
+                out.push_str((try flat(Value::Struct { name: n, fields: fields })) + "\n");
+            }
+        }
+        if !hit { out.push_str(line + "\n"); }
+    }
+    let what = if native { "native " } else { "" };
+    if !found { throw err(404, f"{what}{name} {version} is not in the index"); }
+    if !changed { return false; }
+    try fs::write(dir + "/" + rel, out.to_str()) catch x { throw err(500, f"{x}"); };
+    let verb = if yanked { "Yank" } else { "Unyank" };
+    try commit_push(dir, rel, f"{verb} {what}{name} {version}", who);
+    true
+}
+
+#[cfg(test)]
+fn expect(ok: bool, what: str) {
+    if !ok { panic(what); }
+}
+
+/// The entry of a publish that sends `line` and no metadata.
+#[cfg(test)]
+fn parse_entry(line: str) throws (ApiError) -> Entry { (try parse_publish(f"Publish {{ entry: {line} }}")).entry }
+
+#[cfg(test)]
+fn status_of(line: str) -> i32 {
+    try parse_entry(line) catch e { return e.status; };
+    200
+}
+
+#[cfg(test)]
+fn meta_status(line: str, m: str) -> i32 {
+    try parse_publish(f"Publish {{ entry: {line}, meta: {m} }}") catch e { return e.status; };
+    200
+}
+
+#[test]
+fn versions_and_reqs() {
+    expect(is_version("1.2.3") && is_version("0.0.1-rc.1+b5") && !is_version("1.2") && !is_version("01.2.3") && !is_version("1.2.3-") && !is_version("1.2.3-a..b"), "versions");
+    for r in ["^1.2", "~1.2.3", "=1.0.0", ">=1.2, <2", "1.*", "1.2.*", "*", "1.2.3", ">= 1.0.0-rc.1"] {
+        expect(is_req(r), r);
+    }
+    for r in ["", "^", ">1.*", "1.*.3", "a", "1.2.3.4", "*-pre", "^1.0-rc", "1,"] {
+        expect(!is_req(r), r);
+    }
+    expect(key("Nabi-Syntax") == key("nabi_syntax"), "key");
+}
+
+#[test]
+fn entries() {
+    let rev = "4f0c2a9e1b7d3c58a6e09f21d4b8c7a3e5f60123";
+    let good = f"Package {{ name: \"geom\", version: \"0.3.1\", deps: [{{ name: \"num\", req: \"^1.2\", kind: \"normal\" }}, {{ name: \"z\", req: \"^1\", kind: \"native\" }}], source: Dep::git(\"https://github.com/o/geom\", rev: \"{rev}\"), tree: \"{rev}\", yanked: false, nabi_version: \"0.2.1\", links: \"z\" }}";
+    let e = try parse_entry(good) catch x { panic(x.msg); };
+    expect(e.name == "geom" && e.file == "ge/om/geom" && !e.native, "package");
+    // The line is the client's canonical one-line form.
+    expect(e.line == good, f"canonical line: {e.line}");
+    expect(status_of(good.replace("geom\"", "Geom\"")) == 400, "name rule");
+    expect(status_of(good.replace("https://github.com/o/geom", "http://github.com/o/geom")) == 400, "https only");
+    expect(status_of(good.replace("rev:", "tag:")) == 400, "rev only");
+    expect(status_of(good.replace("yanked: false", "yanked: true")) == 400, "not yanked");
+    expect(status_of(good.replace("nabi_version", "nabi_verison")) == 400, "unknown field");
+    expect(status_of(good.replace("nabi_version: \"0.2.1\", ", "")) == 400, "nabi_version needed");
+    expect(status_of(good.replace("yanked: false", "yanked: false, official: true")) == 400, "official is the registry's");
+    let marked = try with_official(good) catch e { panic(e.msg); };
+    expect(marked == good.replace("links: \"z\" }", "links: \"z\", official: true }"), marked);
+    expect(status_of(good.replace("yanked: false", "yanked: false, v: 2")) == 400, "no format version");
+    for t in ["0.2.1", "1.0.0", "0.10.12"] { expect(status_of(good.replace("\"0.2.1\"", f"\"{t}\"")) == 200, t); }
+    for t in ["", "x", "0.2", "0.2.x", "^0.2.1", "1.2.3.4", "0.2.0-rc.1", "latest"] { expect(status_of(good.replace("\"0.2.1\"", f"\"{t}\"")) == 400, t); }
+    expect(status_of(good.replace("links: \"z\"", "links: \"a b\"")) == 400, "links");
+    expect(status_of(good.replace("license", "x")) == 200, "no metadata");
+    let m = "{ description: \"Geometry\", license: \"MIT\", license_file: \"LICENSE\", authors: [\"Ann <a@x.org>\"], homepage: \"https://x.org\", documentation: \"https://x.org/doc\", repository: \"https://github.com/o/geom\", readme: \"README.md\", keywords: [\"math\"], categories: [\"science\"], include: [\"src/**\"], exclude: [\"bench\"], publish: true, metadata: { docs: { all_features: true } }, links: \"z\", default_run: \"geom\" }";
+    let p = try parse_publish(f"Publish {{ entry: {good}, meta: {m} }}") catch x { panic(x.msg); };
+    expect(p.meta.description == "Geometry" && p.meta.keywords[0] == "math" && p.meta.links == "z" && p.meta.publish == Value::Bool(true), "meta");
+    expect(try! nabion::to_str_flat(p.meta.metadata) == "{ docs: { all_features: true } }", "metadata table");
+    expect(meta_status(good, "Meta { license: \"MIT\" }") == 200, "named meta");
+    let unk = try parse_publish(f"Publish {{ entry: {good}, meta: {{ licence: \"MIT\", rust_version: {{ a: [1] }} }} }}") catch x { panic(x.msg); };
+    expect(unk.warnings.len() == 2 && unk.warnings[0].contains("`licence`"), "unknown meta keys warn");
+    expect(try! nabion::to_str_flat(meta::to_value(unk.meta)) == "{ links: \"z\", licence: \"MIT\", rust_version: { a: [1] } }", "unknown meta keys kept");
+    expect(meta_status(good, "{ x: \"" + "a".repeat(20000) + "\" }") == 400, "unknown keys capped");
+    let more = try parse_publish(f"Publish {{ entry: {good}, meta: {{ has_lib: true, bin_names: [\"geom-cli\"], size: 4096, readme_content: \"# geom\\n\" }} }}") catch x { panic(x.msg); };
+    expect((more.meta.has_lib ?? false) && more.meta.bin_names[0] == "geom-cli" && (more.meta.size ?? 0i64) == 4096i64 && more.readme == "# geom\n" && more.warnings.is_empty(), "targets, size, readme");
+    expect(meta_status(good, "{ size: -1 }") == 400 && meta_status(good, "{ has_lib: 1 }") == 400 && meta_status(good, "{ bin_names: [\"a b\"] }") == 400, "target shapes");
+    expect(meta_status(good, "{ readme_content: \"" + "a".repeat(README_MAX + 1) + "\" }") == 400, "readme cap");
+    expect(meta_status(good, "{ homepage: \"javascript:x\" }") == 400, "homepage scheme");
+    expect(meta_status(good, "{ readme: \"../x\" }") == 400, "readme path");
+    expect(meta_status(good, "{ keywords: [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\"] }") == 400, "keywords");
+    expect(meta_status(good, "{ links: \"y\" }") == 400, "links differ");
+    expect(meta_status(good, "{ metadata: 3 }") == 400 && meta_status(good, "{ publish: \"yes\" }") == 400, "shapes");
+    expect(status_of("Package { name: \"geom\" }") == 400, "missing fields");
+    expect(status_of(good.replace("^1.2", "^1.x.2")) == 400, "req");
+    let ren = good.replace("kind: \"normal\" }", "kind: \"normal\", package: \"num-core\", target: \"cfg(all(unix, not(target_os = \\\"macos\\\")))\" }");
+    let re = try parse_entry(ren) catch x { panic(x.msg); };
+    expect(re.line == ren, f"rename line: {re.line}");
+    expect(status_of(good.replace("kind: \"normal\" }", "kind: \"normal\", target: \"x86_64-unknown-linux-gnu\" }")) == 200, "triple target");
+    for t in ["", "cfg(unix", "cfg()", "cfg(a))(", "linux", "x86 64-a"] { expect(status_of(good.replace("kind: \"normal\" }", f"kind: \"normal\", target: \"{t}\" }}")) == 400, t); }
+    expect(status_of(good.replace("kind: \"normal\" }", "kind: \"normal\", package: \"Num\" }")) == 400, "package name");
+    expect(status_of(good.replace("0.3.1", "0.3")) == 400, "version");
+    expect(status_of("Credentials { token: \"x\" }") == 400, "shape");
+    let bare = try { _ = parse_publish(good); 200 } catch e { e.status };
+    expect(bare == 400, "a bare entry is no publish");
+    let h = "ab".repeat(32);
+    let nat = f"Native {{ name: \"zlib\", version: \"1.3.1\", deps: {{ \"yy\": Dep::native(\"^1.0\") }}, targets: {{ \"aarch64-apple-darwin\": Artifact {{ url: \"https://x/z.tar.gz\", sha256: \"{h}\", links: {{ \"z\": \"static\" }}, runtime: [\"bin/z.dll\"] }} }}, yanked: false }}";
+    let n = try parse_entry(nat) catch x { panic(x.msg); };
+    expect(n.native && n.file == "native/zl/ib/zlib" && n.line == nat, f"native: {n.line}");
+    let ft = f"Package {{ name: \"geom\", version: \"0.3.1\", deps: [{{ name: \"num\", req: \"^1.2\", kind: \"normal\", optional: true, features: [\"fast\"], default_features: false }}], features: {{ \"default\": [\"simd\"], \"simd\": [\"dep:num\", \"num?/x\"] }}, source: Dep::git(\"https://github.com/o/geom\", rev: \"{rev}\"), tree: \"{rev}\", yanked: false, nabi_version: \"0.1.0\" }}";
+    let fe = try parse_entry(ft) catch x { panic(x.msg); };
+    expect(fe.line == ft, f"features line: {fe.line}");
+    expect(status_of(ft.replace("dep:num", "dep:nope")) == 400, "unknown dep");
+    expect(status_of(good.replace("kind: \"native\"", "kind: \"native\", optional: true")) == 400, "optional native");
+    expect(status_of(ft.replace("\"dep:num\", ", "")) == 400, "unused optional dep");
+    expect(status_of(ft.replace("\"dep:num\", \"num?/x\"", "\"dep:num\", \"default\"")) == 400, "cycle");
+    expect(status_of(ft.replace("\"simd\": [", "\"Simd\": [").replace("[\"simd\"]", "[\"Simd\"]")) == 400, "feature name");
+    expect(status_of(nat.replace("Dep::native(\"^1.0\")", f"Dep::native(url: \"https://x\", sha256: \"{h}\")")) == 400, "direct dep");
+    expect(status_of(nat.replace("https://x/z", "file:///z")) == 400, "artifact https");
+    expect(status_of(nat.replace("bin/z.dll", "../z.dll")) == 400, "runtime path");
+    expect(status_of(nat.replace("\"static\"", "\"shared\"")) == 400, "link kind");
+}
+
+#[cfg(test)]
+fn sh(args: List<str>) -> str {
+    let o = try! std::process::Command::new(args[0]).args(args[1:args.len()].to_list()).output();
+    if !o.status.success() { panic(f"{args:?}: {try! str::from_utf8(o.stderr)}"); }
+    (try! str::from_utf8(o.stdout)).trim()
+}
+
+/// A git repository at `dir` with `file` committed; its commit.
+#[cfg(test)]
+fn repo_with(dir: str, file: str) -> str {
+    try! fs::create_dir_all(dir + "/src");
+    try! fs::write(f"{dir}/{file}", "pub fn f() -> i32 { 1 }\n");
+    _ = sh(["git", "-C", dir, "init", "-q"]);
+    _ = sh(["git", "-C", dir, "add", "-A"]);
+    _ = sh(["git", "-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"]);
+    sh(["git", "-C", dir, "rev-parse", "HEAD"])
+}
+
+#[test]
+fn sources() {
+    let t = std::env::temp_dir().as_str() + f"/packages-src-{std::process::id()}";
+    let entry = |dir: str, rev: str, tree: str| Entry { name: "geom", version: "0.1.0", native: false, file: "ge/om/geom", line: f"Package {{ name: \"geom\", version: \"0.1.0\", source: Dep::git(\"{dir}\", rev: \"{rev}\"), tree: \"{tree}\" }}" };
+    let lib = repo_with(t + "/lib", "src/lib.nabi");
+    let tree = sh(["git", "-C", t + "/lib", "rev-parse", "HEAD:"]);
+    let db = try check_source(t + "/cache", entry(t + "/lib", lib, tree), "file") catch e { panic(e.msg); };
+    expect(db == packages::source_db(t + "/cache", t + "/lib") && fs::exists(db), db);
+    let wrong = try {
+        _ = check_source(t + "/cache", entry(t + "/lib", lib, lib), "file");
+        ""
+    } catch e { e.msg };
+    expect(wrong == f"`tree` {lib} is not the tree hash of commit {lib} ({tree})", wrong);
+    // An executable alone is a package too.
+    let app = repo_with(t + "/app", "src/main.nabi");
+    let app_tree = sh(["git", "-C", t + "/app", "rev-parse", "HEAD:"]);
+    _ = try check_source(t + "/cache", entry(t + "/app", app, app_tree), "file") catch e { panic(e.msg); };
+    let util = repo_with(t + "/util", "src/util.nabi");
+    let msg = try {
+        _ = check_source(t + "/cache", entry(t + "/util", util, util), "file");
+        ""
+    } catch e { e.msg };
+    expect(msg == "not a package: no src/lib.nabi (a library) or src/main.nabi (an executable)", msg);
+    let gone = try {
+        _ = check_source(t + "/cache", entry(t + "/nowhere", "ab".repeat(20), tree), "file");
+        ""
+    } catch e { e.msg };
+    expect(gone.starts_with("cannot fetch"), gone);
+    // Another source of the same commit gets its own cache: having it
+    // from /lib proves nothing about /app.
+    let other = try {
+        _ = check_source(t + "/cache", entry(t + "/app", lib, tree), "file");
+        ""
+    } catch e { e.msg };
+    expect(other.starts_with("cannot fetch") || other.contains("is on no branch or tag"), other);
+    // A commit on a branch, but no longer its tip, counts; one left on
+    // no branch does not.
+    let older = lib;
+    _ = repo_with(t + "/lib", "src/more.nabi");
+    try check_source(t + "/cache", entry(t + "/lib", older, tree), "file") catch e { panic(e.msg); };
+    let loose = repo_with(t + "/lib", "src/loose.nabi");
+    let loose_tree = sh(["git", "-C", t + "/lib", "rev-parse", "HEAD:"]);
+    _ = sh(["git", "-C", t + "/lib", "reset", "-q", "--hard", "HEAD~1"]);
+    let off = try {
+        _ = check_source(t + "/cache2", entry(t + "/lib", loose, loose_tree), "file");
+        ""
+    } catch e { e.msg };
+    expect(off.contains("is on no branch or tag") || off.starts_with("cannot fetch"), off);
+    // Archives: the tree under a prefix, its digest and size.
+    let (sum, size) = try archive(db, lib, t + "/arch/geom/0.1.0.tar.gz", "geom-0.1.0") catch e { panic(e.msg); };
+    expect(sum.len() == 64 && size > 0i64 && fs::exists(t + "/arch/geom/0.1.0.tar.gz") && !fs::exists(t + "/arch/geom/0.1.0.tar.gz.tmp"), sum);
+    expect(sh(["tar", "-tzf", t + "/arch/geom/0.1.0.tar.gz"]).contains("geom-0.1.0/src/lib.nabi"), "archive paths");
+    try! fs::remove_dir_all(t);
+}
+
+#[test]
+fn archive_in_line() {
+    let t = "9a1e7c3b5d2f4a6081c9e3b7d5f2a4c6e8b0d1f3";
+    let line = f"Package {{ name: \"geom\", version: \"0.1.0\", deps: [], source: Dep::git(\"https://github.com/o/geom\", rev: \"{t}\"), tree: \"{t}\", yanked: false, nabi_version: \"0.1.0\" }}";
+    let sum = "ab".repeat(32);
+    let got = with_archive(line, t, sum);
+    expect(got.contains(f"tree: \"{t}\", archive: \"{sum}\", yanked: false"), got);
+    expect(with_archive("Package {}", t, sum) == "Package {}", "no tree: unchanged");
+}
+
+#[test]
+fn source_urls() {
+    for good in ["https://github.com/nabi-lang/json", "https://git.example.org:443/a/b.git", "https://example.invalid/geom"] {
+        expect(source_problem(good) is none, good);
+    }
+    for bad in ["http://github.com/x/y", "https://localhost/x", "https://127.0.0.1/x", "https://10.1.2.3/x", "https://[::1]/x", "https://user@github.com/x", "https://github.com:8443/x", "https://metadata/x", "https://169.254.169.254/x", "https://svc.internal/x", "https://a_b.example.org/x"] {
+        expect(!(source_problem(bad) is none), bad);
+    }
+}

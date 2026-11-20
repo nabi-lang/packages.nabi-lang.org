@@ -1,0 +1,435 @@
+// The data file (`db.nabion` under PACKAGES_DATA): accounts, sessions,
+// tokens, owners, releases and trusted publishers, and the lookups into
+// it. Callers hold `LOCK` around a read and the write that follows.
+
+use pkg::index;
+use pkg::meta;
+use pkg::meta::{Release, Actor};
+use pkg::secret;
+use pkg::server::Cfg;
+use pkg::trust;
+use pkg::trust::{TrustedPublisher, TrustToken};
+use std::fs;
+use std::nabion;
+use std::time::SystemTime;
+use web::http;
+use web::http::Request;
+
+#[derive(Nabion)]
+pub struct Account {
+    /// GitHub's numeric user id.
+    pub id: i64;
+    pub login: str;
+    pub created: i64;
+    /// GitHub's display name and avatar address at the last login; ""
+    /// when unset. Pages build the avatar from `id` (meta::avatar_url).
+    pub name: str = "";
+    pub avatar_url: str = "";
+}
+
+#[derive(Nabion)]
+pub struct Session {
+    /// SHA-256 of the cookie value.
+    pub hash: str;
+    pub account: i64;
+    pub csrf: str;
+    pub expires: i64;
+}
+
+#[derive(Nabion)]
+pub struct Token {
+    pub id: str;
+    pub name: str;
+    pub account: i64;
+    /// SHA-256 of the token.
+    pub hash: str;
+    pub created: i64;
+    pub last_used: i64;
+    /// When it stops working (unix time).
+    pub expires: i64 = 0i64;
+    /// `index::key`s it may publish and yank; empty: every package the
+    /// account may.
+    pub packages: List<str> = List::new();
+}
+
+/// Days a new publish token lasts, at most and by default.
+pub const TOKEN_DAYS_MAX: i64 = 365i64;
+pub const TOKEN_DAYS: i64 = 90i64;
+
+/// Who may publish a package: `name` is `index::key`, `native/` prefixed
+/// for native packages.
+#[derive(Nabion)]
+pub struct Owner {
+    pub name: str;
+    pub accounts: List<i64>;
+    /// Organisations and teams shown as owners. They grant no account
+    /// anything: login asks GitHub for no membership, so their members
+    /// publish through trusted publishing.
+    pub orgs: List<OrgOwner> = List::new();
+}
+
+#[derive(Nabion)]
+pub struct OrgOwner {
+    /// `org` or `org/team`, as GitHub spells the org.
+    pub login: str;
+    /// The organisation's numeric id.
+    pub id: i64;
+    pub added_by: str = "";
+    pub added_by_id: i64 = 0i64;
+    pub added: i64 = 0i64;
+}
+
+/// An account asked to become an owner of `package`; it owns nothing
+/// until it accepts.
+#[derive(Nabion)]
+pub struct Invite {
+    /// `index::key` of the package.
+    pub package: str;
+    /// The package's name as the inviter wrote it, for the page.
+    pub name: str;
+    pub account: i64;
+    pub by: i64;
+    pub at: i64;
+}
+
+/// A GitHub account the admins locked out: no login, no session, no
+/// token, no trusted publish it triggers.
+#[derive(Nabion)]
+pub struct Locked {
+    pub id: i64;
+    pub reason: str;
+    pub by: i64;
+    pub at: i64;
+}
+
+/// A package (`version` "") or one version the admins took down: yanked
+/// in the index, gone from the site, refused by the API with `reason`.
+#[derive(Nabion)]
+pub struct Removal {
+    /// `index::key`, `native/` prefixed for a native package.
+    pub name: str;
+    pub version: str = "";
+    pub reason: str;
+    pub by: i64;
+    pub at: i64;
+}
+
+#[derive(Nabion)]
+pub struct Db {
+    pub accounts: List<Account>;
+    pub sessions: List<Session>;
+    pub tokens: List<Token>;
+    pub owners: List<Owner>;
+    /// Every version published, yanked or unyanked through the API, and
+    /// the metadata filled in for lines pushed to the index directly.
+    pub releases: List<Release> = List::new();
+    /// Workflows that may trade an OIDC token for a publish token.
+    pub trusted: List<TrustedPublisher> = List::new();
+    /// Tokens traded for OIDC tokens, until they and their OIDC token expire.
+    pub trust_tokens: List<TrustToken> = List::new();
+    pub invites: List<Invite> = List::new();
+    pub locked: List<Locked> = List::new();
+    pub removed: List<Removal> = List::new();
+    /// Names (`index::key`) the admins let through the reserved list and
+    /// the look-alike check.
+    pub approved: List<str> = List::new();
+}
+
+/// Sessions an account keeps; a new login past it ends the oldest.
+pub const MAX_SESSIONS: usize = 10;
+
+/// Invitations not accepted within this long lapse.
+pub const INVITE_SECS: i64 = 2592000i64;
+
+/// Snapshots of db.nabion kept under `backup/`, one an hour at most.
+const SNAPSHOTS: usize = 72;
+
+pub fn load_db(cfg: Cfg) throws -> Db { try read_db(cfg.data) }
+
+/// `dir/db.nabion`; empty when there is none.
+pub fn read_db(dir: str) throws -> Db {
+    let p = dir + "/db.nabion";
+    if !fs::exists(p) { return Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: List::new(), releases: List::new() }; }
+    try nabion::from_str(try fs::read_to_str(p))
+}
+
+/// `dir/db.nabion` written whole (sessions kept as they are), replacing
+/// the old file in one rename. Before the first write of each hour the
+/// old file is kept as `backup/db-<yyyymmddhh>.nabion`, the newest
+/// SNAPSHOTS of them.
+pub fn write_db(dir: str, db: Db) throws {
+    let p = dir + "/db.nabion";
+    try snapshot(dir, p) catch e { eprintln(f"db backup: {e}"); };
+    try fs::write_atomic(p, (try nabion::to_str(db)) + "\n");
+}
+
+fn snapshot(dir: str, p: str) throws {
+    if !fs::exists(p) { return; }
+    let b = dir + "/backup";
+    let name = f"db-{hour_stamp(now_secs())}.nabion";
+    if fs::exists(b + "/" + name) { return; }
+    try fs::create_dir_all(b);
+    try fs::write_atomic(b + "/" + name, try fs::read(p));
+    let all: List<str> = List::new();
+    for e in (try fs::read_dir(b)).results() {
+        let n = (try e.get()).file_name();
+        if n.starts_with("db-") && n.ends_with(".nabion") { all.push(n); }
+    }
+    all.sort();
+    let extra = if all.len() > SNAPSHOTS { all.len() - SNAPSHOTS } else { 0usize };
+    for i in 0..extra { try fs::remove_file(b + "/" + all[i]) catch _ {}; }
+}
+
+/// `yyyymmddhh` (UTC) of a unix time: snapshot names sort by time.
+pub fn hour_stamp(t: i64) -> str {
+    let d = pkg::server::account::date(t).replace("-", "");
+    let h = (t % 86400i64) / 3600i64;
+    if h < 10i64 { f"{d}0{h}" } else { f"{d}{h}" }
+}
+
+/// Where `db.releases` has `k` (`index::key`, `native/` prefixed) at
+/// `version`; a record is added when there is none.
+pub fn release_at(db: Db, k: str, version: str) -> usize {
+    for i in 0..db.releases.len() {
+        if db.releases[i].name == k && db.releases[i].version == version { return i; }
+    }
+    db.releases.push(Release { name: k, version: version, meta: meta::empty(), published_by: none, yanked_by: none, unyanked_by: none });
+    db.releases.len() - 1
+}
+
+pub fn save_db(cfg: Cfg, db: Db) throws {
+    let now = now_secs();
+    let live: List<Session> = List::new();
+    for s in db.sessions {
+        if s.expires > now { live.push(s); }
+    }
+    db.sessions = live;
+    let kept: List<TrustToken> = List::new();
+    for t in db.trust_tokens {
+        if trust::live(t, now) { kept.push(t); }
+    }
+    db.trust_tokens = kept;
+    let open: List<Invite> = List::new();
+    for v in db.invites {
+        if v.at + INVITE_SECS > now { open.push(v); }
+    }
+    db.invites = open;
+    try write_db(cfg.data, db);
+}
+
+pub fn now_secs() -> i64 { SystemTime::now().unix_secs() }
+
+pub fn account_of(db: Db, id: i64) -> Account | none {
+    for a in db.accounts {
+        if a.id == id { return a; }
+    }
+    none
+}
+
+/// The session cookie. `__Host-`: only this host sets it, over https,
+/// for every path, so a sibling site under the same domain cannot.
+pub const SESSION_COOKIE: str = "__Host-pkg_session";
+pub const STATE_COOKIE: str = "__Host-pkg_state";
+
+/// Whether `s` is `n` lowercase hex digits: what the server hands out.
+pub fn is_hex(s: str, n: usize) -> bool {
+    if s.len() != n { return false; }
+    for c in s.chars() {
+        if !(c.is_ascii_digit() || (c >= 'a' && c <= 'f')) { return false; }
+    }
+    true
+}
+
+/// The cookie of a request that may name a session: 64 hex digits, so
+/// a made-up one costs no data file read.
+pub fn session_cookie(r: Request) -> str | none {
+    let c = http::cookie(r, SESSION_COOKIE);
+    if is_hex(c, 64) { c } else { none }
+}
+
+/// The live session a request's cookie names, of an account not locked.
+pub fn session_of(db: Db, r: Request) -> Session | none {
+    let c = session_cookie(r) ?? { return none; };
+    let h = secret::sha256_hex(c);
+    let now = now_secs();
+    for s in db.sessions {
+        if secret::same(s.hash, h) && s.expires > now && lock_of(db, s.account) is none { return s; }
+    }
+    none
+}
+
+/// Where `db.tokens` has the token `t` (`pkg_` + 64 hex), checked
+/// against every stored hash.
+pub fn token_at(db: Db, t: str) -> usize | none {
+    if !t.starts_with("pkg_") || !is_hex(t[4:], 64) { return none; }
+    let h = secret::sha256_hex(t);
+    let found: usize | none = none;
+    for i in 0..db.tokens.len() {
+        if secret::same(db.tokens[i].hash, h) { found = i; }
+    }
+    found
+}
+
+pub fn token_of(db: Db, t: str) -> Token | none {
+    let i = token_at(db, t) ?? { return none; };
+    db.tokens[i]
+}
+
+/// Why account `id` is locked; none when it is not.
+pub fn lock_of(db: Db, id: i64) -> Locked | none {
+    for l in db.locked {
+        if l.id == id { return l; }
+    }
+    none
+}
+
+/// The takedown of `k` (`index::key`, `native/` prefixed) as a whole, or
+/// of its `version`; none when there is none.
+pub fn removal_of(db: Db, k: str, version: str) -> Removal | none {
+    for x in db.removed {
+        if x.name == k && (x.version.is_empty() || x.version == version) { return x; }
+    }
+    none
+}
+
+/// The invitations of account `id` still open.
+pub fn invites_of(db: Db, id: i64) -> List<Invite> {
+    let out: List<Invite> = List::new();
+    let now = now_secs();
+    for v in db.invites {
+        if v.account == id && v.at + INVITE_SECS > now { out.push(v); }
+    }
+    out
+}
+
+/// The first publisher owns a name; a name already in the index with no
+/// owner on record (published before this server) is the admins'.
+pub fn may_publish(owners: List<i64> | none, in_index: bool, id: i64, admin: bool) -> bool {
+    if admin { return true; }
+    if let o: List<i64> = owners { return o.contains(id); }
+    !in_index
+}
+
+pub fn owners_of(db: Db, k: str) -> List<i64> | none {
+    for o in db.owners {
+        if o.name == k { return o.accounts; }
+    }
+    none
+}
+
+/// The owners a page shows for `k` (`index::key`): its accounts and
+/// organisations on record, then the owner of each trusted publisher's
+/// repository and of each trusted publish, once each.
+pub fn owners_for(db: Db, k: str) -> List<meta::Person> {
+    let out: List<meta::Person> = List::new();
+    let seen: Set<str> = Set::new();
+    let put = |p: meta::Person| {
+        let l = p.login.to_lowercase();
+        if p.login.is_empty() || seen.contains(l) { return; }
+        seen.insert(l);
+        out.push(p);
+    };
+    for o in db.owners {
+        if o.name != k { continue; }
+        for id in o.accounts {
+            if let a: Account = account_of(db, id) { put(meta::Person { login: a.login, name: a.name, id: a.id }); }
+        }
+        for g in o.orgs { put(meta::Person { login: g.login, id: g.id, org: true }); }
+    }
+    if k.starts_with("native/") { return out; }
+    for p in db.trusted {
+        if index::key(p.package) != k { continue; }
+        put(meta::Person { login: (p.repository.split_once("/") ?? (p.repository, "")).0, id: p.owner_id, derived: true });
+    }
+    for r in fill_owner_ids(db) {
+        if r.name != k { continue; }
+        if let a: Actor = r.published_by {
+            if a.via is meta::Via {
+                let p = meta::person_of(a);
+                p.derived = true;
+                put(p);
+            }
+        }
+    }
+    out
+}
+
+/// `db.releases`, each trusted publish that recorded no owner id given
+/// its repository's from the trusted publishers.
+pub fn fill_owner_ids(db: Db) -> List<Release> {
+    let ids: Dict<str, i64> = Dict::new();
+    for p in db.trusted {
+        if p.owner_id > 0i64 { ids.insert(p.repository.to_lowercase(), p.owner_id); }
+    }
+    let out: List<Release> = List::new();
+    for r in db.releases {
+        out.push(Release { name: r.name, version: r.version, meta: r.meta, published_by: with_owner_id(r.published_by, ids), yanked_by: with_owner_id(r.yanked_by, ids), unyanked_by: with_owner_id(r.unyanked_by, ids), yank_message: r.yank_message, downloads: r.downloads, archive: r.archive, archive_size: r.archive_size });
+    }
+    out
+}
+
+fn with_owner_id(x: Actor | none, ids: Dict<str, i64>) -> Actor | none {
+    let a = x ?? { return none; };
+    let v = a.via ?? { return a; };
+    if v.owner_id != 0i64 { return a; }
+    Actor { id: a.id, login: a.login, at: a.at, via: meta::Via { repository: v.repository, workflow: v.workflow, ref: v.ref, run_id: v.run_id, run_attempt: v.run_attempt, owner_id: ids.get(v.repository.to_lowercase()) ?? 0i64 } }
+}
+
+#[test]
+fn ownership_and_tokens() {
+    assert(may_publish(none, false, 5i64, false), "first publisher");
+    assert(!may_publish(none, true, 5i64, false), "unowned names in the index are the admins'");
+    assert(may_publish([5i64], true, 5i64, false) && !may_publish([6i64], true, 5i64, false), "owners");
+    assert(may_publish([6i64], true, 5i64, true), "admins publish any");
+    let t = "pkg_" + "ab".repeat(32);
+    let db = Db { releases: List::new(), accounts: List::new(), sessions: List::new(), tokens: [Token { id: "1", name: "n", account: 1i64, hash: secret::sha256_hex(t), created: 0i64, last_used: 0i64 }], owners: List::new() };
+    assert(token_of(db, t) is Token && token_of(db, t.replace("pkg_a", "pkg_b")) is none && token_of(db, "ab".repeat(34)) is none, "lookup");
+    let back: Db = try nabion::from_str(try! nabion::to_str(db)) catch e { panic(f"{e}"); };
+    assert(back.tokens.len() == 1 && back.tokens[0].hash == db.tokens[0].hash, "data file round trip");
+    assert(token_at(db, t) == 0usize && token_at(db, "pkg_" + "AB".repeat(32)) is none, "token index");
+    assert(is_hex("ab".repeat(32), 64) && !is_hex("ab".repeat(32) + "0", 64) && !is_hex("xy".repeat(32), 64), "hex");
+}
+
+#[test]
+fn snapshots() {
+    assert(hour_stamp(1700000000i64) == "2023111422" && hour_stamp(951782400i64) == "2000022900", hour_stamp(1700000000i64));
+    let dir = std::env::temp_dir().as_str() + f"/packages-db-{std::process::id()}";
+    try fs::remove_dir_all(dir) catch _ {};
+    try! fs::create_dir_all(dir + "/backup");
+    for i in 0..(SNAPSHOTS + 3) { try! fs::write(dir + f"/backup/db-1999{i:06}.nabion", ""); }
+    let db = Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: List::new() };
+    try! write_db(dir, db);
+    try! write_db(dir, db);
+    let n = 0usize;
+    for e in (try! fs::read_dir(dir + "/backup")).results() {
+        if (try! e.get()).file_name().starts_with("db-1999") { n += 1; }
+    }
+    assert(n == SNAPSHOTS - 1, f"old snapshots kept: {n}");
+    assert(fs::exists(dir + f"/backup/db-{hour_stamp(now_secs())}.nabion"), "this hour's snapshot");
+    try fs::remove_dir_all(dir) catch _ {};
+}
+
+#[test]
+fn owners() {
+    // Optional fields left out: accounts without names, owners without orgs.
+    let db: Db = try nabion::from_str("Db { accounts: [Account { id: 5, login: \"ann\", created: 1 }, Account { id: 6, login: \"bob\", created: 1, name: \"Bob B\" }], sessions: [], tokens: [], owners: [Owner { name: \"geom\", accounts: [5, 6] }] }") catch e { panic(f"{e}"); };
+    assert(db.accounts[0].name.is_empty() && db.owners[0].orgs.is_empty(), "defaults");
+    db.owners[0].orgs.push(OrgOwner { login: "acme/release", id: 42i64 });
+    db.trusted = [TrustedPublisher { package: "geom", repository: "acme/geom", owner_id: 42i64, workflow: "publish.yml" }, TrustedPublisher { package: "json", repository: "nabi-lang/json", owner_id: 341800840i64, workflow: "publish.yml" }];
+    let ps = owners_for(db, "geom");
+    let names: List<str> = List::new();
+    for p in ps { names.push(f"{p.login}:{p.id}:{p.name}:{p.org}:{p.derived}"); }
+    assert(names.join(",") == "ann:5::false:false,bob:6:Bob B:false:false,acme/release:42::true:false,acme:42::false:true", names.join(","));
+    // No owners on record: the trusted publisher's repository owner, and
+    // that of a trusted publish recorded before owner ids were.
+    let v = meta::Via { repository: "nabi-lang/json", workflow: "publish.yml" };
+    db.releases = [Release { name: "json", version: "0.2.0", meta: meta::empty(), published_by: Actor { id: 3i64, login: "carol", at: 1i64, via: v }, yanked_by: none, unyanked_by: none }];
+    let js = owners_for(db, "json");
+    assert(js.len() == 1 && js[0].login == "nabi-lang" && js[0].id == 341800840i64 && js[0].derived, f"{js.len()}");
+    let filled = fill_owner_ids(db)[0].published_by ?? pkg::server::api::nobody_did();
+    assert((filled.via ?? v).owner_id == 341800840i64 && filled.id == 3i64, "owner id filled in");
+    db.trusted = List::new();
+    let only = owners_for(db, "json");
+    assert(only.len() == 1 && only[0].login == "nabi-lang" && only[0].id == 0i64, "publish without an id");
+    assert(owners_for(db, "nothing").is_empty(), "unknown package");
+}

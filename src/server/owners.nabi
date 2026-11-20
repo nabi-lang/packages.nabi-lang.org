@@ -1,0 +1,274 @@
+// Who may change a package: its owners (accounts, organisations, teams)
+// and its trusted publishers, added and removed from the account pages
+// and the API. An account becomes an owner by accepting an invitation.
+// GitHub is asked before `LOCK` is taken, never under it.
+
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::meta;
+use pkg::packages;
+use pkg::secret;
+use pkg::server::admin::{Audit, audit};
+use pkg::server::github::{github_owner, github_repo, is_login};
+use pkg::server::store::{Account, Db, Invite, OrgOwner, Owner, account_of, invites_of, load_db, now_secs, owners_of, save_db};
+use pkg::server::{Cfg, LOCK, STALE};
+use pkg::trust;
+use pkg::trust::TrustedPublisher;
+
+const MAX_OWNERS: usize = 32;
+
+/// Whether account `id` may add and remove `k`'s trusted publishers: its
+/// owners and the admins. A package with no owner on record (not published
+/// yet, or published before this server) is the admins' alone.
+pub fn may_manage(db: Db, k: str, id: i64, admin: bool) -> bool {
+    admin || (owners_of(db, k) ?? List::new()).contains(id)
+}
+
+/// The trusted publishers account `id` may see and change.
+pub fn managed(db: Db, id: i64, admin: bool) -> List<TrustedPublisher> {
+    let out: List<TrustedPublisher> = List::new();
+    for p in db.trusted {
+        if may_manage(db, index::key(p.package), id, admin) { out.push(p); }
+    }
+    out
+}
+
+fn data(cfg: Cfg) throws (ApiError) -> Db { try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); } }
+
+fn save(cfg: Cfg, db: Db) throws (ApiError) { try save_db(cfg, db) catch e { throw index::err(500, f"data: {e}"); }; }
+
+/// Add `p` for account `a`, with its repository's owner id from GitHub.
+pub fn add_trusted(cfg: Cfg, a: Account, admin: bool, p: TrustedPublisher) throws (ApiError) -> TrustedPublisher {
+    try trust::check_publisher(p);
+    let k = index::key(p.package);
+    let denied = index::err(403, f"only the owners of `{p.package}` and the admins add its trusted publishers");
+    if !may_manage(try data(cfg), k, a.id, admin) { throw denied; }
+    let (full, owner_id) = try github_repo(cfg, p.repository);
+    let out = TrustedPublisher {
+        package: p.package,
+        repository: full,
+        owner_id: owner_id,
+        workflow: p.workflow,
+        environment: p.environment,
+        id: try secret::random_hex(8) catch e { throw index::err(500, f"{e}"); },
+        added_by: a.login,
+        added_by_id: a.id,
+        added: now_secs(),
+    };
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        if !may_manage(db, k, a.id, admin) { throw denied; }
+        let n = 0usize;
+        for q in db.trusted {
+            if trust::same(q, out) { throw index::err(409, f"`{p.package}` already trusts {q.repository} {q.workflow}"); }
+            if index::key(q.package) == k { n += 1; }
+        }
+        if n >= trust::MAX_PER_PACKAGE { throw index::err(400, f"a package has at most {trust::MAX_PER_PACKAGE} trusted publishers; remove one first"); }
+        db.trusted.push(out);
+        try save(cfg, db);
+    }
+    // A trusted publisher's repository owner is shown as an owner.
+    STALE.store(1);
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: "trusted-add", target: f"{out.package} {out.repository} {out.workflow} {out.environment}".trim() });
+    out
+}
+
+/// Remove trusted publisher `id` for account `a`.
+pub fn remove_trusted(cfg: Cfg, a: Account, admin: bool, id: str) throws (ApiError) {
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        let keep: List<TrustedPublisher> = List::new();
+        let gone = false;
+        for p in db.trusted {
+            if p.id != id {
+                keep.push(p);
+                continue;
+            }
+            if !may_manage(db, index::key(p.package), a.id, admin) { throw index::err(404, "no such trusted publisher"); }
+            if p.seeded { throw index::err(400, "this trusted publisher is in the server's PACKAGES_TRUSTED file; remove it there"); }
+            gone = true;
+        }
+        if !gone { throw index::err(404, "no such trusted publisher"); }
+        db.trusted = keep;
+        try save(cfg, db);
+    }
+    STALE.store(1);
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: "trusted-remove", target: id });
+}
+
+/// Whether `who` may be written as an owner: a login, or `org/team`.
+pub fn owner_name(who: str) -> (str, str) | none {
+    let (org, team) = who.split_once("/") ?? (who, "");
+    if !is_login(org) { return none; }
+    if who.contains("/") {
+        if team.is_empty() || team.len() > 100 { return none; }
+        for c in team.chars() {
+            if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') { return none; }
+        }
+    }
+    (org, team)
+}
+
+/// Where `db.owners` has `k`; a record is added when there is none.
+fn owner_at(db: Db, k: str) -> usize {
+    for i in 0..db.owners.len() {
+        if db.owners[i].name == k { return i; }
+    }
+    db.owners.push(Owner { name: k, accounts: List::new() });
+    db.owners.len() - 1
+}
+
+/// Whether account `a` may change the owners of package `package`, and its
+/// key: the package is in the index and `a` manages it.
+fn owner_check(cfg: Cfg, db: Db, a: Account, admin: bool, package: str) throws (ApiError) -> str {
+    if !packages::is_name(package) { throw index::err(400, f"`{package}` is not a package name"); }
+    let k = index::key(package);
+    if !may_manage(db, k, a.id, admin) { throw index::err(403, f"only the owners of `{package}` and the admins change its owners"); }
+    if !(try index::exists(cfg.index, false, package)) { throw index::err(404, f"`{package}` is not in the index"); }
+    if (try index::is_library(cfg.index, package)) { throw index::err(403, f"`{package}` is the standard library's entry; the Nabi project owns it"); }
+    k
+}
+
+/// Whether organisation `org_id` vouches for being shown as an owner of
+/// `k`: one of its repositories is a trusted publisher of it.
+pub fn org_vouched(db: Db, k: str, org_id: i64) -> bool {
+    for p in db.trusted {
+        if index::key(p.package) == k && p.owner_id == org_id && org_id > 0i64 { return true; }
+    }
+    false
+}
+
+/// Add `who` to the owners of `package` for account `a`. A user (who has
+/// logged in here once) is invited and owns it once they accept; an
+/// organisation or `org/team` is listed at once, by an admin or when one
+/// of the organisation's repositories is a trusted publisher of it.
+pub fn add_owner(cfg: Cfg, a: Account, admin: bool, package: str, who: str) throws (ApiError) -> meta::Person {
+    let k = try owner_check(cfg, try data(cfg), a, admin, package);
+    let (org, team) = owner_name(who) ?? { throw index::err(400, f"`{who}` is not a GitHub name; write a user's login, an organization, or org/team"); };
+    let (name, id, is_org) = try github_owner(cfg, org);
+    if !is_org && !team.is_empty() { throw index::err(400, f"{name} is a user, and only an organization has teams; write `{name}`"); }
+    let out = meta::Person { login: name, id: id };
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        _ = try owner_check(cfg, db, a, admin, package);
+        let i = owner_at(db, k);
+        let pending = 0usize;
+        for v in db.invites {
+            if v.package == k { pending += 1; }
+        }
+        if db.owners[i].accounts.len() + db.owners[i].orgs.len() + pending >= MAX_OWNERS { throw index::err(400, f"a package has at most {MAX_OWNERS} owners; remove one first"); }
+        if !is_org {
+            let u = account_of(db, id) ?? { throw index::err(400, f"{name} has not logged in to packages.nabi-lang.org yet; a user logs in once before being added as an owner"); };
+            if db.owners[i].accounts.contains(u.id) { throw index::err(409, f"{name} already owns `{package}`"); }
+            for v in db.invites {
+                if v.package == k && v.account == u.id { throw index::err(409, f"{name} is invited to own `{package}` already; they accept on their account page"); }
+            }
+            db.invites.push(Invite { package: k, name: package, account: u.id, by: a.id, at: now_secs() });
+            out = meta::Person { login: name, name: u.name, id: u.id };
+        } else {
+            if !admin && !org_vouched(db, k, id) {
+                throw index::err(403, f"{name} is listed as an owner of `{package}` by the admins, or once one of its repositories is a trusted publisher of `{package}`");
+            }
+            let login = if team.is_empty() { name } else { name + "/" + team.to_lowercase() };
+            for o in db.owners[i].orgs {
+                if o.login.to_lowercase() == login.to_lowercase() { throw index::err(409, f"{login} already owns `{package}`"); }
+            }
+            db.owners[i].orgs.push(OrgOwner { login: login, id: id, added_by: a.login, added_by_id: a.id, added: now_secs() });
+            out = meta::Person { login: login, id: id, org: true };
+        }
+        try save(cfg, db);
+    }
+    STALE.store(1);
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: "owner-add", target: f"{package} {who}" });
+    out
+}
+
+/// Accept (or decline) account `a`'s invitation to own `package`.
+pub fn accept_invite(cfg: Cfg, a: Account, package: str, accept: bool) throws (ApiError) {
+    let k = index::key(package);
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        let found = false;
+        for v in invites_of(db, a.id) {
+            if v.package == k { found = true; }
+        }
+        if !found { throw index::err(404, f"no open invitation to own `{package}`"); }
+        let keep: List<Invite> = List::new();
+        for v in db.invites {
+            if !(v.package == k && v.account == a.id) { keep.push(v); }
+        }
+        db.invites = keep;
+        if accept {
+            let i = owner_at(db, k);
+            if !db.owners[i].accounts.contains(a.id) { db.owners[i].accounts.push(a.id); }
+        }
+        try save(cfg, db);
+    }
+    STALE.store(1);
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: if accept { "invite-accept" } else { "invite-decline" }, target: package });
+}
+
+/// Remove `who` (a login, an organisation or `org/team`; or the account
+/// `id` when not 0) from the owners and invitations of `package` for
+/// account `a`. A name is resolved to its GitHub id first: logins change
+/// hands, ids do not.
+pub fn remove_owner(cfg: Cfg, a: Account, admin: bool, package: str, who: str, id: i64) throws (ApiError) {
+    let k = try owner_check(cfg, try data(cfg), a, admin, package);
+    let target = id;
+    let team = "";
+    if target == 0i64 {
+        let (org, t) = owner_name(who) ?? { throw index::err(400, f"`{who}` is not a GitHub name; write a user's login, an organization, or org/team"); };
+        let (_, gid, _) = try github_owner(cfg, org);
+        target = gid;
+        team = t.to_lowercase();
+    }
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        _ = try owner_check(cfg, db, a, admin, package);
+        let gone = false;
+        for i in 0..db.owners.len() {
+            if db.owners[i].name != k { continue; }
+            if team.is_empty() && db.owners[i].accounts.contains(target) {
+                let ids: List<i64> = List::new();
+                for x in db.owners[i].accounts {
+                    if x != target { ids.push(x); }
+                }
+                db.owners[i].accounts = ids;
+                gone = true;
+            }
+            let orgs: List<OrgOwner> = List::new();
+            for o in db.owners[i].orgs {
+                let t = (o.login.split_once("/") ?? (o.login, "")).1.to_lowercase();
+                if o.id == target && t == team { gone = true; } else { orgs.push(o); }
+            }
+            db.owners[i].orgs = orgs;
+        }
+        let keep: List<Invite> = List::new();
+        for v in db.invites {
+            if v.package == k && v.account == target && team.is_empty() { gone = true; } else { keep.push(v); }
+        }
+        db.invites = keep;
+        if !gone { throw index::err(404, f"`{who}` does not own `{package}`"); }
+        try save(cfg, db);
+    }
+    STALE.store(1);
+    let whom = if who.is_empty() { f"{id}" } else { who };
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: "owner-remove", target: f"{package} {whom}" });
+}
+
+#[test]
+fn owner_rights() {
+    let db = Db { accounts: [Account { id: 5i64, login: "ann", created: 0i64 }], sessions: List::new(), tokens: List::new(), owners: [Owner { name: "geom", accounts: [5i64] }] };
+    let cfg = Cfg { url: "", addr: "", client_id: "", client_secret: "", admins: ",1001,", data: "", index: "/nonexistent", oauth: "", api: "" };
+    let bob = Account { id: 6i64, login: "bob", created: 0i64 };
+    // Refused before the index or GitHub is asked.
+    let s = [0, 0, 0];
+    try owner_check(cfg, db, bob, false, "geom") catch e { s[0] = e.status; "" };
+    try owner_check(cfg, db, bob, false, "json") catch e { s[1] = e.status; "" };
+    try owner_check(cfg, db, bob, false, "Not A Name") catch e { s[2] = e.status; "" };
+    assert(s[0] == 403 && s[1] == 403 && s[2] == 400, f"a non-owner, an unowned package, a bad name: {s:?}");
+    assert(!(owner_name("acme") is none) && !(owner_name("serde-rs/publish") is none), "names");
+    assert(owner_name("") is none && owner_name("a b") is none && owner_name("acme/") is none && owner_name("acme/x/y") is none && owner_name("../x") is none, "bad names");
+    db.trusted = [TrustedPublisher { package: "geom", repository: "acme/geom", owner_id: 42i64, workflow: "publish.yml" }];
+    assert(org_vouched(db, "geom", 42i64) && !org_vouched(db, "geom", 43i64) && !org_vouched(db, "json", 42i64), "an organisation vouches through its trusted publisher");
+}

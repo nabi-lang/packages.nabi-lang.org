@@ -1,0 +1,38 @@
+//! Automatic differentiation for f64 code on core's `Array`.
+//!
+//! Forward mode carries derivatives alongside values: `Dual` (one
+//! direction), `Duals<N>` (N directions per evaluation), `HyperDual`
+//! (exact second derivatives) and `Jet` (Taylor series of any order).
+//! Reverse mode records a `Tape` of `Var` operations and sweeps it back
+//! once, so the gradient of f: R^n -> R costs a small multiple of one
+//! evaluation whatever n is. A function written once over `Smooth` runs
+//! in every mode. `grad`, `jacobian`, `hessian`, `jvp`, `vjp` and
+//! `derivatives` pick the mode from the number type the function takes.
+//!
+//! `∂` and `∇` (feature `ops`) return a derivative in the form of what
+//! they are given, never a value at a point: a function for a function,
+//! samples for samples; the value is `∂(f)(x)`. They dispatch through
+//! the `Derive` and `Gradient` traits, so other packages extend the same
+//! two names. Every result is exact to rounding: no step sizes.
+//!
+//! Pure Nabi: every target, wasm included, gets the same results.
+
+#[cfg(feature = "ops")]
+pub mod ops;
+
+mod diff;
+mod dual;
+mod grid;
+mod hyper;
+mod jet;
+mod lanes;
+mod smooth;
+mod tape;
+
+pub use diff::{ScalarFn, VectorFn, derivative, derivatives, grad, hessian, jacobian, jvp, seed, value_grad, value_jacobian, vjp};
+pub use dual::Dual;
+pub use hyper::HyperDual;
+pub use jet::Jet;
+pub use lanes::Duals;
+pub use smooth::Smooth;
+pub use tape::{Adjoints, Tape, Var};

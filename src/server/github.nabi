@@ -1,0 +1,127 @@
+// GitHub over curl: the OAuth login's user, a repository and a user or
+// organisation by name. Secrets go to curl on stdin, never in argv.
+
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::json;
+use pkg::server::Cfg;
+use pkg::server::store::Account;
+use pkg::trust;
+use std::process::{Command, Stdio, ChildStdin, ChildStdout};
+use web::http;
+
+/// A curl config value, quoted.
+pub fn cq(s: str) -> str {
+    if s.contains("\n") || s.contains("\r") { panic("newline in a curl config value"); }
+    "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+}
+
+/// Run `curl` with `config` on stdin (secrets never reach argv); its stdout.
+pub fn curl(config: str) throws (ApiError) -> str {
+    let c = try Command::new("curl").args(["--config", "-"]).stdin(Stdio::Piped).stdout(Stdio::Piped).stderr(Stdio::Null).spawn() catch e {
+        throw index::err(502, f"cannot run curl: {e}");
+    };
+    let full = config + "silent\nshow-error\nfail\nmax-time = 20\n";
+    if let w: ChildStdin = c.take_stdin() {
+        try w.write_all(full) catch _ {};
+        try w.close() catch _ {};
+    }
+    let out = "";
+    if let rd: ChildStdout = c.take_stdout() {
+        out = try str::from_utf8(try rd.read_to_end() catch _ { List::<u8>::new() }) catch _ { "" };
+        try rd.close() catch _ {};
+    }
+    let st = try c.wait() catch _ { throw index::err(502, "GitHub did not answer"); };
+    if !st.success() { throw index::err(502, "GitHub did not answer"); }
+    out
+}
+
+fn safe_token(t: str) -> bool {
+    if t.is_empty() || t.len() > 512 { return false; }
+    for c in t.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') { return false; }
+    }
+    true
+}
+
+/// A GitHub login: letters, digits, `-`.
+pub fn is_login(s: str) -> bool {
+    if s.is_empty() || s.len() > 39 { return false; }
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-') { return false; }
+    }
+    true
+}
+
+/// GitHub's display name as sent: one line of at most 100 characters,
+/// "" when it is null or not given.
+pub fn display_name(raw: str) -> str {
+    let t = raw.trim();
+    if t == "null" { return ""; }
+    let out = StrBuf::new();
+    let n = 0usize;
+    for c in t.chars() {
+        if n == 100 { break; }
+        out.push(if (c as u32) < 0x20u32 { ' ' } else { c });
+        n += 1;
+    }
+    out.to_str()
+}
+
+/// The GitHub account behind an OAuth `code`.
+pub fn github_user(cfg: Cfg, code: str) throws (ApiError) -> Account {
+    let callback = cfg.url + "/auth/github/callback";
+    let data = f"client_id={http::pct_encode(cfg.client_id)}&client_secret={http::pct_encode(cfg.client_secret)}&code={http::pct_encode(code)}&redirect_uri={http::pct_encode(callback)}";
+    let ua = "header = " + cq("User-Agent: packages.nabi-lang.org") + "\n";
+    let tok = json::fields(try curl(f"url = {cq(cfg.oauth + "/login/oauth/access_token")}\n{ua}header = {cq("Accept: application/json")}\ndata = {cq(data)}\n"));
+    let access = tok.get("access_token") ?? "";
+    if !safe_token(access) { throw index::err(400, "GitHub refused the login; try again"); }
+    let user = json::fields(try curl(f"url = {cq(cfg.api + "/user")}\n{ua}header = {cq("Accept: application/vnd.github+json")}\nheader = {cq("Authorization: Bearer " + access)}\n"));
+    let id = try (user.get("id") ?? "").parse::<i64>() catch _ { throw index::err(502, "GitHub sent no user id"); };
+    let login = user.get("login") ?? "";
+    if id <= 0i64 || !is_login(login) { throw index::err(502, "GitHub sent a malformed user"); }
+    let av = user.get("avatar_url") ?? "";
+    Account { id: id, login: login, created: 0i64, name: display_name(user.get("name") ?? ""), avatar_url: if av.starts_with("https://") && av.len() <= 512 { av } else { "" } }
+}
+
+/// The User-Agent and, with GITHUB_API_TOKEN, the Authorization header
+/// of a lookup in GitHub's API, as curl config lines.
+fn api_headers(cfg: Cfg) -> str {
+    let ua = "header = " + cq("User-Agent: packages.nabi-lang.org") + "\n";
+    if cfg.api_token.is_empty() || !safe_token(cfg.api_token) { return ua; }
+    ua + "header = " + cq("Authorization: Bearer " + cfg.api_token) + "\n"
+}
+
+/// GitHub's spelling of `repo` and its owner's numeric id.
+pub fn github_repo(cfg: Cfg, repo: str) throws (ApiError) -> (str, i64) {
+    let ua = api_headers(cfg);
+    let text = try curl(f"url = {cq(cfg.api + "/repos/" + repo)}\n{ua}header = {cq("Accept: application/vnd.github+json")}\n") catch _ {
+        throw index::err(400, f"GitHub shows no public repository {repo}");
+    };
+    let full = json::fields(text).get("full_name") ?? "";
+    let owner = json::fields(json::member(text, "owner") ?? "{}");
+    let id = try (owner.get("id") ?? "").parse::<i64>() catch _ { 0i64 };
+    if !trust::is_repo(full) || id <= 0i64 { throw index::err(502, "GitHub sent a malformed repository"); }
+    (full, id)
+}
+
+/// A GitHub user or organisation by name: GitHub's spelling, its id and
+/// whether it is an organisation.
+pub fn github_owner(cfg: Cfg, name: str) throws (ApiError) -> (str, i64, bool) {
+    let ua = api_headers(cfg);
+    let text = try curl(f"url = {cq(cfg.api + "/users/" + name)}\n{ua}header = {cq("Accept: application/vnd.github+json")}\n") catch _ {
+        throw index::err(400, f"GitHub has no user or organization `{name}`");
+    };
+    let f = json::fields(text);
+    let login = f.get("login") ?? "";
+    let id = try (f.get("id") ?? "").parse::<i64>() catch _ { 0i64 };
+    if !is_login(login) || id <= 0i64 { throw index::err(502, "GitHub sent a malformed user"); }
+    (login, id, (f.get("type") ?? "") == "Organization")
+}
+
+#[test]
+fn quoting() {
+    assert(cq("a\"b\\c") == "\"a\\\"b\\\\c\"", "curl quoting");
+    assert(display_name("null").is_empty() && display_name(" Ann\nLee ") == "Ann Lee" && display_name("x".repeat(200)).len() == 100, "display names");
+    assert(pkg::server::host_of("https://packages.nabi-lang.org") == "packages.nabi-lang.org" && pkg::server::host_of("http://Localhost:8080/x") == "localhost", "hosts");
+}

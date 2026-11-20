@@ -1,0 +1,28 @@
+//! Queries over CSV files: `parse` reads a query, `run` applies it to a
+//! table and gives the rows that match.
+
+/// A parsed query: `select a, b where c > 1 group by d`.
+pub struct Query {
+    /// The columns kept, in order; empty: every column.
+    pub select: List<str>;
+    /// The filter, as written.
+    pub filter: str;
+    /// The columns to group by; empty: no grouping.
+    pub group_by: List<str>;
+}
+
+/// Why a query could not be read.
+pub struct QueryError {
+    /// Byte offset of the problem in the query text.
+    pub at: usize;
+    pub message: str;
+}
+
+/// Read `text` as a query.
+pub fn parse(text: str) throws (QueryError) -> Query {
+    if text.trim().is_empty() { throw QueryError { at: 0usize, message: "empty query" }; }
+    Query { select: List::new(), filter: text, group_by: List::new() }
+}
+
+/// The rows of the CSV `input` that `q` keeps, as CSV text.
+pub fn run(q: Query, input: str) -> str { input }

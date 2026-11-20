@@ -1,0 +1,61 @@
+//! Numerical optimization on core's `Array`: roots and minima of scalar
+//! functions, unconstrained minimization (simplex, Powell, conjugate
+//! gradients, BFGS, L-BFGS, Newton-CG, trust regions), bounds (L-BFGS-B,
+//! projected gradient), nonlinear constraints (augmented Lagrangian),
+//! linear and convex quadratic programs (simplex, interior point),
+//! nonlinear least squares and curve fitting (Levenberg-Marquardt,
+//! trust-region reflective, robust losses), systems of equations
+//! (Newton, Broyden, hybrid Powell) and global search (differential
+//! evolution, basin hopping, simulated annealing).
+//!
+//! Derivatives come from the user, from automatic differentiation
+//! (autodiff's `Dual` forward mode or `Var` reverse mode), from the
+//! complex step, or from finite differences. Bad input throws an
+//! `OptimizeError` that says what to write instead; a run that does not
+//! converge returns its result with the reason in `status`.
+//!
+//! Pure Nabi on f64: every target, wasm included, gets the same results.
+
+#[cfg(feature = "ops")]
+pub mod ops;
+pub mod problems;
+
+mod bound;
+mod constrained;
+mod diff;
+mod dual;
+mod error;
+mod global;
+mod line;
+mod linear;
+mod lsq;
+mod minimize;
+mod objective;
+mod result;
+mod scalar;
+mod system;
+
+pub use autodiff::{Dual, Smooth, Var, derivative, grad, jacobian, value_grad};
+pub use bound::Bounds;
+pub use bound::lbfgsb::lbfgsb;
+pub use bound::projected::projected_gradient;
+pub use constrained::{Constrained, Constraint, auglag};
+pub use diff::{Diff, approx_grad, approx_hessian, approx_jacobian, check_grad, complex_step_grad, hessian_from_grad};
+pub use error::OptimizeError;
+pub use global::{basin_hopping, differential_evolution, simulated_annealing};
+pub use line::{LineSearch, LineStep, line_search};
+pub use linear::{Lp, LpMethod, LpSolution, Qp, linprog, quadprog};
+pub use lsq::fit::{Fit, Model, curve_fit};
+pub use lsq::{IntoResiduals, LeastSquares, Loss, LsqMethod, LsqOptions, Residuals, least_squares};
+pub use minimize::cg::{Conjugate, cg};
+pub use minimize::nelder::nelder_mead;
+pub use minimize::newton::newton_cg;
+pub use minimize::powell::powell;
+pub use minimize::quasi::{bfgs, lbfgs};
+pub use minimize::trust::{trust_dogleg, trust_ncg};
+pub use minimize::{Method, minimize};
+pub use objective::{IntoObjective, Objective};
+pub use result::{Minimum, Options, Status, Step};
+pub use scalar::min::{Bracket, ScalarMin, bounded, bracket, brent, golden, minimize_scalar};
+pub use scalar::root::{Root, bisect, bracket_root, brentq, halley, newton, newton_ad, ridder, secant, toms748};
+pub use system::{Broyden, SystemRoot, broyden, hybr, root, root_newton};

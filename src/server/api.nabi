@@ -1,0 +1,612 @@
+// The `/api/v1/` routes: package info, READMEs and source archives for
+// anyone; publish, yank, owners, trusted publishers and moderation for a
+// token.
+//
+// Nothing slow runs under a lock. Reads take the data file as it is (it
+// is replaced in one rename). A package's source is fetched and checked
+// before any lock is taken; then `INDEX` covers the index commit and
+// push, and `LOCK`, inside it, the data file's read and write.
+
+use pkg::docs;
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::meta;
+use pkg::meta::{Release, Actor};
+use pkg::packages;
+use pkg::server::admin::admin_route;
+use pkg::server::auth::exchange;
+use pkg::server::limit;
+use pkg::server::names;
+use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, remove_owner, remove_trusted};
+use pkg::server::store::{Account, Db, Locked, Owner, Removal, account_of, fill_owner_ids, load_db, lock_of, may_publish, now_secs, owners_of, release_at, removal_of, save_db, token_at};
+use pkg::server::{Cfg, Resp, api_error, INDEX, is_admin, LOCK, may_act, nabion_resp, STALE};
+use pkg::trust;
+use pkg::trust::{TrustedPublisher, TrustToken};
+use std::fs;
+use std::nabion;
+use std::nabion::Value;
+use web::http;
+use web::http::Request;
+
+#[derive(Nabion)]
+#[nabion(deny_unknown_fields)]
+pub struct Yank {
+    pub name: str;
+    pub version: str;
+    pub undo: bool = false;
+    pub native: bool = false;
+    /// Why; kept with the version until it is unyanked.
+    pub message: str = "";
+}
+
+const YANK_MESSAGE_MAX: usize = 512;
+
+/// New package names an account may take a day; the admins have no cap.
+pub const NEW_NAMES_PER_DAY: usize = 10;
+
+/// A token's `last_used` is written at most this often.
+const LAST_USED_SECS: i64 = 3600i64;
+
+/// The protocols a package source is fetched over.
+const SOURCE_PROTOCOLS: str = "https";
+
+/// Sources being fetched for a publish: one fetch per source at a time.
+static FETCHING: Mutex<Set<str>> = Mutex::new(Set::new());
+
+pub fn api_route(cfg: Cfg, r: Request, client: str) -> Resp {
+    try api(cfg, r, client) catch e { api_error(e.status, e.msg) }
+}
+
+fn actor_value(a: Actor | none) -> Value {
+    match a {
+        x: Actor => {
+            // A trusted publish is the repository owner's; who started the
+            // run stays in the data file only.
+            let shown = match x.via {
+                w: meta::Via => Actor { id: 0i64, login: meta::owner_of(w), at: x.at, via: w },
+                none => x,
+            };
+            let v = nabion::to_value(shown);
+            // An account's record has no `via`.
+            if let Value::Struct { name: n, fields } = v {
+                if fields.get("via") == Value::None { fields.remove("via"); }
+                return Value::Struct { name: n, fields: fields };
+            }
+            v
+        },
+        none => Value::None,
+    }
+}
+
+/// Refuse a taken-down package or version with the reason.
+fn gone(db: Db, k: str, name: str, version: str) throws (ApiError) {
+    if let x: Removal = removal_of(db, k, version) {
+        let what = if x.version.is_empty() { name } else { f"{name} {x.version}" };
+        throw index::err(451, f"{what} was taken down by the registry: {x.reason}");
+    }
+}
+
+/// `GET /api/v1/packages/<name>` and `/api/v1/native/<name>`: the owners,
+/// and each version in the index with its dependencies (as the index
+/// line has them), metadata, README presence, archive, downloads and who
+/// published, yanked and unyanked it. No token needed.
+fn package_info(cfg: Cfg, db: Db, native: bool, name: str) throws (ApiError) -> Resp {
+    if !packages::is_name(name) { throw index::err(404, f"`{name}` is not a package name"); }
+    let k = (if native { "native/" } else { "" }) + index::key(name);
+    try gone(db, k, name, "");
+    let lines = try index::lines_for(cfg.index, native, name);
+    if lines.is_empty() { throw index::err(404, f"{if native { "native package" } else { "package" }} `{name}` is not in the index"); }
+    let owners: List<Value> = List::new();
+    for id in owners_of(db, k) ?? List::new() {
+        let a = account_of(db, id) ?? Account { id: id, login: "", created: 0i64 };
+        let f: Dict<str, Value> = Dict::new();
+        f.insert("id", Value::Int(Int::from(a.id)));
+        f.insert("login", Value::Str(a.login));
+        owners.push(Value::Struct { name: none, fields: f });
+    }
+    let orgs: List<Value> = List::new();
+    for o in db.owners {
+        if o.name != k { continue; }
+        for g in o.orgs {
+            let f: Dict<str, Value> = Dict::new();
+            f.insert("id", Value::Int(Int::from(g.id)));
+            f.insert("login", Value::Str(g.login));
+            orgs.push(Value::Struct { name: none, fields: f });
+        }
+    }
+    let rels = fill_owner_ids(db);
+    let list: List<Value> = List::new();
+    // The package is official when its latest version is (pick_latest).
+    let vs: List<packages::Version> = List::new();
+    for line in lines {
+        let v = if let Value::Str(x) = line.get("version") ?? Value::None { x } else { "" };
+        let yanked = line.get("yanked") == Value::Bool(true);
+        let rel = Release { name: k, version: v, meta: meta::empty(), published_by: none, yanked_by: none, unyanked_by: none };
+        for r in rels {
+            if r.name == k && r.version == v { rel = r; }
+        }
+        let removed = Value::None;
+        if let x: Removal = removal_of(db, k, v) { removed = Value::Str(x.reason); }
+        let archive = Value::None;
+        if !rel.archive.is_empty() && removed == Value::None {
+            let a: Dict<str, Value> = Dict::new();
+            a.insert("sha256", Value::Str(rel.archive));
+            a.insert("size", Value::Int(Int::from(rel.archive_size)));
+            a.insert("url", Value::Str(f"{cfg.url}/api/v1/packages/{name}/{v}/download"));
+            archive = Value::Struct { name: "Archive", fields: a };
+        }
+        let f: Dict<str, Value> = Dict::new();
+        f.insert("version", Value::Str(v));
+        f.insert("yanked", Value::Bool(yanked));
+        f.insert("yank_message", if yanked && !rel.yank_message.is_empty() { Value::Str(rel.yank_message) } else { Value::None });
+        f.insert("removed", removed);
+        f.insert("deps", line.get("deps") ?? (if native { Value::Dict(Dict::new()) } else { Value::List(List::new()) }));
+        f.insert("meta", meta::to_value(rel.meta));
+        f.insert("has_readme", Value::Bool(fs::exists(meta::readme_file(cfg.data, k, v))));
+        f.insert("archive", archive);
+        f.insert("downloads", Value::Int(Int::from(rel.downloads)));
+        f.insert("published_by", actor_value(rel.published_by));
+        f.insert("yanked_by", actor_value(rel.yanked_by));
+        f.insert("unyanked_by", actor_value(rel.unyanked_by));
+        let official = line.get("official") == Value::Bool(true);
+        f.insert("official", Value::Bool(official));
+        list.push(Value::Struct { name: "Version", fields: f });
+        vs.push(packages::Version { version: v, deps: List::new(), url: "", rev: "", tree: "", yanked: yanked, features: List::new(), official: official });
+    }
+    let official = !native && packages::pick_latest(vs).official;
+    nabion_resp(200, "Package", [("name", Value::Str(name)), ("native", Value::Bool(native)), ("owners", Value::List(owners)), ("orgs", Value::List(orgs)), ("versions", Value::List(list)), ("official", Value::Bool(official))])
+}
+
+/// `GET /api/v1/packages/<name>/<version>/readme`: the README text sent
+/// with that version, as Markdown.
+fn readme_of(cfg: Cfg, db: Db, native: bool, name: str, version: str) throws (ApiError) -> Resp {
+    if !packages::is_name(name) || !index::is_version(version) { throw index::err(404, "no such package version"); }
+    let k = (if native { "native/" } else { "" }) + index::key(name);
+    try gone(db, k, name, version);
+    let p = meta::readme_file(cfg.data, k, version);
+    if !fs::exists(p) { throw index::err(404, f"{name} {version} was published without a README"); }
+    let text = try fs::read_to_str(p) catch e { throw index::err(500, f"readme: {e}"); };
+    Resp { status: 200, headers: ["Content-Type: text/markdown; charset=utf-8", "Cache-Control: public, max-age=60"], body: text, file: "" }
+}
+
+/// `GET /api/v1/packages/<name>/<version>/download`: the source archive
+/// kept at publish (the package info's `archive` has its SHA-256).
+fn download(cfg: Cfg, db: Db, name: str, version: str) throws (ApiError) -> Resp {
+    if !packages::is_name(name) || !index::is_version(version) { throw index::err(404, "no such package version"); }
+    let k = index::key(name);
+    try gone(db, k, name, version);
+    let p = meta::archive_file(cfg.data, k, version);
+    if !fs::exists(p) { throw index::err(404, f"no source archive of {name} {version} is kept; fetch its git source"); }
+    Resp {
+        status: 200,
+        headers: ["Content-Type: application/gzip", f"Content-Disposition: attachment; filename=\"{name}-{version}.tar.gz\"", "Cache-Control: public, max-age=86400"],
+        body: "",
+        file: p,
+    }
+}
+
+/// Who a request's token speaks for: an account, or a token traded for
+/// an OIDC token, which may touch only the packages in `scope`.
+struct Auth {
+    account: Account;
+    admin: bool;
+    /// `index::key`s an exchanged token may publish and yank; none: an
+    /// account's token.
+    scope: List<str> | none;
+    /// Shown by `/api/v1/me` and recorded as the actor.
+    login: str;
+    /// The index commit's author.
+    who: str;
+    /// Recorded as who published or yanked.
+    actor: Actor;
+    /// What its rate limit counts by.
+    key: str;
+    /// `index::key`s an account's token is limited to; empty: none.
+    only: List<str> = List::new();
+}
+
+pub fn nobody_did() -> Actor { Actor { id: 0i64, login: "", at: 0i64 } }
+
+/// Who an exchanged token acts for: the user who triggered the run, and
+/// the run. A token with no run on record names its workflow instead.
+fn trusted_actor(t: TrustToken) -> Actor {
+    match t.via {
+        v: meta::Via => Actor { id: t.actor_id, login: t.actor, at: 0i64, via: v },
+        none => Actor { id: 0i64, login: t.publisher, at: 0i64 },
+    }
+}
+
+fn may(auth: Auth, db: Db, k: str, in_index: bool) -> bool {
+    match auth.scope {
+        s: List<str> => s.contains(k),
+        none => (auth.only.is_empty() || auth.only.contains(k)) && may_publish(owners_of(db, k), in_index, auth.account.id, auth.admin),
+    }
+}
+
+fn nabion_value(status: i32, v: Value) -> Resp {
+    Resp {
+        status: status,
+        headers: ["Content-Type: application/nabion; charset=utf-8", "Cache-Control: no-store"],
+        body: (try! nabion::to_str_flat(v)) + "\n",
+        file: "",
+    }
+}
+
+/// The account or exchanged token a request presents. Refused: none or
+/// a bad one, a locked account, an account that may not act.
+fn authenticate(cfg: Cfg, db: Db, r: Request) throws (ApiError) -> Auth {
+    let presented = (r.header("authorization").strip_prefix("Bearer ") ?? "").trim();
+    let no_account = Account { id: 0i64, login: "", created: 0i64 };
+    let now = now_secs();
+    if presented.starts_with("pkt_") {
+        let t = trust::token_of(db.trust_tokens, presented, now) ?? {
+            throw index::err(401, "the trusted publishing token expired or is not valid; exchange a new OIDC token");
+        };
+        if let l: Locked = lock_of(db, t.actor_id) { throw index::err(403, f"the account that started this run is locked: {l.reason}"); }
+        return Auth { account: no_account, admin: false, scope: t.packages, login: t.publisher, who: f"{t.repository} <index@packages.nabi-lang.org>", actor: trusted_actor(t), key: "tok:" + t.hash[:16] };
+    }
+    let i = token_at(db, presented) ?? { throw index::err(401, "a valid token is required (Authorization: Bearer pkg_..)"); };
+    let tok = db.tokens[i];
+    if tok.expires <= now { throw index::err(401, f"this token expired on {pkg::server::account::date(tok.expires)}; create a new one on your account page ({cfg.url}/me) and give it to `nabi login`"); }
+    let a = account_of(db, tok.account) ?? no_account;
+    if let l: Locked = lock_of(db, a.id) { throw index::err(403, f"this account is locked: {l.reason}"); }
+    // A token kept from before publishing closed authorizes nothing.
+    if !may_act(cfg, a.id) { throw index::err(403, "Publishing is not open yet"); }
+    if now - tok.last_used >= LAST_USED_SECS {
+        using g = LOCK.lock() {
+            let d = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
+            if let j: usize = token_at(d, presented) {
+                d.tokens[j].last_used = now;
+                try save_db(cfg, d) catch e { eprintln(f"data: {e}"); };
+            }
+        }
+    }
+    // A token limited to some packages moderates nothing.
+    Auth { account: a, admin: is_admin(cfg, a.id) && tok.packages.is_empty(), scope: none, login: a.login, who: f"{a.login} <{a.id}+{a.login}@users.noreply.github.com>", actor: Actor { id: a.id, login: a.login, at: 0i64 }, key: f"acct:{a.id}", only: tok.packages }
+}
+
+/// New names account `id` took in the day before `now`: the packages
+/// whose first release on record it published.
+pub fn new_names_today(db: Db, id: i64, now: i64) -> usize {
+    let first: Dict<str, (i64, i64)> = Dict::new();
+    for r in db.releases {
+        if let a: Actor = r.published_by {
+            let earlier = true;
+            if let f: (i64, i64) = first.get(r.name) { earlier = a.at < f.0; }
+            if earlier { first.insert(r.name, (a.at, a.id)); }
+        }
+    }
+    let n = 0usize;
+    for (_, f) in first.iter() {
+        if f.1 == id && f.0 > now - 86400i64 { n += 1; }
+    }
+    n
+}
+
+/// Check what `nabi publish --index-dir` left out of a version already
+/// in the index from the same tree: refused when the trees differ or it
+/// came through this API.
+fn fill_check(db: Db, k: str, p: index::Publish, have: str) throws (ApiError) {
+    let e = p.entry;
+    let taken = index::err(409, f"{e.name} {e.version} is already in the index");
+    if e.native { throw taken; }
+    let (_, v) = try packages::parse_line(e.line) catch x { throw index::err(400, x.msg); };
+    if v.tree != have { throw index::err(409, f"{e.name} {e.version} is already in the index from another tree ({have}); publish a new version"); }
+    for r in db.releases {
+        if r.name == k && r.version == e.version && r.published_by is Actor { throw taken; }
+    }
+}
+
+/// index::check_source for `e`, from `url`, with the source to itself:
+/// a second publish from it while one fetches it is told to wait.
+fn checked_source(cfg: Cfg, e: index::Entry, url: str) throws (ApiError) -> str {
+    let u = url.to_lowercase();
+    let mine = false;
+    using g = FETCHING.lock() {
+        let s = g.get();
+        if !s.contains(u) {
+            s.insert(u);
+            mine = true;
+        }
+    }
+    if !mine { throw index::err(409, f"another publish from {url} is running; try again in a moment"); }
+    let out = "";
+    let failed: ApiError | none = none;
+    out = try index::check_source(cfg.data + "/sources", e, SOURCE_PROTOCOLS) catch x {
+        failed = x;
+        ""
+    };
+    using g = FETCHING.lock() { g.get().remove(u); }
+    if let x: ApiError = failed { throw x; }
+    out
+}
+
+/// The index part of a publish, under `INDEX`: the checkout synced, the
+/// line appended, committed and pushed. True when the version was there
+/// from the same tree (only its missing records are filled in).
+fn index_step(cfg: Cfg, auth: Auth, p: index::Publish, k: str, refused: ApiError) throws (ApiError) -> bool {
+    let e = p.entry;
+    try index::sync(cfg.index);
+    let db = try load_db(cfg) catch x { throw index::err(500, f"data: {x}"); };
+    if let have: str = try index::tree_at(cfg.index, e.native, e.name, e.version) {
+        try fill_check(db, k, p, have);
+        return true;
+    }
+    // Again: someone may have taken the name meanwhile.
+    if !may(auth, db, k, try index::exists(cfg.index, e.native, e.name)) { throw refused; }
+    try index::publish(cfg.index, e, auth.who);
+    false
+}
+
+/// Whether `auth` is a trusted publish from a repository of the
+/// organization whose packages are official (PACKAGES_OFFICIAL_ORG).
+fn by_org(cfg: Cfg, auth: Auth) -> bool {
+    if cfg.official_org <= 0i64 || !(auth.scope is List<str>) { return false; }
+    match auth.actor.via {
+        v: meta::Via => v.owner_id == cfg.official_org,
+        none => false,
+    }
+}
+
+/// `POST /api/v1/publish`.
+fn publish(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
+    let trusted = auth.scope is List<str>;
+    let p = try index::parse_publish(body);
+    // A version is official exactly when the organization's workflow
+    // publishes it; the registry writes the flag, never the publisher.
+    let org = by_org(cfg, auth);
+    let official = org && !p.entry.native;
+    if official {
+        let x = p.entry;
+        p.entry = index::Entry { name: x.name, version: x.version, native: x.native, file: x.file, line: try index::with_official(x.line) };
+    }
+    let e = p.entry;
+    let k = (if e.native { "native/" } else { "" }) + index::key(e.name);
+    try gone(db, k, e.name, e.version);
+    if !e.native && (try index::is_library(cfg.index, e.name)) { throw index::library_refused(e.name); }
+    let in_index = try index::exists(cfg.index, e.native, e.name);
+    let refused = index::err(403, if trusted { f"this token publishes only the packages that trust its workflow, not `{e.name}`" } else { f"`{e.name}` belongs to other accounts" });
+    if !may(auth, db, k, in_index) { throw refused; }
+    if !in_index {
+        try names::check_new(e.name, try index::names(cfg.index, e.native), db.approved, auth.admin, if e.native { List::new() } else { try names::protected(cfg.index) }, org);
+        if !auth.admin && !trusted && new_names_today(db, auth.account.id, now_secs()) >= NEW_NAMES_PER_DAY {
+            throw index::err(429, f"an account takes at most {NEW_NAMES_PER_DAY} new package names a day; publish new versions of the ones you have, or wait");
+        }
+    }
+    let warnings: List<Value> = List::new();
+    for w in p.warnings { warnings.push(Value::Str(w)); }
+    // The source: fetched, checked and archived before any lock.
+    let src = "";
+    let rev = "";
+    let staged = "";
+    let sum = ("", 0i64);
+    if !e.native {
+        let (_, v) = try packages::parse_line(e.line) catch x { throw index::err(400, x.msg); };
+        rev = v.rev;
+        src = try checked_source(cfg, e, v.url);
+        staged = cfg.data + f"/archives/.staged-{std::process::id()}-{now_secs()}-{index::key(e.name)}-{e.version}.tar.gz";
+        sum = try index::archive(src, rev, staged, f"{e.name}-{e.version}");
+        // The line names the archive, so `nabi` can fetch it in place of git.
+        p.entry.line = index::with_archive(e.line, v.tree, sum.0);
+    }
+    let by = auth.actor;
+    by.at = now_secs();
+    let filled = false;
+    let unsaved = false;
+    let failed: ApiError | none = none;
+    using ix = INDEX.lock() {
+        filled = try index_step(cfg, auth, p, k, refused) catch x {
+            failed = x;
+            false
+        };
+        if failed is none {
+            using g = LOCK.lock() {
+                let d = try load_db(cfg) catch x {
+                    failed = index::err(500, f"data: {x}");
+                    Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: List::new() }
+                };
+                // An exchanged token has no account to own the name.
+                if !filled && owners_of(d, k) is none && !trusted { d.owners.push(Owner { name: k, accounts: [auth.account.id] }); }
+                let rp = meta::readme_file(cfg.data, k, e.version);
+                if !p.readme.is_empty() && (!filled || !fs::exists(rp)) {
+                    try {
+                        fs::create_dir_all(web::build::dir_of(rp));
+                        fs::write(rp, p.readme);
+                    } catch x { eprintln(f"readme: {x}"); };
+                }
+                let i = release_at(d, k, e.version);
+                d.releases[i].meta = if filled { meta::over(d.releases[i].meta, p.meta) } else { p.meta };
+                d.releases[i].published_by = by;
+                if !filled { d.releases[i].official = official; }
+                if !staged.is_empty() && d.releases[i].archive.is_empty() {
+                    let to = meta::archive_file(cfg.data, k, e.version);
+                    try {
+                        fs::create_dir_all(web::build::dir_of(to));
+                        fs::rename(staged, to);
+                    } catch x { eprintln(f"archive: {x}"); };
+                    if fs::exists(to) {
+                        d.releases[i].archive = sum.0;
+                        d.releases[i].archive_size = sum.1;
+                    }
+                }
+                // The line is pushed already: a failed write loses only
+                // the metadata, which the same publish fills in again.
+                if failed is none {
+                    try save_db(cfg, d) catch x {
+                        eprintln(f"data: {x}");
+                        unsaved = true;
+                    };
+                }
+            }
+        }
+    }
+    if !staged.is_empty() && fs::exists(staged) { try fs::remove_file(staged) catch _ {}; }
+    if let x: ApiError = failed { throw x; }
+    if filled { warnings.push(Value::Str(f"{e.name} {e.version} was already in the index from this tree; its missing metadata is filled in")); }
+    if unsaved { warnings.push(Value::Str(f"{e.name} {e.version} is in the index, but the registry could not record its metadata and README; run the same `nabi publish` again to fill them in")); }
+    // Docs, from the source just checked, outside every lock: a failure
+    // is a warning and a status on the page, never a refused publish.
+    if !e.native {
+        let st = docs::make(cfg.data + "/docs", index::key(e.name), e.version, src, rev, e.name.replace("-", "_"));
+        if st.state == "failed" { warnings.push(Value::Str(f"docs: {st.message}; {e.name} {e.version} is published, and its docs page says why")); }
+    }
+    STALE.store(1);
+    nabion_resp(200, "Published", [("name", Value::Str(e.name)), ("version", Value::Str(e.version)), ("file", Value::Str(e.file)), ("warnings", Value::List(warnings))])
+}
+
+/// `POST /api/v1/yank`.
+fn yank(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
+    let y: Yank = try nabion::from_str(body) catch e { throw index::err(400, f"the body is `Yank {{ name: .., version: .., undo: false, native: false, message: \"..\" }}`: {e}"); };
+    if y.message.len() > YANK_MESSAGE_MAX { throw index::err(400, f"a yank message is at most {YANK_MESSAGE_MAX} bytes"); }
+    if y.undo && !y.message.is_empty() { throw index::err(400, "an unyank takes no message"); }
+    let k = (if y.native { "native/" } else { "" }) + index::key(y.name);
+    if !may(auth, db, k, true) { throw index::err(403, f"`{y.name}` belongs to other accounts"); }
+    if y.undo { try gone(db, k, y.name, y.version); }
+    let by = auth.actor;
+    by.at = now_secs();
+    using ix = INDEX.lock() {
+        try index::sync(cfg.index);
+        let changed = try index::yank(cfg.index, y.name, y.version, !y.undo, y.native, auth.who);
+        // Yanking a yanked version again only replaces its message.
+        if changed || (!y.undo && !y.message.is_empty()) {
+            using g = LOCK.lock() {
+                let d = try load_db(cfg) catch x { throw index::err(500, f"data: {x}"); };
+                let i = release_at(d, k, y.version);
+                if changed {
+                    if y.undo { d.releases[i].unyanked_by = by; } else { d.releases[i].yanked_by = by; }
+                }
+                d.releases[i].yank_message = y.message;
+                try save_db(cfg, d) catch x { eprintln(f"data: {x}"); };
+            }
+            STALE.store(1);
+        }
+    }
+    nabion_resp(200, "Yanked", [("name", Value::Str(y.name)), ("version", Value::Str(y.version)), ("yanked", Value::Bool(!y.undo))])
+}
+
+fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
+    for (prefix, native) in [("/api/v1/packages/", false), ("/api/v1/native/", true)] {
+        if let rest: str = r.path.strip_prefix(prefix) {
+            let parts: List<str> = List::new();
+            for x in rest.split("/") { parts.push(http::pct_decode(x, false) ?? x); }
+            let what = if parts.len() == 3 { f"{prefix}<name>/<version>/{parts[2]}" } else { f"{prefix}<name>" };
+            if r.method != "GET" && r.method != "HEAD" { throw index::err(405, f"use GET {what}"); }
+            try limit::check("read:" + client, limit::READS);
+            let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
+            if parts.len() == 3 && parts[2] == "readme" { return try readme_of(cfg, db, native, parts[0], parts[1]); }
+            if parts.len() == 3 && parts[2] == "download" && !native { return try download(cfg, db, parts[0], parts[1]); }
+            if parts.len() != 1 { throw index::err(404, "no such API route"); }
+            return try package_info(cfg, db, native, parts[0]);
+        }
+    }
+    let routes: List<(str, str)> = [
+        ("GET", "/api/v1/me"),
+        ("POST", "/api/v1/publish"),
+        ("POST", "/api/v1/yank"),
+        ("POST", "/api/v1/trusted-publishing/token"),
+        ("GET", "/api/v1/trusted-publishers"),
+        ("POST", "/api/v1/trusted-publishers"),
+        ("POST", "/api/v1/trusted-publishers/remove"),
+        ("POST", "/api/v1/owners"),
+        ("POST", "/api/v1/owners/remove"),
+        ("POST", "/api/v1/owners/accept"),
+        ("GET", "/api/v1/admin"),
+        ("POST", "/api/v1/admin/lock"),
+        ("POST", "/api/v1/admin/takedown"),
+        ("POST", "/api/v1/admin/approve"),
+    ];
+    let methods: List<str> = List::new();
+    for (m, p) in routes {
+        if p == r.path { methods.push(m); }
+    }
+    if methods.is_empty() { throw index::err(404, "no such API route"); }
+    if !methods.contains(r.method) { throw index::err(405, f"use {methods.join(" or ")} {r.path}"); }
+    let write = r.method == "POST";
+    if write { try limit::check("ip:" + client, 2i64 * cfg.rate); }
+    if r.path == "/api/v1/trusted-publishing/token" {
+        try limit::check("x:" + client, limit::EXCHANGES);
+        return try exchange(cfg, r.body);
+    }
+    let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
+    let auth = try authenticate(cfg, db, r);
+    if write { try limit::check(auth.key, cfg.rate); }
+    let trusted = auth.scope is List<str>;
+    if r.path == "/api/v1/me" {
+        return nabion_resp(200, "Me", [("login", Value::Str(auth.login)), ("publish", Value::Bool(trusted || may_act(cfg, auth.account.id)))]);
+    }
+    if r.path.starts_with("/api/v1/admin") {
+        if trusted || !auth.admin { throw index::err(403, "only the registry admins moderate, with an account's token"); }
+        return try admin_route(cfg, db, auth.account, r);
+    }
+    if r.path.starts_with("/api/v1/trusted-publishers") {
+        if trusted { throw index::err(403, "trusted publishers are managed with an account's token, not a trusted publishing one"); }
+        let a = auth.account;
+        if r.method == "GET" {
+            let list: List<Value> = List::new();
+            for p in managed(db, a.id, auth.admin) { list.push(nabion::to_value(p)); }
+            return nabion_resp(200, "TrustedPublishers", [("publishers", Value::List(list))]);
+        }
+        if r.path == "/api/v1/trusted-publishers/remove" {
+            let id = "";
+            if let Value::Struct { name: _, fields } = try nabion::parse(r.body) catch _ { Value::None } {
+                if let Value::Str(x) = fields.get("id") ?? Value::None { id = x; }
+            }
+            if id.is_empty() { throw index::err(400, "the body is `Remove { id: \"..\" }`"); }
+            try remove_trusted(cfg, a, auth.admin, id);
+            return nabion_resp(200, "Removed", [("id", Value::Str(id))]);
+        }
+        let p: TrustedPublisher = try nabion::from_str(r.body) catch e {
+            throw index::err(400, f"the body is `TrustedPublisher {{ package: .., repository: \"owner/repo\", workflow: \"publish.yml\", environment: \"\" }}`: {e}");
+        };
+        return nabion_value(200, nabion::to_value(try add_trusted(cfg, a, auth.admin, p)));
+    }
+    if r.path.starts_with("/api/v1/owners") {
+        if trusted { throw index::err(403, "owners are managed with an account's token, not a trusted publishing one"); }
+        let want = index::err(400, "the body is `Owner { package: \"..\", login: \"user, org or org/team\" }`");
+        let package = "";
+        let who = "";
+        if let Value::Struct { name: _, fields } = try nabion::parse(r.body) catch _ { throw want; } {
+            if let Value::Str(x) = fields.get("package") ?? Value::None { package = x; }
+            if let Value::Str(x) = fields.get("login") ?? Value::None { who = x; }
+        }
+        if r.path == "/api/v1/owners/accept" {
+            if package.is_empty() { throw index::err(400, "the body is `Owner { package: \"..\" }`"); }
+            try accept_invite(cfg, auth.account, package, true);
+            return nabion_resp(200, "Accepted", [("package", Value::Str(package))]);
+        }
+        if package.is_empty() || who.is_empty() { throw want; }
+        if r.path == "/api/v1/owners/remove" {
+            try remove_owner(cfg, auth.account, auth.admin, package, who, 0i64);
+            return nabion_resp(200, "Removed", [("package", Value::Str(package)), ("login", Value::Str(who))]);
+        }
+        let p = try add_owner(cfg, auth.account, auth.admin, package, who);
+        if p.org { return nabion_resp(200, "Added", [("package", Value::Str(package)), ("login", Value::Str(p.login)), ("org", Value::Bool(true))]); }
+        return nabion_resp(200, "Invited", [("package", Value::Str(package)), ("login", Value::Str(p.login))]);
+    }
+    if !trusted && !may_act(cfg, auth.account.id) { throw index::err(403, "Publishing is not open yet"); }
+    if r.path == "/api/v1/publish" { return try publish(cfg, db, auth, r.body); }
+    try yank(cfg, db, auth, r.body)
+}
+
+#[test]
+fn trusted_scope() {
+    let db = Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: [Owner { name: "geom", accounts: [5i64] }] };
+    let nobody = Account { id: 0i64, login: "", created: 0i64 };
+    let t = Auth { account: nobody, admin: false, scope: ["geom", "ge_om"], login: "github:x", who: "", actor: nobody_did(), key: "" };
+    assert(may(t, db, "geom", true) && may(t, db, "ge_om", false) && !may(t, db, "json", true) && !may(t, db, "native/geom", true), "scope");
+    let owner = Auth { account: Account { id: 5i64, login: "o", created: 0i64 }, admin: false, scope: none, login: "o", who: "", actor: nobody_did(), key: "" };
+    assert(may(owner, db, "geom", true) && !may(owner, db, "json", true), "account");
+    let limited = Auth { account: Account { id: 5i64, login: "o", created: 0i64 }, admin: false, scope: none, login: "o", who: "", actor: nobody_did(), key: "", only: ["geo"] };
+    assert(!may(limited, db, "geom", true), "a token limited to other packages");
+    assert(pkg::server::owners::may_manage(db, "geom", 5i64, false) && !pkg::server::owners::may_manage(db, "geom", 6i64, false), "owners manage");
+    assert(!pkg::server::owners::may_manage(db, "markdown", 5i64, false) && pkg::server::owners::may_manage(db, "markdown", 6i64, true), "unowned names are the admins'");
+}
+
+#[test]
+fn new_names() {
+    let now = 1800000000i64;
+    let rel = |n: str, v: str, id: i64, t: i64| Release { name: n, version: v, meta: meta::empty(), published_by: Actor { id: id, login: "", at: t }, yanked_by: none, unyanked_by: none };
+    let db = Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: List::new() };
+    db.releases = [rel("a", "0.1.0", 5i64, now - 100i64), rel("a", "0.2.0", 5i64, now - 50i64), rel("b", "0.1.0", 6i64, now - 200000i64), rel("b", "0.2.0", 5i64, now - 10i64), rel("c", "0.1.0", 5i64, now - 90000i64)];
+    assert(new_names_today(db, 5i64, now) == 1 && new_names_today(db, 6i64, now) == 0, f"{new_names_today(db, 5i64, now)}");
+}

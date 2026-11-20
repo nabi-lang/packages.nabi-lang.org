@@ -1,0 +1,189 @@
+// Moderation, for the registry admins' tokens: lock an account out, take
+// a package or one version down, approve a reserved or look-alike name.
+// Each change is logged and appended to PACKAGES_DATA/audit.nabion, as
+// are the accounts' own changes to sessions, tokens, owners and trusted
+// publishers.
+//
+//   GET  /api/v1/admin             Moderation { locked, removed, approved }
+//   POST /api/v1/admin/lock        Lock { id, reason, undo }
+//   POST /api/v1/admin/takedown    Takedown { name, version, native, reason, undo }
+//   POST /api/v1/admin/approve     Approve { name, undo }
+
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::packages;
+use pkg::server::store::{Account, Db, Locked, Removal, Session, load_db, now_secs, save_db};
+use pkg::server::{Cfg, INDEX, is_admin, LOCK, nabion_resp, Resp, STALE};
+use std::fs;
+use std::nabion;
+use std::nabion::Value;
+use web::http::Request;
+
+const MAX_REASON: usize = 512;
+
+#[derive(Nabion)]
+#[nabion(deny_unknown_fields)]
+struct Lock {
+    id: i64;
+    reason: str = "";
+    undo: bool = false;
+}
+
+#[derive(Nabion)]
+#[nabion(deny_unknown_fields)]
+struct Takedown {
+    name: str;
+    /// "": every version.
+    version: str = "";
+    native: bool = false;
+    reason: str = "";
+    undo: bool = false;
+}
+
+#[derive(Nabion)]
+#[nabion(deny_unknown_fields)]
+struct Approve {
+    name: str;
+    undo: bool = false;
+}
+
+/// One change, as audit.nabion keeps it.
+#[derive(Nabion)]
+pub struct Audit {
+    pub at: i64;
+    /// The GitHub id of the account that made it.
+    pub by: i64;
+    pub action: str;
+    pub target: str;
+    pub reason: str = "";
+}
+
+/// Log `x` and append it to the audit file.
+pub fn audit(cfg: Cfg, x: Audit) {
+    let line = (try? nabion::to_str_flat(x)) ?? f"{x.action} {x.target}";
+    eprintln(f"audit: {line}");
+    try {
+        let f = fs::File::append(cfg.data + "/audit.nabion");
+        f.write_all(line + "\n");
+        f.close();
+    } catch e { eprintln(f"audit: {e}"); };
+}
+
+fn reason_of(r: str, undo: bool) throws (ApiError) -> str {
+    let t = r.trim();
+    if undo { return ""; }
+    if t.is_empty() || t.len() > MAX_REASON { throw index::err(400, f"give a `reason` of 1 to {MAX_REASON} bytes: it is shown to the account or on the package"); }
+    t
+}
+
+fn data(cfg: Cfg) throws (ApiError) -> Db { try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); } }
+
+fn save(cfg: Cfg, db: Db) throws (ApiError) { try save_db(cfg, db) catch e { throw index::err(500, f"data: {e}"); }; }
+
+/// Lock (or unlock) GitHub account `q.id`: its sessions end, and its
+/// tokens, logins and the trusted publishes it starts are refused.
+fn lock(cfg: Cfg, a: Account, q: Lock) throws (ApiError) -> Resp {
+    if q.id <= 0i64 { throw index::err(400, "`id` is a GitHub user id"); }
+    if is_admin(cfg, q.id) { throw index::err(400, "an admin is not locked; take the id out of PACKAGES_ADMINS first"); }
+    let why = try reason_of(q.reason, q.undo);
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        let keep: List<Locked> = List::new();
+        for l in db.locked {
+            if l.id != q.id { keep.push(l); }
+        }
+        if q.undo && keep.len() == db.locked.len() { throw index::err(404, f"account {q.id} is not locked"); }
+        if !q.undo {
+            keep.push(Locked { id: q.id, reason: why, by: a.id, at: now_secs() });
+            let live: List<Session> = List::new();
+            for s in db.sessions {
+                if s.account != q.id { live.push(s); }
+            }
+            db.sessions = live;
+        }
+        db.locked = keep;
+        try save(cfg, db);
+    }
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: if q.undo { "unlock" } else { "lock" }, target: f"{q.id}", reason: why });
+    nabion_resp(200, "Locked", [("id", Value::Int(Int::from(q.id))), ("locked", Value::Bool(!q.undo))])
+}
+
+/// Take `q.name` (or its `q.version`) down: every version it covers is
+/// yanked in the index, the site leaves it out, and the API answers 451
+/// with the reason. Undone, the record goes; the versions stay yanked
+/// until their owners unyank them.
+fn takedown(cfg: Cfg, a: Account, q: Takedown) throws (ApiError) -> Resp {
+    if !packages::is_name(q.name) { throw index::err(400, f"`{q.name}` is not a package name"); }
+    if !q.version.is_empty() && !index::is_version(q.version) { throw index::err(400, f"`{q.version}` is not a version"); }
+    let why = try reason_of(q.reason, q.undo);
+    let k = (if q.native { "native/" } else { "" }) + index::key(q.name);
+    let who = f"packages.nabi-lang.org admins <index@packages.nabi-lang.org>";
+    let yanked = 0usize;
+    using ix = INDEX.lock() {
+        if !q.undo {
+            try index::sync(cfg.index);
+            let vs = try index::releases(cfg.index, q.native, q.name);
+            if vs.is_empty() { throw index::err(404, f"`{q.name}` is not in the index"); }
+            for (v, was) in vs {
+                if !q.version.is_empty() && v != q.version { continue; }
+                if !was && (try index::yank(cfg.index, q.name, v, true, q.native, who)) { yanked += 1; }
+            }
+        }
+        using g = LOCK.lock() {
+            let db = try data(cfg);
+            let keep: List<Removal> = List::new();
+            for x in db.removed {
+                if !(x.name == k && x.version == q.version) { keep.push(x); }
+            }
+            if q.undo && keep.len() == db.removed.len() { throw index::err(404, f"`{q.name}` {q.version} is not taken down"); }
+            if !q.undo { keep.push(Removal { name: k, version: q.version, reason: why, by: a.id, at: now_secs() }); }
+            db.removed = keep;
+            try save(cfg, db);
+        }
+    }
+    STALE.store(1);
+    let target = if q.version.is_empty() { k } else { f"{k}@{q.version}" };
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: if q.undo { "restore" } else { "takedown" }, target: target, reason: why });
+    nabion_resp(200, "TakenDown", [("name", Value::Str(q.name)), ("version", Value::Str(q.version)), ("removed", Value::Bool(!q.undo)), ("yanked", Value::Int(Int::from(yanked as i64)))])
+}
+
+/// Let `q.name` through the reserved list and the look-alike check (or
+/// stop letting it).
+fn approve(cfg: Cfg, a: Account, q: Approve) throws (ApiError) -> Resp {
+    if !packages::is_name(q.name) { throw index::err(400, f"`{q.name}` is not a package name"); }
+    let k = index::key(q.name);
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        let keep: List<str> = List::new();
+        for n in db.approved {
+            if n != k { keep.push(n); }
+        }
+        if !q.undo { keep.push(k); }
+        db.approved = keep;
+        try save(cfg, db);
+    }
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: if q.undo { "unapprove" } else { "approve" }, target: k });
+    nabion_resp(200, "Approved", [("name", Value::Str(q.name)), ("approved", Value::Bool(!q.undo))])
+}
+
+pub fn admin_route(cfg: Cfg, db: Db, a: Account, r: Request) throws (ApiError) -> Resp {
+    if r.path == "/api/v1/admin" {
+        let locked: List<Value> = List::new();
+        for l in db.locked { locked.push(nabion::to_value(l)); }
+        let removed: List<Value> = List::new();
+        for x in db.removed { removed.push(nabion::to_value(x)); }
+        let approved: List<Value> = List::new();
+        for n in db.approved { approved.push(Value::Str(n)); }
+        return nabion_resp(200, "Moderation", [("locked", Value::List(locked)), ("removed", Value::List(removed)), ("approved", Value::List(approved))]);
+    }
+    if r.path == "/api/v1/admin/lock" {
+        let q: Lock = try nabion::from_str(r.body) catch e { throw index::err(400, f"the body is `Lock {{ id: <GitHub user id>, reason: \"..\", undo: false }}`: {e}"); };
+        return try lock(cfg, a, q);
+    }
+    if r.path == "/api/v1/admin/takedown" {
+        let q: Takedown = try nabion::from_str(r.body) catch e { throw index::err(400, f"the body is `Takedown {{ name: \"..\", version: \"\", native: false, reason: \"..\", undo: false }}`: {e}"); };
+        return try takedown(cfg, a, q);
+    }
+    let q: Approve = try nabion::from_str(r.body) catch e { throw index::err(400, f"the body is `Approve {{ name: \"..\", undo: false }}`: {e}"); };
+    try approve(cfg, a, q)
+}

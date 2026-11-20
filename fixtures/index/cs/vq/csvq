@@ -1,0 +1,1 @@
+Package { name: "csvq", version: "0.3.0", deps: [{ name: "table", req: "^0.1", kind: "normal" }], source: Dep::git("https://github.com/packages-demo/csvq", rev: "83e02d1e961e68c638a9f4303f2785395c400ec7"), tree: "78af956a8002ad355c1e10180f1c797568e6b80e", yanked: false, nabi_version: "0.1.0" }

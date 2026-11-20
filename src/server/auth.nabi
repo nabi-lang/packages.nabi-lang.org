@@ -1,0 +1,221 @@
+// Who a request is: GitHub login and the session cookie, and trusted
+// publishing, which trades a GitHub Actions OIDC token for a short
+// publish token.
+
+use pkg::Site;
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::json;
+use pkg::layout;
+use pkg::secret;
+use pkg::server::admin::{Audit, audit};
+use pkg::server::github::{cq, curl, github_user};
+use pkg::server::routes::read_page;
+use pkg::server::store::{Account, Db, Locked, MAX_SESSIONS, SESSION_COOKIE, Session, STATE_COOKIE, account_of, load_db, lock_of, now_secs, save_db, session_cookie, session_of};
+use pkg::server::{Cfg, Resp, cookie, counts, LOCK, message, nabion_resp, redirect};
+use pkg::trust;
+use pkg::trust::{TrustedPublisher, TrustToken};
+use core::crypto::rsa::PublicKey;
+use std::env;
+use std::fs;
+use std::nabion;
+use std::nabion::Value;
+use web::http;
+use web::http::Request;
+
+/// When the issuer's keys were last fetched (unix seconds).
+static JWKS_AT: Atomic<i64> = Atomic::new(0i64);
+
+const SESSION_SECS: i64 = 2592000;
+
+/// The body of a token exchange; GitHub's OIDC tokens are about 1 KiB.
+const MAX_EXCHANGE: usize = 16384;
+
+pub fn login(cfg: Cfg) throws -> Resp {
+    let state = try secret::random_hex(16);
+    let to = f"{cfg.oauth}/login/oauth/authorize?client_id={http::pct_encode(cfg.client_id)}&redirect_uri={http::pct_encode(cfg.url + "/auth/github/callback")}&state={state}&scope=read:user";
+    redirect(to, [cookie(STATE_COOKIE, state, 600i64)])
+}
+
+pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
+    let q = http::form(r.query);
+    let state = q.get("state") ?? "";
+    let want = http::cookie(r, STATE_COOKIE);
+    if want.is_empty() || !secret::same(state, want) {
+        return message(site, r.path, 400, "Login failed", "The login expired or did not start here. Log in again.");
+    }
+    let code = q.get("code") ?? "";
+    if code.is_empty() {
+        return message(site, r.path, 400, "Login cancelled", "GitHub did not authorize the login.");
+    }
+    let gh = try github_user(cfg, code) catch e {
+        return message(site, r.path, e.status, "Login failed", e.msg);
+    };
+    let id = gh.id;
+    let sid = try secret::random_hex(32);
+    let csrf = try secret::random_hex(16);
+    let now = now_secs();
+    let out = Resp { status: 500, headers: List::new(), body: "", file: "" };
+    using g = LOCK.lock() {
+        let db = try load_db(cfg);
+        if let l: Locked = lock_of(db, id) {
+            return message(site, r.path, 403, "Account locked", f"The registry admins locked this account: {l.reason}. To appeal, write to the address in SECURITY.md.");
+        }
+        let seen = false;
+        for i in 0..db.accounts.len() {
+            if db.accounts[i].id == id {
+                db.accounts[i].login = gh.login;
+                db.accounts[i].name = gh.name;
+                db.accounts[i].avatar_url = gh.avatar_url;
+                seen = true;
+            }
+        }
+        if !seen { db.accounts.push(Account { id: id, login: gh.login, created: now, name: gh.name, avatar_url: gh.avatar_url }); }
+        // Past MAX_SESSIONS the oldest of this account's sessions ends.
+        let mine = 0usize;
+        for x in db.sessions {
+            if x.account == id { mine += 1; }
+        }
+        let kept: List<Session> = List::new();
+        for x in db.sessions {
+            if x.account == id && mine >= MAX_SESSIONS {
+                mine -= 1;
+                continue;
+            }
+            kept.push(x);
+        }
+        kept.push(Session { hash: secret::sha256_hex(sid), account: id, csrf: csrf, expires: now + SESSION_SECS });
+        db.sessions = kept;
+        try save_db(cfg, db);
+        audit(cfg, Audit { at: now, by: id, action: "login", target: gh.login });
+        out = redirect("/me", [cookie(SESSION_COOKIE, sid, SESSION_SECS), cookie(STATE_COOKIE, "", 0i64)]);
+    }
+    out
+}
+
+/// The issuer's key `kid`: from the cached JWKS, else fetched again (at
+/// most once a minute, so made-up kids cannot make us hammer it).
+fn oidc_key(cfg: Cfg, kid: str) throws (ApiError) -> PublicKey {
+    let cache = cfg.data + "/jwks.json";
+    let have = try fs::read_to_str(cache) catch _ { "" };
+    if let k: PublicKey = trust::find_key(have, kid) { return k; }
+    let unknown = index::err(401, f"the OIDC token's key is not one {cfg.issuer} lists");
+    let now = now_secs();
+    if now - JWKS_AT.load() < 60i64 { throw unknown; }
+    JWKS_AT.store(now);
+    let ua = "header = " + cq("User-Agent: packages.nabi-lang.org") + "\n";
+    let conf = try curl(f"url = {cq(cfg.issuer + "/.well-known/openid-configuration")}\n{ua}");
+    let uri = json::fields(conf).get("jwks_uri") ?? "";
+    if !uri.starts_with(cfg.issuer + "/") { throw index::err(502, "the issuer's OIDC configuration names no jwks_uri of its own"); }
+    let keys = try curl(f"url = {cq(uri)}\n{ua}");
+    try fs::write_atomic(cache, keys) catch e { eprintln(f"jwks cache: {e}"); };
+    trust::find_key(keys, kid) ?? { throw unknown; }
+}
+
+/// The `jwt` of `TrustedPublishing { jwt: ".." }` or `{"jwt": ".."}`.
+fn jwt_of(body: str) throws (ApiError) -> str {
+    let want = index::err(400, "the body is `TrustedPublishing { jwt: \"<GitHub Actions OIDC token>\" }`");
+    if body.trim().starts_with("{") { return json::fields(body).get("jwt") ?? { throw want; }; }
+    let v = try nabion::parse(body) catch _ { throw want; };
+    if let Value::Struct { name: _, fields } = v {
+        if let Value::Str(t) = fields.get("jwt") ?? Value::None { return t; }
+    }
+    throw want;
+}
+
+/// `POST /api/v1/trusted-publishing/token`: a GitHub Actions OIDC token
+/// in, a publish token for the packages that trust its workflow out. The
+/// token is checked (and the issuer's keys fetched) before `LOCK`.
+pub fn exchange(cfg: Cfg, body: str) throws (ApiError) -> Resp {
+    if body.len() > MAX_EXCHANGE { throw index::err(413, f"the body is at most {MAX_EXCHANGE} bytes"); }
+    let j = try trust::parse_jwt(try jwt_of(body));
+    let key = try oidc_key(cfg, j.header.get("kid") ?? "");
+    let now = now_secs();
+    try trust::check(j, key, cfg.issuer, cfg.audience, now);
+    let out = api_error_resp();
+    using g = LOCK.lock() {
+        let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
+        out = try grant(cfg, db, j.claims, now);
+    }
+    out
+}
+
+fn api_error_resp() -> Resp { Resp { status: 500, headers: List::new(), body: "", file: "" } }
+
+/// The publish token for checked claims `c`, recorded in `db`.
+fn grant(cfg: Cfg, db: Db, c: Dict<str, str>, now: i64) throws (ApiError) -> Resp {
+    let jti = c.get("jti") ?? "";
+    for t in db.trust_tokens {
+        if t.jti == jti { throw index::err(401, "this OIDC token was exchanged already; request a new one"); }
+    }
+    let repo = c.get("repository") ?? "";
+    let wref = c.get("workflow_ref") ?? "";
+    // Only publishers from the seed file or from an account that may act.
+    let usable: List<TrustedPublisher> = List::new();
+    for p in db.trusted {
+        if counts(cfg, p) { usable.push(p); }
+    }
+    let keys = trust::grant(usable, c);
+    if keys.is_empty() {
+        let file = ((wref.split_once("/.github/workflows/") ?? ("", wref)).1.split_once("@") ?? (wref, "")).0;
+        let env = c.get("environment") ?? "";
+        throw index::err(403, f"no package trusts {repo}, workflow {file}{if env.is_empty() { "" } else { ", environment " + env }}: an owner adds it as a trusted publisher at {cfg.url}/me");
+    }
+    let names: List<Value> = List::new();
+    for p in usable {
+        if trust::matches(p, c) && !names.contains(Value::Str(p.package)) { names.push(Value::Str(p.package)); }
+    }
+    let tok = "pkt_" + try secret::random_hex(32) catch e { throw index::err(500, f"{e}"); };
+    let exp = try (c.get("exp") ?? "").parse::<i64>() catch _ { now };
+    let (actor, actor_id) = trust::actor_of(c);
+    if let l: Locked = lock_of(db, actor_id) { throw index::err(403, f"the account that started this run is locked: {l.reason}"); }
+    db.trust_tokens.push(TrustToken {
+        hash: secret::sha256_hex(tok),
+        packages: keys,
+        publisher: "github:" + wref,
+        repository: repo,
+        jti: jti,
+        created: now,
+        expires: now + trust::TOKEN_SECS,
+        jwt_expires: exp,
+        actor: actor,
+        actor_id: actor_id,
+        via: trust::via_of(c),
+    });
+    try save_db(cfg, db) catch e { throw index::err(500, f"data: {e}"); };
+    eprintln(f"trusted publishing: github:{wref} for {keys.join(", ")}");
+    nabion_resp(200, "TrustedToken", [("token", Value::Str(tok)), ("expires", Value::Int(Int::from(now + trust::TOKEN_SECS))), ("packages", Value::List(names))])
+}
+
+/// A logged-in request's account and its session's CSRF token.
+pub struct Viewer {
+    pub account: Account;
+    pub csrf: str;
+}
+
+/// Who a request with a live session cookie is; none without one. No
+/// lock: the data file is replaced in one rename, and a cookie that is
+/// not 64 hex digits never reaches it.
+pub fn viewer(cfg: Cfg, r: Request) -> Viewer | none {
+    if session_cookie(r) is none { return none; }
+    let d = (try? load_db(cfg)) ?? { return none; };
+    let s = session_of(d, r) ?? { return none; };
+    let a = account_of(d, s.account) ?? { return none; };
+    Viewer { account: a, csrf: s.csrf }
+}
+
+/// `resp` with the header's login button turned into the account menu,
+/// and kept out of every cache.
+pub fn signed_in(site: Site, r: Request, resp: Resp, v: Viewer) -> Resp {
+    let text = resp.body;
+    if !resp.file.is_empty() {
+        let data = read_page(site, r.path, resp.file) ?? { return resp; };
+        text = (try? str::from_utf8(data)) ?? { return resp; };
+    }
+    let headers: List<str> = List::new();
+    for h in resp.headers {
+        if !h.starts_with("Cache-Control:") { headers.push(h); }
+    }
+    headers.push("Cache-Control: no-store");
+    Resp { status: resp.status, headers: headers, body: layout::signed_in(text, v.account.login, v.account.id, v.csrf), file: "" }
+}

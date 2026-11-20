@@ -1,0 +1,164 @@
+//! Dense linear algebra on core's `Array`: products, factorizations as
+//! types (`Lu`, `Cholesky`, `Ldlt`, `Qr`, `Svd`, `Eigh`, `Eig`, `Schur`),
+//! solvers and matrix functions. Every routine takes `Matrix<T>` /
+//! `Vector<T>` (`Array<T, 2>` / `Array<T, 1>`, views included) for `T` in
+//! f64, f32, `Complex<f64>`, `Complex<f32>` (`Scalar`), or the real two
+//! (`Real`) where the algorithm is real only. Bad input throws a
+//! `LinalgError` that says what to call instead; nothing panics except
+//! the operators of `ops`, which cannot throw and panic on a shape
+//! mismatch as core's broadcast operators do.
+//!
+//! Pure Nabi: no BLAS or LAPACK, so every target, wasm included, gets
+//! the same results.
+
+pub mod factor;
+#[cfg(feature = "ops")]
+pub mod ops;
+pub mod scalar;
+
+mod blas;
+mod build;
+mod dense;
+mod error;
+mod expm;
+mod input;
+mod norm;
+mod product;
+mod rhs;
+mod solve;
+
+pub use build::{adjoint, diag, diagonal, eye, trace};
+pub use error::LinalgError;
+pub use expm::expm;
+pub use factor::cholesky::{Cholesky, Ldlt};
+pub use factor::eig::{Eig, Schur};
+pub use factor::eigh::Eigh;
+pub use factor::lu::Lu;
+pub use factor::qr::Qr;
+pub use factor::svd::Svd;
+pub use input::AsVector;
+pub use norm::{Norm, matrix_norm, norm, vector_norm};
+pub use product::{dot, kron, matmul, matrix_power, matvec, outer, vdot, vecmat};
+pub use rhs::Rhs;
+pub use scalar::{Real, Scalar};
+pub use solve::{Triangle, cond, det, inv, lstsq, null_space, pinv, rank, slogdet, solve, solve_triangular, svdvals};
+
+use core::array::{Matrix, Vector};
+
+/// `P A = L U` with partial pivoting (square `a`). See `Lu`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 2], [3, 4]];
+/// let f = try linalg::lu(a);
+/// assert((f.det() + 2.0).abs() < 1e-12);
+/// ```
+pub fn lu<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Lu<T> { try factor::lu::factor(a) }
+
+/// `A = L L^H` of a Hermitian positive definite matrix. See `Cholesky`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[4, 2], [2, 5]];
+/// assert((try linalg::cholesky(a)).l()[1, 1] == 2.0);
+/// ```
+pub fn cholesky<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Cholesky<T> { try factor::cholesky::cholesky(a) }
+
+/// `A = L D L^H` without pivoting. See `Ldlt`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[2, 1], [1, -1]];
+/// assert((try linalg::ldlt(a)).d()[1] == -1.5);
+/// ```
+pub fn ldlt<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Ldlt<T> { try factor::cholesky::ldlt(a) }
+
+/// Householder `A = Q R` of any m x n matrix. See `Qr`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 1], [1, 2], [1, 3]];
+/// let f = try linalg::qr(a);
+/// assert(f.q().shape() == [3, 2] && f.r().shape() == [2, 2]);
+/// ```
+pub fn qr<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Qr<T> { try factor::qr::factor(a, false) }
+
+/// `A P = Q R` with column pivoting: `|R[i, i]|` falls, which shows
+/// the numerical rank. See `Qr`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 10], [1, 20]];
+/// assert((try linalg::qr_pivoted(a)).perm() == [1, 0]);
+/// ```
+pub fn qr_pivoted<T: Scalar>(a: Matrix<T>) throws (LinalgError) -> Qr<T> { try factor::qr::factor(a, true) }
+
+/// The thin SVD of a real matrix (U is m x k, V^T k x n, k = min(m, n)).
+/// See `Svd`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 0, 0], [0, 2, 0]];
+/// let f = try linalg::svd(a);
+/// assert(f.u().shape() == [2, 2] && f.vt().shape() == [2, 3]);
+/// ```
+pub fn svd<T: Real>(a: Matrix<T>) throws (LinalgError) -> Svd<T> { try factor::svd::factor(a, false, true) }
+
+/// The full SVD (U is m x m, V^T n x n). See `Svd`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[1, 0, 0], [0, 2, 0]];
+/// assert((try linalg::svd_full(a)).vt().shape() == [3, 3]);
+/// ```
+pub fn svd_full<T: Real>(a: Matrix<T>) throws (LinalgError) -> Svd<T> { try factor::svd::factor(a, true, true) }
+
+/// Eigenvalues and eigenvectors of a real symmetric matrix. See `Eigh`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[2, 0], [0, 1]];
+/// assert((try linalg::eigh(a)).values()[0] == 1.0);
+/// ```
+pub fn eigh<T: Real>(a: Matrix<T>) throws (LinalgError) -> Eigh<T> { try factor::eigh::factor(a, true) }
+
+/// The eigenvalues of a real symmetric matrix, rising, without the
+/// vectors (about a third of the work of `eigh`).
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[0, 1], [1, 0]];
+/// let w = try linalg::eigvalsh(a);
+/// assert((w[0] + 1.0).abs() < 1e-15 && (w[1] - 1.0).abs() < 1e-15);
+/// ```
+pub fn eigvalsh<T: Real>(a: Matrix<T>) throws (LinalgError) -> Vector<T> { (try factor::eigh::factor(a, false)).values() }
+
+/// Eigenvalues and eigenvectors of a general real matrix (complex in
+/// general). See `Eig`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[2, 1], [0, 3]];
+/// assert((try linalg::eig(a)).values().len() == 2);
+/// ```
+pub fn eig<T: Real>(a: Matrix<T>) throws (LinalgError) -> Eig<T> { try factor::eig::factor(a) }
+
+/// The real Schur form `A = Z T Z^T`. See `Schur`.
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[0, -1], [1, 0]];
+/// assert((try linalg::schur(a)).t()[1, 0] != 0.0);   // one 2 x 2 block
+/// ```
+pub fn schur<T: Real>(a: Matrix<T>) throws (LinalgError) -> Schur<T> { try factor::eig::schur(a) }

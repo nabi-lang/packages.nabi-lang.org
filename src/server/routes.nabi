@@ -1,0 +1,195 @@
+// The site's routes: the API, login and the account pages handed on,
+// search and the list, the files in `public/` and their cache rules,
+// and the 404s that name a package.
+
+use pkg::Site;
+use pkg::layout;
+use pkg::server::account::account_route;
+use pkg::server::api::api_route;
+use pkg::server::auth::{callback, login};
+use pkg::server::limit;
+use pkg::server::{Cfg, Resp, html, HTML_CACHE, IMMUTABLE, message, shared_html};
+use std::fs;
+use std::nabion;
+use std::thread;
+use web::http;
+use web::http::Request;
+use web::url;
+
+/// An OG card asked for by the version render.ts drew it from (the `.v`
+/// beside it), and a stylesheet or script asked for by its content
+/// version (layout::asset), never change: cache them for good. Bare,
+/// stale or unrendered card addresses stay short; pages are cached for a
+/// minute; everything else revalidates.
+pub fn cache_for(site: Site, path: str, f: str, query: str) -> str {
+    let v = http::form(query).get("v") ?? "";
+    if path == "/og.png" || (path.starts_with("/og/") && path.ends_with(".png")) {
+        let drawn = try fs::read_to_str(f + ".v") catch _ { "" };
+        return if !v.is_empty() && v == drawn.trim() { IMMUTABLE } else { "public, max-age=3600" };
+    }
+    // The kit's fonts: unversioned names, so a day and the ETag.
+    if path.starts_with("/fonts/") { return "public, max-age=86400"; }
+    let want = layout::asset_version(site, path[1:]);
+    if !want.is_empty() { return if v == want { IMMUTABLE } else { "no-cache" }; }
+    if f.ends_with(".html") { HTML_CACHE } else { "no-cache" }
+}
+
+/// `public/.packages.nabion` (main.nabi); empty when it cannot be read.
+fn rows(site: Site) -> List<layout::Row> {
+    // A rebuild swaps `public/` (see route): look again a few times.
+    for k in 0..4 {
+        if k > 0 { thread::sleep(Duration::ms(50)); }
+        let text = try fs::read_to_str(site.out + "/.packages.nabion") catch _ { continue; };
+        return try nabion::from_str(text) catch _ { List::new() };
+    }
+    List::new()
+}
+
+/// `GET /api/health`: `ok` and the toolchain the site names, one `key
+/// value` a line, for uptime checks and the release pipeline; `failing`
+/// and a 503 while the package list cannot be read.
+pub fn health(site: Site) -> Resp {
+    let ok = fs::exists(site.out + "/.packages.nabion");
+    let tc = if site.release.is_empty() { "unknown" } else { site.release };
+    let body = f"{if ok { "ok" } else { "failing" }}\nnabi {tc}\npackages {rows(site).len()}\n";
+    Resp { status: if ok { 200 } else { 503 }, headers: ["Content-Type: text/plain; charset=utf-8", "Cache-Control: no-store"], body: body, file: "" }
+}
+
+/// `/packages/<name>..` with no page: a 301 when the name only differs in
+/// case, else a 404 naming the package (or its missing version) and the
+/// closest names. None when `name` is a package and the page is something
+/// else.
+fn missing_package(site: Site, p: str, rest: str, query: str) -> Resp | none {
+    let (raw, tail) = rest.split_once("/") ?? (rest, "");
+    let name = http::pct_decode(raw, false) ?? raw;
+    let names: List<str> = List::new();
+    for row in rows(site) { names.push(row.name); }
+    let has = names.contains(name);
+    if !has {
+        for n in names {
+            if n == name.to_lowercase() {
+                let to = "/packages/" + n + (if tail.is_empty() { "" } else { "/" + tail });
+                return Resp { status: 301, headers: [url::moved(to, query), "Cache-Control: public, max-age=3600"], body: "", file: "" };
+            }
+        }
+        let near: List<(str, str)> = List::new();
+        for n in layout::closest(names, name) { near.push(("/packages/" + n, n)); }
+        let sentence = if near.is_empty() { "Nothing in the index has that name. Search with <kbd class=\"kbd\">/</kbd>, or go to:" } else { "Packages with a similar name:" };
+        near.push(("/packages", "All packages"));
+        near.push(("/publishing", "Publishing a package"));
+        let body = f"<div class=\"frame lost-page\">{web::chrome::not_found(f"No package named {name}", sentence, near)}</div>\n";
+        return html(404, layout::page(site, p[1:], f"No package named {name}", body));
+    }
+    let ver = (tail.split_once("/") ?? (tail, "")).0;
+    if !ver.is_empty() && ver.byte(0) >= 48u8 && ver.byte(0) <= 57u8 {
+        let links: List<(str, str)> = [(f"/packages/{name}/versions", f"Versions of {name}"), (f"/packages/{name}", f"{name}, latest version")];
+        let body = f"<div class=\"frame lost-page\">{web::chrome::not_found(f"No version {ver} of {name}", "The index has no such version. Go to:", links)}</div>\n";
+        return html(404, layout::page(site, p[1:], f"No version {ver} of {name}", body));
+    }
+    none
+}
+
+pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
+    let p = r.path;
+    if p == "/api/health" && (r.method == "GET" || r.method == "HEAD") { return health(site); }
+    if p.starts_with("/api/") { return api_route(cfg, r, client); }
+    if p == http::REPORT_PATH {
+        if r.method != "POST" { return Resp { status: 405, headers: ["Content-Type: text/plain; charset=utf-8", "Cache-Control: no-store"], body: "POST only\n", file: "" }; }
+        if let line: str = http::csp_report(r.body) { eprintln(line); }
+        return Resp { status: 204, headers: ["Cache-Control: no-store"], body: "", file: "" };
+    }
+    if p == http::SPECULATION_PATH && (r.method == "GET" || r.method == "HEAD") {
+        return Resp { status: 200, headers: [http::SPECULATION_TYPE, "Cache-Control: public, max-age=3600"], body: http::SPECULATION_RULES, file: "" };
+    }
+    let post = r.method == "POST";
+    let get = r.method == "GET" || r.method == "HEAD";
+    if (p == "/login" || p == "/auth/github/callback") && get && !limit::allow("login:" + client, limit::LOGINS) {
+        let m = message(site, p, 429, "Too many logins", "Wait a minute, then log in again.");
+        m.headers.push("Retry-After: 60");
+        return m;
+    }
+    if p == "/login" && get { return try login(cfg); }
+    if p == "/auth/github/callback" && get { return try callback(cfg, site, r); }
+    if (p == "/me" && get) || (post && (p == "/logout" || p == "/me/tokens" || (p.starts_with("/me/tokens/") && p.ends_with("/revoke")) || p == "/me/trusted" || (p.starts_with("/me/trusted/") && p.ends_with("/remove")) || p == "/me/owners" || p == "/me/owners/remove" || p == "/me/invites/accept" || p == "/me/invites/decline")) {
+        return try account_route(cfg, site, r, client);
+    }
+    if !get { return message(site, p, 405, "Method not allowed", "Only GET here."); }
+    // A search or a misspelt package name scans every name.
+    let costly = (p == "/packages" && !r.query.is_empty()) || (p.starts_with("/packages/") && http::page_file(site.out, p) is none);
+    if costly && !limit::allow("read:" + client, limit::READS) {
+        let m = message(site, p, 429, "Too many requests", "Wait a minute, then try again.");
+        m.headers.push("Retry-After: 60");
+        return m;
+    }
+    if let c: str = url::canonical(p) {
+        return Resp { status: 301, headers: [url::moved(c, r.query), "Cache-Control: public, max-age=3600"], body: "", file: "" };
+    }
+    // A search or another order: the list page, filtered and sorted here
+    // (it works without JS). The bare list is a file.
+    if p == "/packages" {
+        let f = http::form(r.query);
+        let q = f.get("q") ?? "";
+        let sort = f.get("sort") ?? "";
+        if !q.trim().is_empty() || !sort.is_empty() {
+            let (title, body) = layout::list_page(rows(site), q, sort);
+            return shared_html(200, layout::page(site, "packages/index.html", title, body));
+        }
+    }
+    // Package names are lowercase: never let a case-insensitive file system
+    // answer for `/packages/JSON`.
+    if let rest: str = p.strip_prefix("/packages/") {
+        let seg = (rest.split_once("/") ?? (rest, "")).0;
+        if seg != seg.to_lowercase() {
+            if let m: Resp = missing_package(site, p, rest, r.query) { return m; }
+        }
+    }
+    // A rebuild renames `public/` away and the new site into its place
+    // (main.nabi): in between there is no site, which is not a 404.
+    for k in 0..5 {
+        if k > 0 {
+            if fs::exists(site.out) { break; }
+            thread::sleep(Duration::ms(50));
+        }
+        if let f: str = http::page_file(site.out, p) {
+            return Resp { status: 200, headers: [f"Content-Type: {http::content_type(f)}", "Cache-Control: " + cache_for(site, p, f, r.query)], body: "", file: f };
+        }
+    }
+    if let rest: str = p.strip_prefix("/packages/") {
+        if let m: Resp = missing_package(site, p, rest, r.query) { return m; }
+    }
+    // The 404 every Nabi site shares, as public/404.html has it.
+    html(404, layout::page(site, p[1:], "Not found", layout::not_found()))
+}
+
+/// The bytes of `file`, found for `path`. A rebuild swaps `public/` for
+/// the new site (main.nabi), so a file found a moment ago can be gone:
+/// look it up again a few times before giving up. Never an empty 200.
+pub fn read_page(site: Site, path: str, file: str) -> List<u8> | none {
+    let f = file;
+    for k in 0..4 {
+        if k > 0 {
+            thread::sleep(Duration::ms(50));
+            f = http::page_file(site.out, path) ?? f;
+        }
+        let got = true;
+        let b = try fs::read(f) catch _ {
+            got = false;
+            List::new()
+        };
+        if got { return b; }
+    }
+    none
+}
+
+#[test]
+fn health_answers() {
+    let out = f"{std::env::temp_dir()}/nabi-packages-health-{std::process::id()}";
+    try fs::create_dir_all(out) catch e { panic(f"{e}"); };
+    let site = Site { title: "", tagline: "", index_repo: "", out: out, release: "9.9.9" };
+    let no = health(site);
+    try fs::write(out + "/.packages.nabion", "[]") catch e { panic(f"{e}"); };
+    let ok = health(site);
+    try fs::remove_dir_all(out) catch _ {};
+    assert(ok.status == 200 && ok.body == "ok\nnabi 9.9.9\npackages 0\n", ok.body);
+    assert(no.status == 503 && no.body.starts_with("failing\n"), no.body);
+}

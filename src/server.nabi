@@ -1,0 +1,469 @@
+// `serve`: the site in `public/`, GitHub login, publish tokens, trusted
+// publishing and the publish / yank API over plain HTTP (TLS ends at a
+// reverse proxy).
+//
+// One thread per connection. A write to the data file reads it and
+// writes it back under `LOCK`; an index commit and push holds `INDEX`
+// (taken before `LOCK`, never inside it). Neither is held across a
+// fetch of a package source or a call to GitHub. Reads take the data
+// file without a lock: it is replaced in one rename. After an index
+// commit `STALE` is set and a background thread rebuilds the site by
+// running this program again.
+//
+// Here: the settings, the responses every route builds, the connection
+// loop and the rebuild. `routes` picks the answer to a request; `api`,
+// `auth`, `account`, `owners` and `admin` are the routes behind it;
+// `store` is the data file, `github` the calls to GitHub, `limit` the
+// rate limits and `names` which new names are taken.
+
+pub mod account;
+pub mod admin;
+pub mod api;
+pub mod auth;
+pub mod github;
+pub mod limit;
+pub mod names;
+pub mod owners;
+pub mod routes;
+pub mod store;
+
+use pkg::Site;
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::layout;
+use pkg::secret;
+use pkg::server::auth::{Viewer, signed_in, viewer};
+use pkg::server::routes::{read_page, route};
+use pkg::server::store::{load_db, save_db};
+use pkg::trust;
+use pkg::trust::TrustedPublisher;
+use markdown::esc;
+use std::env;
+use std::fs;
+use std::nabion;
+use std::nabion::Value;
+use std::net;
+use std::net::TcpStream;
+use std::process::Command;
+use std::thread;
+use web::http;
+use web::http::Request;
+use web::url;
+
+pub static LOCK: Mutex<i32> = Mutex::new(0);
+pub static INDEX: Mutex<i32> = Mutex::new(0);
+pub static STALE: Atomic<i32> = Atomic::new(0);
+static ACTIVE: Atomic<i32> = Atomic::new(0);
+
+const MAX_CONNS: i32 = 256;
+
+/// Settings from the environment, then `.env`.
+pub struct Cfg {
+    /// Public base URL, no trailing `/`.
+    pub url: str;
+    pub addr: str;
+    pub client_id: str;
+    pub client_secret: str;
+    /// `,1001,1002,`: GitHub's numeric user ids. Logins change hands, ids
+    /// never do.
+    pub admins: str;
+    pub data: str;
+    pub index: str;
+    pub oauth: str;
+    pub api: str;
+    /// The `aud` an OIDC token must carry: PACKAGES_AUDIENCE, else the
+    /// host of `url`.
+    pub audience: str = "";
+    /// The OIDC issuer, no trailing `/`; tests point it at a fake.
+    pub issuer: str = trust::GITHUB_ISSUER;
+    /// PACKAGES_TRUSTED: the bootstrap file of trusted publishers; "": none.
+    pub trusted: str = "";
+    /// PACKAGES_OPEN_PUBLISHING=1: accounts other than the admins get
+    /// tokens, trusted publishers and publishing. Off: they only log in.
+    pub open: bool = false;
+    /// PACKAGES_CLIENT_HEADER: the header (lowercase) a trusted proxy
+    /// puts the client's address in; "": the TCP peer is the client.
+    pub client_header: str = "";
+    /// PACKAGES_RATE_LIMIT: changes (API writes, account forms) an
+    /// account may make a minute; an address may make twice that.
+    pub rate: i64 = 30i64;
+    /// PACKAGES_OFFICIAL_ORG: GitHub's id of the organization (nabi-lang)
+    /// whose repositories' trusted publishes are official; 0: none.
+    pub official_org: i64 = 0i64;
+    /// GITHUB_API_TOKEN: a token (no scopes needed) the repository and
+    /// owner lookups send, for GitHub's 5000 requests an hour in place
+    /// of 60 per address; "": none.
+    pub api_token: str = "";
+}
+
+/// `KEY=value` lines; `#` comments, blank lines, `export ` and one pair
+/// of matching quotes around the value allowed.
+pub fn parse_env(text: str) -> Dict<str, str> {
+    let out: Dict<str, str> = Dict::new();
+    for raw in text.split("\n") {
+        let l = raw.trim();
+        if l.is_empty() || l.starts_with("#") { continue; }
+        l = l.strip_prefix("export ") ?? l;
+        let (k, v) = l.split_once("=") ?? ("", "");
+        let key = k.trim();
+        if key.is_empty() { continue; }
+        let val = v.trim();
+        if val.len() >= 2 && ((val.starts_with("\"") && val.ends_with("\"")) || (val.starts_with("'") && val.ends_with("'"))) {
+            val = val[1:val.len() - 1];
+        }
+        out.insert(key, val);
+    }
+    out
+}
+
+fn setting(file: Dict<str, str>, k: str, dflt: str) throws -> str {
+    let v = try env::var(k) catch _ { file.get(k) ?? dflt };
+    if v.is_empty() { throw ApiError { status: 0, msg: f"{k} is not set (environment or .env)" }; }
+    v
+}
+
+fn optional(file: Dict<str, str>, k: str) -> str { try env::var(k) catch _ { file.get(k) ?? "" } }
+
+/// `packages.nabi-lang.org` of `https://packages.nabi-lang.org:443/x`.
+pub fn host_of(url: str) -> str {
+    let rest = url.split_once("://") ?? ("", url);
+    let h = (rest.1.split_once("/") ?? (rest.1, "")).0;
+    (h.split_once(":") ?? (h, "")).0.to_lowercase()
+}
+
+pub fn load_cfg(path: str) throws -> Cfg {
+    let text = if fs::exists(path) { try fs::read_to_str(path) } else { "" };
+    let f = parse_env(text);
+    let admins = try admin_ids(try env::var("PACKAGES_ADMINS") catch _ { f.get("PACKAGES_ADMINS") ?? "" });
+    let url = try setting(f, "PACKAGES_URL", "");
+    let aud = optional(f, "PACKAGES_AUDIENCE");
+    let issuer = optional(f, "GITHUB_OIDC_ISSUER");
+    let rate = optional(f, "PACKAGES_RATE_LIMIT").trim();
+    let org = optional(f, "PACKAGES_OFFICIAL_ORG").trim();
+    if issuer.is_empty() { issuer = trust::GITHUB_ISSUER; }
+    Cfg {
+        url: url.strip_suffix("/") ?? url,
+        addr: try setting(f, "PACKAGES_ADDR", "127.0.0.1:8080"),
+        client_id: try setting(f, "GITHUB_CLIENT_ID", ""),
+        client_secret: try setting(f, "GITHUB_CLIENT_SECRET", ""),
+        admins: admins,
+        data: try setting(f, "PACKAGES_DATA", ""),
+        index: try setting(f, "PACKAGES_INDEX", ""),
+        oauth: try setting(f, "GITHUB_OAUTH_URL", "https://github.com"),
+        api: try setting(f, "GITHUB_API_URL", "https://api.github.com"),
+        audience: if aud.is_empty() { host_of(url) } else { aud },
+        issuer: issuer.strip_suffix("/") ?? issuer,
+        trusted: optional(f, "PACKAGES_TRUSTED"),
+        open: ["1", "true"].contains(optional(f, "PACKAGES_OPEN_PUBLISHING").to_lowercase()),
+        client_header: optional(f, "PACKAGES_CLIENT_HEADER").trim().to_lowercase(),
+        api_token: optional(f, "GITHUB_API_TOKEN").trim(),
+        official_org: if org.is_empty() { 0i64 } else { try org.parse::<i64>() catch _ { throw ApiError { status: 0, msg: f"PACKAGES_OFFICIAL_ORG is the numeric GitHub id of the organization (the `id` of https://api.github.com/orgs/<org>), not `{org}`" }; } },
+        rate: try (if rate.is_empty() { "30" } else { rate }).parse::<i64>() catch _ { throw ApiError { status: 0, msg: f"PACKAGES_RATE_LIMIT is a number of changes a minute, not `{rate}`" }; },
+    }
+}
+
+/// PACKAGES_ADMINS (`1001, 1002`) as `,1001,1002,`. A login is refused:
+/// whoever registers a renamed admin's old login must not inherit it.
+pub fn admin_ids(list: str) throws (ApiError) -> str {
+    let out = StrBuf::new();
+    out.push(',');
+    for a in list.split(",") {
+        let t = a.trim();
+        if t.is_empty() { continue; }
+        let id = try t.parse::<i64>() catch _ { 0i64 };
+        if id <= 0i64 || f"{id}" != t {
+            throw ApiError { status: 0, msg: f"PACKAGES_ADMINS takes numeric GitHub user ids, not `{t}`: write the `id` of https://api.github.com/users/{t}" };
+        }
+        out.push_str(f"{id},");
+    }
+    out.to_str()
+}
+
+pub fn is_admin(cfg: Cfg, id: i64) -> bool { id > 0i64 && cfg.admins.contains(f",{id},") }
+
+/// Whether account `id` may do more than log in: create tokens, add
+/// trusted publishers, publish and yank.
+pub fn may_act(cfg: Cfg, id: i64) -> bool { is_admin(cfg, id) || (cfg.open && id > 0i64) }
+
+/// Whether trusted publisher `p` may be granted: from the seed file, or
+/// added by an account that may act.
+pub fn counts(cfg: Cfg, p: TrustedPublisher) -> bool { p.seeded || may_act(cfg, p.added_by_id) }
+
+pub struct Resp {
+    pub status: i32;
+    pub headers: List<str>;
+    pub body: str;
+    /// A static file sent as the body instead; `""`: none.
+    pub file: str;
+}
+
+// Every page, generated or from public/: Cloudflare injects its Web
+// Analytics beacon; a README may show images from anywhere on https. No
+// style attributes: a package's hue is a class (layout::hue_class).
+const CSP: str = "Content-Security-Policy: default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; style-src 'self'; font-src 'self'; img-src 'self' data: https:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" + http::REPORT_TO;
+
+/// The CSP of a page with a <select> (the list's sort): WebKit's own select
+/// shadow DOM sets style attributes, so those are allowed there alone.
+const CSP_SELECT: str = "Content-Security-Policy: default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' data: https:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" + http::REPORT_TO;
+
+pub fn html(status: i32, body: str) -> Resp {
+    Resp {
+        status: status,
+        headers: [
+            "Content-Type: text/html; charset=utf-8",
+            "Cache-Control: no-store",
+        ],
+        body: body,
+        file: "",
+    }
+}
+
+/// Pages anyone may cache: short, and revalidated by ETag (handle).
+pub const HTML_CACHE: str = "public, max-age=60, must-revalidate";
+
+pub const IMMUTABLE: str = "public, max-age=31536000, immutable";
+
+/// A generated page anyone may see, like the files in `public/`.
+pub fn shared_html(status: i32, body: str) -> Resp {
+    let r = html(status, body);
+    r.headers[1] = "Cache-Control: " + HTML_CACHE;
+    r
+}
+
+pub fn redirect(to: str, cookies: List<str>) -> Resp {
+    let h: List<str> = [f"Location: {to}", "Cache-Control: no-store"];
+    for c in cookies { h.push("Set-Cookie: " + c); }
+    Resp { status: 303, headers: h, body: "", file: "" }
+}
+
+pub fn nabion_resp(status: i32, name: str, fields: List<(str, Value)>) -> Resp {
+    let f: Dict<str, Value> = Dict::new();
+    for (k, v) in fields { f.insert(k, v); }
+    Resp {
+        status: status,
+        headers: ["Content-Type: application/nabion; charset=utf-8", "Cache-Control: no-store"],
+        // Strings and bools only: nothing that has no NABION form.
+        body: (try! nabion::to_str_flat(Value::Struct { name: name, fields: f })) + "\n",
+        file: "",
+    }
+}
+
+pub fn api_error(status: i32, msg: str) -> Resp {
+    let r = nabion_resp(status, "Error", [("message", Value::Str(msg))]);
+    if status == 429 { r.headers.push("Retry-After: 60"); }
+    r
+}
+
+pub fn cookie(name: str, value: str, max_age: i64) -> str {
+    f"{name}={value}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=Lax"
+}
+
+pub fn page(site: Site, path: str, title: str, body: str, status: i32) -> Resp {
+    html(status, layout::page(site, path[1:], title, f"<div class=\"frame acct\">\n{body}\n</div>"))
+}
+
+pub fn message(site: Site, path: str, status: i32, title: str, text: str) -> Resp {
+    page(site, path, title, f"<h1 class=\"t-h1\">{esc(title)}</h1>\n<p class=\"t-lead\">{esc(text)}</p>\n<p><a href=\"/\">Back to the package registry</a></p>", status)
+}
+
+const HTML_TYPE: str = "Content-Type: text/html; charset=utf-8";
+
+fn handle(s: TcpStream, cfg: Cfg, site: Site) {
+    let t0 = Instant::now();
+    let r = try http::read_request(s, http::MAX_BODY, Duration::secs(30)) catch e {
+        try http::send(s, e.status, ["Content-Type: text/plain; charset=utf-8"], e.msg + "\n", false) catch _ {};
+        try s.close() catch _ {};
+        return;
+    };
+    let client = pkg::server::limit::client_of(cfg, s, r);
+    let resp = try route(cfg, site, r, client) catch e {
+        eprintln(f"{r.method} {r.path}: {e}");
+        message(site, r.path, 500, "Server error", "Something went wrong.")
+    };
+    if resp.headers.contains(HTML_TYPE) {
+        if let v: Viewer = viewer(cfg, r) { resp = signed_in(site, r, resp, v); }
+    }
+    let sent = resp.status;
+    if !resp.file.is_empty() {
+        if let data: List<u8> = read_page(site, r.path, resp.file) {
+            sent = respond(s, r, 200, resp.headers, data);
+        } else {
+            resp = message(site, r.path, 503, "Try again", "The site is being rebuilt. Reload the page in a moment.");
+            resp.headers.push("Retry-After: 1");
+            sent = respond(s, r, resp.status, resp.headers, resp.body.as_bytes().to_list());
+        }
+    } else {
+        sent = respond(s, r, resp.status, resp.headers, resp.body.as_bytes().to_list());
+    }
+    try s.close() catch _ {};
+    // The path only: queries carry OAuth codes.
+    eprintln(f"{r.method} {r.path} {sent} {t0.elapsed().as_ms()}ms");
+}
+
+/// Whether an If-None-Match value names `tag` (http::etag). A proxy that
+/// compresses may have marked the tag (`"..-gzip"`), which
+/// http::not_modified does not undo, and `W/` is ignored (weak
+/// comparison, as RFC 9110 has for If-None-Match).
+pub fn etag_matches(header: str, tag: str) -> bool {
+    for part in header.split(",") {
+        let t = part.trim();
+        if t == "*" { return true; }
+        t = t.strip_prefix("W/") ?? t;
+        if let k: usize = t.find("-") { t = t[:k] + "\""; }
+        if t == tag { return true; }
+    }
+    false
+}
+
+/// Send a response. A 200 anyone may cache gets an ETag, and a request
+/// that already has it a 304. The status sent.
+fn respond(s: TcpStream, r: Request, status: i32, headers: List<str>, body: List<u8>) -> i32 {
+    let head = r.method == "HEAD";
+    if headers.contains(HTML_TYPE) {
+        let text = (try? str::from_utf8(body)) ?? "";
+        headers.push(if text.contains("<select") { CSP_SELECT } else { CSP });
+        headers.push(http::REPORTING);
+        headers.push(http::SPECULATION);
+        // The header differs for a logged-in session (signed_in).
+        headers.push("Vary: Cookie");
+    }
+    if status == 200 && (r.method == "GET" || head) && !headers.contains("Cache-Control: no-store") {
+        let tag = http::etag(body);
+        headers.push("ETag: " + tag);
+        if etag_matches(r.header("if-none-match"), tag) {
+            // The validators and Cache-Control, not the type; http::send
+            // writes a 304 without a body or Content-Length.
+            let kept: List<str> = List::new();
+            for x in headers {
+                if !x.to_lowercase().starts_with("content-type:") { kept.push(x); }
+            }
+            try http::send(s, 304, kept, "", head) catch _ {};
+            return 304;
+        }
+    }
+    try http::send(s, status, headers, body, head) catch _ {};
+    status
+}
+
+/// Rebuild the site whenever `STALE` is set, one build at a time. Where
+/// puppeteer-core is installed, draw the new cards with og/render.ts
+/// and build again so the pages point at them; elsewhere they keep the
+/// site card until a deploy draws them.
+fn rebuild_loop(index_dir: str, data: str, out: str) {
+    let exe = try env::current_exe() catch e {
+        eprintln(f"cannot find this program to rebuild the site: {e}");
+        return;
+    };
+    loop {
+        if STALE.swap(0) == 1 {
+            let st = try Command::new(exe.as_str()).args(["--index", index_dir, "--data", data]).status() catch e {
+                eprintln(f"site rebuild: {e}");
+                continue;
+            };
+            if !st.success() {
+                eprintln(f"site rebuild: {st}");
+                continue;
+            }
+            if !fs::exists("node_modules/puppeteer-core") { continue; }
+            let r = try Command::new("node").args(["og/render.ts", out, "og/manifest.tsv"]).status() catch e {
+                eprintln(f"og cards: node: {e}");
+                continue;
+            };
+            if !r.success() {
+                eprintln(f"og cards: {r}");
+                continue;
+            }
+            let again = try Command::new(exe.as_str()).args(["--index", index_dir, "--data", data]).status() catch e {
+                eprintln(f"site rebuild: {e}");
+                continue;
+            };
+            if !again.success() { eprintln(f"site rebuild: {again}"); }
+        }
+        thread::sleep(Duration::secs(1));
+    }
+}
+
+pub fn serve(site: Site) throws {
+    let cfg = try load_cfg(".env");
+    if !fs::exists(cfg.index + "/.git") { throw ApiError { status: 0, msg: f"PACKAGES_INDEX={cfg.index} is not a git checkout" }; }
+    // Start from the index's state: lines pushed by others (a deploy, an
+    // --index-dir publish) reach the checkout only through a sync.
+    try index::sync(cfg.index) catch e { eprintln(f"index sync: {e.msg}"); };
+    if cfg.admins == "," { eprintln("PACKAGES_ADMINS is empty: no account may publish or moderate"); }
+    try fs::create_dir_all(cfg.data);
+    // Fail now on a bad data file or bootstrap file, not on the first
+    // request.
+    let db = try load_db(cfg);
+    let seeds = if cfg.trusted.is_empty() { List::<TrustedPublisher>::new() } else { try trust::read_seeds(cfg.trusted) };
+    db.trusted = trust::merge_seeds(db.trusted, seeds);
+    try save_db(cfg, db);
+    eprintln(f"trusted publishing: OIDC tokens from {cfg.issuer} for audience {cfg.audience}; {seeds.len()} publishers from PACKAGES_TRUSTED");
+    using l = try net::tcp_listen(cfg.addr) {
+        eprintln(f"serving {site.out}/ and the API on http://{cfg.addr} for {cfg.url}");
+        STALE.store(1);
+        let ix = cfg.index;
+        let data = cfg.data;
+        let out = site.out;
+        let bg = thread::spawn(|| {
+            rebuild_loop(ix, data, out);
+            0
+        });
+        bg.detach();
+        for c in l.incoming().results() {
+            let s = try c.get() catch e {
+                eprintln(f"accept: {e}");
+                continue;
+            };
+            if ACTIVE.fetch_add(1) >= MAX_CONNS {
+                ACTIVE.fetch_sub(1);
+                // Read what the request sent first: closing a socket with
+                // unread data resets it, and a proxy that sees the reset
+                // before the answer reports a 502 instead of this 503.
+                s.set_read_timeout(Duration::ms(20));
+                _ = try s.read(secret::zeros(16384)) catch _ { 0usize };
+                try http::send(s, 503, ["Content-Type: text/plain; charset=utf-8", "Retry-After: 1"], "busy\n", false) catch _ {};
+                try s.close() catch _ {};
+                continue;
+            }
+            let t = thread::spawn(|| {
+                handle(s, cfg, site);
+                ACTIVE.fetch_sub(1);
+                0
+            });
+            t.detach();
+        }
+    }
+}
+
+#[test]
+fn env_files() {
+    let f = parse_env("# c\n\nA=1\nexport B = \"two words\"\nC='x=y'\n=bad\nD=\n");
+    assert(f["A"] == "1" && f["B"] == "two words" && f["C"] == "x=y" && f["D"] == "" && f.len() == 4, "parse");
+    let ids = try admin_ids(" 1001, 42 ,") catch e { panic(e.msg); };
+    assert(ids == ",1001,42,", ids);
+    for bad in ["alice", "1001x", "-5", "0", "01001"] {
+        let refused = try admin_ids(bad) catch _ { "refused" };
+        assert(refused == "refused", f"admin id `{bad}`");
+    }
+    let cfg = Cfg { url: "", addr: "", client_id: "", client_secret: "", admins: ids, data: "", index: "", oauth: "", api: "" };
+    assert(is_admin(cfg, 1001i64) && is_admin(cfg, 42i64) && !is_admin(cfg, 100i64) && !is_admin(cfg, 4i64) && !is_admin(cfg, 0i64), "admins");
+    // Closed: only the admins act, and only their publishers and the seeds count.
+    assert(may_act(cfg, 1001i64) && !may_act(cfg, 1002i64) && !may_act(cfg, 0i64), "closed");
+    let p = TrustedPublisher { package: "geom", repository: "acme/geom", workflow: "publish.yml", added_by: "alice", added_by_id: 1002i64 };
+    assert(!counts(cfg, p), "a non-admin's publisher, whatever its login");
+    p.added_by_id = 1001i64;
+    assert(counts(cfg, p), "an admin's publisher");
+    let seed = TrustedPublisher { package: "geom", repository: "acme/geom", workflow: "publish.yml", seeded: true };
+    assert(counts(cfg, seed), "seeded");
+    cfg.open = true;
+    p.added_by_id = 1002i64;
+    assert(may_act(cfg, 1002i64) && !may_act(cfg, 0i64) && counts(cfg, p), "open");
+}
+
+#[test]
+fn validators() {
+    let t = http::etag("abc");
+    assert(t == "\"ba7816bf8f01cfea\"", t);
+    assert(etag_matches(t, t) && etag_matches("W/" + t, t) && etag_matches("\"x\", \"ba7816bf8f01cfea-gzip\"", t) && etag_matches("*", t), "matches");
+    assert(!etag_matches("", t) && !etag_matches("\"ba7816bf8f01cfeb\"", t), "misses");
+}

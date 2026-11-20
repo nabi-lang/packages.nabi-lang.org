@@ -1,0 +1,10 @@
+Package {
+    name: "packages_nabi_lang_org",
+    version: "0.1.0",
+    toolchain: "0.1",
+    deps: {
+        "markdown": Dep::path("../markdown"),
+        "nabi-syntax": Dep::path("../nabi-syntax"),
+        "web": Dep::path("web/nabi"),
+    },
+}

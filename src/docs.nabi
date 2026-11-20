@@ -1,0 +1,187 @@
+// The docs of each package version, made once when it is published and
+// kept with the server's data: its public modules as web::apidoc::pages
+// has them (items re-exported from private modules inline), as NABION,
+// beside a status the pages show. A version without them (published
+// before docs were kept, or with `nabi publish --index-dir`) gets them
+// at the next site build.
+//
+// The source is untrusted. It is only read and scanned, never built or
+// run, and a process of its own does it (this program's `docs`
+// command): a scan that runs longer than SCAN_MS is killed, one that
+// crashes takes only itself down. The scan reads at most MAX_FILES
+// `.nabi` files under src/, MAX_BYTES in all, and keeps at most
+// MAX_OUT bytes of docs.
+//
+//   <store>/<key>/<version>/status.nabion   Status
+//   <store>/<key>/<version>/api.nabion      List<web::apidoc::Module>
+
+use pkg::packages;
+use std::env;
+use std::fs;
+use std::nabion;
+use std::process;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::SystemTime;
+use web::apidoc::Module;
+
+/// Bumped when the scan changes what it keeps: docs made by another
+/// generation are made again.
+pub const GEN: i64 = 1i64;
+pub const MAX_FILES: usize = 2000usize;
+pub const MAX_BYTES: i64 = 8388608i64;
+pub const MAX_OUT: usize = 16777216usize;
+pub const SCAN_MS: i64 = 20000i64;
+
+#[derive(Nabion)]
+pub struct Status {
+    /// `ok`; `nolib`: no src/lib.nabi, so no API; `failed`: see message.
+    pub state: str;
+    /// Why it failed; `""` otherwise.
+    pub message: str = "";
+    /// When the docs were made, unix seconds.
+    pub at: i64 = 0i64;
+    pub gen: i64 = 0i64;
+}
+
+pub struct Docs {
+    pub status: Status;
+    /// Empty unless `status.state` is `ok`.
+    pub api: List<Module>;
+}
+
+pub struct DocsError {
+    pub msg: str;
+}
+
+impl Display for DocsError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.msg) }
+}
+
+impl Debug for DocsError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"DocsError({self.msg})") }
+}
+
+impl Error for DocsError {}
+
+fn now() -> i64 { SystemTime::now().unix_secs() }
+
+/// The directory of `key` `version` under `store`.
+pub fn dir_of(store: str, key: str, version: str) -> str { f"{store}/{key}/{version}" }
+
+fn failed(msg: str) -> Status { Status { state: "failed", message: msg, at: now(), gen: GEN } }
+
+/// The docs kept for `key` `version` in `store`; none when there are
+/// none of this generation.
+pub fn stored(store: str, key: str, version: str) -> Docs | none {
+    let d = dir_of(store, key, version);
+    let text = try fs::read_to_str(d + "/status.nabion") catch _ { return none; };
+    let st: Status = try nabion::from_str(text) catch _ { return none; };
+    if st.gen != GEN { return none; }
+    if st.state != "ok" { return Docs { status: st, api: List::new() }; }
+    let api_text = try fs::read_to_str(d + "/api.nabion") catch _ { return none; };
+    let api: List<Module> = try nabion::from_str(api_text) catch _ { return none; };
+    Docs { status: st, api: api }
+}
+
+/// `text` into `path` by way of a file beside it, so a reader never sees
+/// half of it.
+fn put(path: str, text: str) throws {
+    let tmp = f"{path}.{process::id()}.tmp";
+    try fs::write(tmp, text);
+    try fs::rename(tmp, path);
+}
+
+fn save(d: str, st: Status) -> Status {
+    try put(d + "/status.nabion", (try! nabion::to_str(st)) + "\n") catch e { eprintln(f"docs: {d}: {e}"); };
+    st
+}
+
+/// Keep a failed status for `key` `version`: docs that could not be
+/// made at all.
+pub fn fail(store: str, key: str, version: str, msg: str) -> Status {
+    let d = dir_of(store, key, version);
+    try fs::create_dir_all(d) catch e { return failed(f"cannot keep docs: {e}"); };
+    save(d, failed(msg))
+}
+
+/// Make and keep the docs of `key` `version` from commit `rev` of the
+/// bare repository `db`; `krate` is the name code spells (`nabi_syntax`).
+/// The scan runs in a process of its own, killed after SCAN_MS. Never
+/// throws: what went wrong is the status.
+pub fn make(store: str, key: str, version: str, db: str, rev: str, krate: str) -> Status {
+    let d = dir_of(store, key, version);
+    try fs::create_dir_all(d) catch e { return failed(f"cannot keep docs: {e}"); };
+    let exe = try env::current_exe() catch e { return save(d, failed(f"cannot start the scan: {e}")); };
+    let out = d + "/scan.nabion";
+    if fs::exists(out) { try fs::remove_file(out) catch _ {}; }
+    let child = try Command::new(exe.as_str()).args(["docs", db, rev, krate, d]).stdin(Stdio::Null).stdout(Stdio::Null).spawn() catch e {
+        return save(d, failed(f"cannot start the scan: {e}"));
+    };
+    let t0 = Instant::now();
+    loop {
+        let done: ExitStatus | none = try child.try_wait() catch _ { none };
+        if let es: ExitStatus = done {
+            if !es.success() { return save(d, failed(f"the scan stopped ({es})")); }
+            let text = try fs::read_to_str(out) catch _ { return save(d, failed("the scan wrote no status")); };
+            let st: Status = try nabion::from_str(text) catch _ { return save(d, failed("the scan wrote a bad status")); };
+            try fs::remove_file(out) catch _ {};
+            return save(d, st);
+        }
+        if t0.elapsed().as_ms() >= SCAN_MS {
+            try child.kill() catch _ {};
+            try { _ = child.wait(); } catch _ {};
+            return save(d, failed(f"the scan took longer than {SCAN_MS / 1000i64} s"));
+        }
+        thread::sleep(Duration::ms(10));
+    }
+}
+
+/// The `.nabi` files under src/ of `rev` in `db` and their sizes, within
+/// the limits.
+fn sources(db: str, rev: str) throws (DocsError) -> Dict<str, i64> {
+    let out: Dict<str, i64> = Dict::new();
+    let listing = packages::git(["-C", db, "ls-tree", "-r", "-l", "-z", rev, "--", "src"]) ?? { throw DocsError { msg: f"cannot read commit {rev}" }; };
+    let total = 0i64;
+    // `<mode> blob <sha> <size>\t<path>`
+    for l in listing.split("\u{0}") {
+        let (head, path) = l.split_once("\t") ?? { continue; };
+        let ws: List<str> = List::new();
+        for w in head.split(" ") {
+            if !w.is_empty() { ws.push(w); }
+        }
+        if ws.len() != 4 || ws[1] != "blob" || !path.ends_with(".nabi") { continue; }
+        let size = try ws[3].parse::<i64>() catch _ { 0i64 };
+        total += size;
+        out.insert(path, size);
+    }
+    if !out.contains_key("src/lib.nabi") { return out; }
+    if out.len() > MAX_FILES { throw DocsError { msg: f"src/ has {out.len()} .nabi files; docs are made for at most {MAX_FILES}" }; }
+    if total > MAX_BYTES { throw DocsError { msg: f"src/ has {total} bytes of .nabi; docs are made for at most {MAX_BYTES}" }; }
+    out
+}
+
+/// The `docs <db> <rev> <krate> <dir>` command: scan, write
+/// `<dir>/api.nabion` and the status to `<dir>/scan.nabion` for make().
+pub fn scan_cmd(db: str, rev: str, krate: str, d: str) -> i32 {
+    let st = Status { state: "ok", at: now(), gen: GEN };
+    let files = try sources(db, rev) catch e {
+        st = failed(e.msg);
+        Dict::new()
+    };
+    if st.state == "ok" && !files.contains_key("src/lib.nabi") { st.state = "nolib"; }
+    if st.state == "ok" {
+        let api = pkg::apidoc::collect(krate, |p| if files.contains_key(p) { packages::git(["-C", db, "show", f"{rev}:{p}"]) } else { none });
+        let text = (try! nabion::to_str(api)) + "\n";
+        if text.len() > MAX_OUT {
+            st = failed(f"the docs come to {text.len()} bytes; at most {MAX_OUT} are kept");
+        } else {
+            try put(d + "/api.nabion", text) catch e { st = failed(f"cannot keep docs: {e}"); };
+        }
+    }
+    try put(d + "/scan.nabion", (try! nabion::to_str(st)) + "\n") catch e {
+        eprintln(f"docs: {d}: {e}");
+        return 1;
+    };
+    0
+}

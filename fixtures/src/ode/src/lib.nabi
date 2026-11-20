@@ -1,0 +1,25 @@
+//! Ordinary differential equations on core's `Array`: adaptive initial
+//! value solvers (explicit Runge-Kutta, Radau IIA, BDF, automatic stiff
+//! switching) with dense output and events, fixed-step and symplectic
+//! integrators, and boundary value problems by collocation.
+
+#[cfg(feature = "ops")]
+pub mod ops;
+pub mod problems;
+
+mod bvp;
+mod dense;
+mod error;
+mod fixed;
+mod ivp;
+mod solution;
+mod symplectic;
+
+pub use bvp::{Bvp, BvpStatus, solve_bvp, solve_bvp_params};
+pub use dense::Dense;
+pub use error::OdeError;
+pub use fixed::{Fixed, euler, fixed, rk4};
+pub use ivp::events::{Direction, Event};
+pub use ivp::{Jacobian, Method, solve_ivp};
+pub use solution::{Solution, Status};
+pub use symplectic::{Orbit, Symplectic, leapfrog, symplectic, verlet, yoshida4};

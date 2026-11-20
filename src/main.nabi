@@ -1,0 +1,485 @@
+// packages.nabi-lang.org: renders the registry index (packages-index) into a
+// static site, then checks every internal link.
+//
+//   nabi run                      build into `out` (site.nabion)
+//   nabi run -- check             build, and exit 1 on a broken link or a bad index line
+//   nabi run -- --demo            use fixtures/index and fixtures/readme
+//   nabi run -- --offline         no `git fetch` for READMEs (cache only)
+//   nabi run -- --index <dir>     another index checkout
+//   nabi run -- --data <dir>      the server's data (db.nabion): metadata, publishers, owners
+//   nabi run -- serve             serve the site and the API (see server.nabi)
+//   <program> docs <db> <rev> <crate> <dir>
+//                                 scan one version's docs (docs.nabi; run by
+//                                 the server and the build, not by hand)
+
+mod apidoc;
+mod docs;
+mod index;
+mod json;
+mod layout;
+mod meta;
+mod packages;
+mod secret;
+mod server;
+mod trust;
+
+use pkg::packages::Package;
+use core::crypto::HashAlgorithm;
+use core::crypto::sha2::Digest;
+use std::env;
+use std::fs;
+use std::nabion;
+use std::process;
+use std::process::{Command, Stdio};
+use web::build::{attr_values, chars_of, dir_of, json_str, png_size, write};
+use web::kit;
+use web::url;
+
+#[derive(Nabion)]
+#[nabion(deny_unknown_fields)]
+pub struct Site {
+    pub title: str;
+    pub tagline: str;
+    /// `<meta name="description">` of pages without one of their own.
+    pub description: str = "";
+    /// Checkout of the index, relative to this file.
+    pub index: str = "../packages-index";
+    /// The index repository's web page (links to package files).
+    pub index_repo: str;
+    pub base_url: str = "https://packages.nabi-lang.org";
+    pub docs: str = "https://docs.nabi-lang.org";
+    /// The language's home site.
+    pub home: str = "https://nabi-lang.org";
+    pub playground: str = "https://playground.nabi-lang.org";
+    /// The toolchain release the footer names (`nabi 0.1.6`): when it is
+    /// not set, the nabic on PATH's (the server has none; the deploy sets it).
+    pub release: str = "";
+    /// README cache (git objects and extracted READMEs).
+    pub cache: str = ".cache";
+    pub out: str = "public";
+    /// The home card's version and pixel size (og_version), set on load.
+    pub og: str = "";
+    pub og_w: i64 = 0i64;
+    pub og_h: i64 = 0i64;
+    /// Content version of each stylesheet and script as `,name=v,` runs
+    /// (asset_versions; a string, so the server threads can share it), set
+    /// on load.
+    pub assets: str = "";
+}
+
+/// site.nabion, with the home card's version and size.
+fn load_site() throws -> Site {
+    let site: Site = try nabion::from_str(try fs::read_to_str("site.nabion"));
+    if site.release.is_empty() { site.release = nabic_release(); }
+    site.og = og_version(try og_inputs("home.html"), "");
+    let (w, h) = try png_size("static/og.png");
+    site.og_w = w;
+    site.og_h = h;
+    site.assets = try asset_versions();
+    site
+}
+
+/// `0.1.6` from the nabic on PATH (`nabic 0.1.6 (d0c8492ae 2026-11-01)`),
+/// or "" without one.
+fn nabic_release() -> str {
+    let o = try Command::new("nabic").args(["--version"]).stdin(Stdio::Null).output() catch _ { return ""; };
+    let w = (try? str::from_utf8(o.stdout)) ?? "";
+    let parts: List<str> = List::new();
+    for x in w.split_whitespace() { parts.push(x); }
+    if o.status.success() && parts.len() > 1 { parts[1] } else { "" }
+}
+
+/// The first 10 hex digits of the SHA-256 of each `.css` and `.js` the
+/// build publishes: the kit's (built in) and static/'s. Pages ask for
+/// them at that version, so a changed file is a new URL.
+fn asset_versions() throws -> str {
+    let out = StrBuf::new();
+    out.push(',');
+    let put = |name: str, data: Slice<u8>| {
+        if !name.ends_with(".css") && !name.ends_with(".js") { return; }
+        let d = Digest::new(HashAlgorithm::Sha256);
+        d.update(data);
+        out.push_str(f"{name}={secret::hex(d.finish()[0:5])},");
+    };
+    for f in kit::files() { put(f.name, f.data); }
+    try for e in fs::walk("static") {
+        if !e.is_file() { continue; }
+        let b = try fs::read(e.path());
+        put(e.path().as_str()["static/".len():], b[0:b.len()]);
+    }
+    out.to_str()
+}
+
+/// A running hash of what og/render.ts draws a card from: itself, the
+/// template, the assets the templates load, and for the home card the
+/// static/og.png it replaces. og_version adds the card's text. The kit's
+/// stylesheet and mark come from the copies built in, so a server
+/// without web/ beside it still agrees with the build.
+fn og_inputs(tpl: str) throws -> Digest {
+    let d = Digest::new(HashAlgorithm::Sha256);
+    let built: Dict<str, str> = Dict::new();
+    built.insert("web/assets/brand/wordmark-light.svg", kit::WORDMARK_SVG);
+    built.insert("web/assets/brand/wordmark-dark.svg", kit::WORDMARK_DARK_SVG);
+    built.insert("web/css/nabi.css", kit::NABI_CSS);
+    let files = ["og/render.ts", "og/" + tpl, "web/assets/brand/wordmark-light.svg", "web/assets/brand/wordmark-dark.svg", "web/css/nabi.css"];
+    if tpl == "home.html" { files.push("static/og.png"); }
+    // A missing input only changes the version, so its pages fall back to
+    // the site card; it must never stop the server.
+    if fs::exists("og/fonts") {
+        for entry in fs::walk("og/fonts").results() {
+            let e = try entry.get() catch _ { continue; };
+            if e.is_file() { files.push(e.path().as_str()); }
+        }
+    }
+    files.sort();
+    for f in files {
+        d.update(f + "\n");
+        if let b: str = built.get(f) {
+            d.update(b);
+            continue;
+        }
+        d.update(try fs::read(f) catch _ { continue; });
+    }
+    d
+}
+
+/// The docs pages of `s` (the package's latest, or the version it shows):
+/// the root module's at `layout::docs_out`, each other public module's
+/// at `apidoc::page` beside it.
+fn api_pages(site: Site, s: Package, have: Set<str>, about: str, og: str, alt: str, files: Dict<str, str>) {
+    let at = layout::api_at(s);
+    let of = if s.at.is_empty() { s.name } else { f"{s.name} {s.at}" };
+    let root = layout::docs_out(s.name, at);
+    files.insert(root, layout::page_desc(site, root, f"Docs of {of}", about, layout::api_page(site, s, have), og, alt));
+    let dir = layout::docs_dir(s.name, at);
+    for k in 1..s.api.len() {
+        let m = s.api[k];
+        let out = apidoc::page(dir, m);
+        files.insert(out, layout::page_desc(site, out, f"{m.path}: docs of {of}", about, layout::api_page(site, s, have, m), og, alt));
+    }
+}
+
+/// Whether the live site has `card` drawn at version `v`: its `.v` matches.
+fn drawn(site: Site, card: str, v: str) -> bool {
+    let f = site.out + "/" + card;
+    if !fs::exists(f) { return false; }
+    let got = try fs::read_to_str(f + ".v") catch _ { "" };
+    got.trim() == v
+}
+
+/// A card's version: the first 10 hex digits of its inputs' SHA-256. It
+/// changes exactly when the rendered card would, so a new card gets a
+/// new URL and link previews refetch it.
+pub fn og_version(inputs: Digest, text: str) -> str {
+    let d = inputs;
+    d.update(text);
+    secret::hex(d.finish()[0:5])
+}
+
+/// Broken internal `href` / `src` targets: missing file or anchor, or an
+/// address that is relative or not canonical (`url::canonical`).
+fn check(files: Dict<str, str>, statics: Set<str>) -> List<str> {
+    let ids: Dict<str, Set<str>> = Dict::new();
+    let refs: Dict<str, List<str>> = Dict::new();
+    for out in files.keys() {
+        let cs = chars_of(files[out]);
+        let s: Set<str> = Set::new();
+        for id in attr_values(cs, "id") { s.insert(id); }
+        ids.insert(out, s);
+        let r = attr_values(cs, "href");
+        r.extend(attr_values(cs, "src"));
+        r.extend(attr_values(cs, "action"));
+        refs.insert(out, r);
+    }
+    let bad: List<str> = List::new();
+    for out in files.keys() {
+        for raw in refs[out] {
+            if raw.contains("://") || raw.starts_with("mailto:") || raw == "#" { continue; }
+            // `?v=` on assets, `?q=` on keyword links.
+            let (p0, rest) = url::split_ref(raw);
+            let href = p0 + (if let k: usize = rest.find("#") { rest[k:] } else { "" });
+            let path = href;
+            let frag = "";
+            if let k: usize = href.find("#") {
+                path = href[:k];
+                frag = href[k + 1:];
+            }
+            if !path.is_empty() && !path.starts_with("/") {
+                bad.push(f"{out}: {href} (relative; write /{path})");
+                continue;
+            }
+            if path.is_empty() {
+                if !frag.is_empty() && !ids[out].contains(frag) { bad.push(f"{out}: {href} (no anchor)"); }
+                continue;
+            }
+            if let c: str = url::canonical(path) {
+                bad.push(f"{out}: {href} (not canonical; write {c})");
+                continue;
+            }
+            let rel = path[1:];
+            let target = if rel.is_empty() {
+                "index.html"
+            } else if ids.contains_key(rel + ".html") {
+                rel + ".html"
+            } else {
+                rel + "/index.html"
+            };
+            if let s: Set<str> = ids.get(target) {
+                if !frag.is_empty() && !s.contains(frag) { bad.push(f"{out}: {href} (no anchor)"); }
+            } else if !statics.contains(rel) {
+                bad.push(f"{out}: {href} (no page)");
+            }
+        }
+    }
+    bad
+}
+
+fn main() throws {
+    let t0 = Instant::now();
+    let args = env::args();
+    if args.len() == 2 && args[1] == "serve" {
+        try server::serve(try load_site());
+        return;
+    }
+    if args.len() == 6 && args[1] == "docs" { process::exit(docs::scan_cmd(args[2], args[3], args[4], args[5])); }
+    let strict = false;
+    let demo = false;
+    let offline = false;
+    let index_arg = "";
+    let data_arg = "";
+    let i = 1usize;
+    while i < args.len() {
+        let a = args[i];
+        if a == "check" {
+            strict = true;
+        } else if a == "--demo" {
+            demo = true;
+        } else if a == "--offline" {
+            offline = true;
+        } else if a == "--index" && i + 1 < args.len() {
+            i += 1;
+            index_arg = args[i];
+        } else if a == "--data" && i + 1 < args.len() {
+            i += 1;
+            data_arg = args[i];
+        } else {
+            eprintln(f"unknown argument `{a}` (check, --demo, --offline, --index <dir>, --data <dir>)");
+            process::exit(2);
+        }
+        i += 1;
+    }
+
+    let site = try load_site();
+    let dir = if demo { "fixtures/index" } else if !index_arg.is_empty() { index_arg } else { site.index };
+    dir = dir.strip_suffix("/") ?? dir;
+    if !fs::exists(dir) {
+        eprintln(f"error: no index at {dir} (site.nabion `index`, or --demo)");
+        process::exit(1);
+    }
+    let data_dir = if demo { "fixtures/data" } else { data_arg };
+    let readmes = packages::Readmes { cache: site.cache, fixed: if demo { "fixtures/readme" } else { "" }, fixed_src: if demo { "fixtures/src" } else { "" }, offline: offline, data: data_dir };
+    let data = packages::no_data();
+    // Packages the admins took down are left out of the site.
+    let removed: Set<str> = Set::new();
+    if !data_dir.is_empty() {
+        let db = try server::store::read_db(data_dir);
+        for x in db.removed {
+            if x.version.is_empty() { removed.insert(x.name); }
+        }
+        for r in server::store::fill_owner_ids(db) { data.releases.insert(r.name + "@" + r.version, r); }
+        for a in db.accounts {
+            if !a.name.is_empty() { data.names.insert(a.id, a.name); }
+        }
+        let keys: Set<str> = Set::new();
+        for o in db.owners { keys.insert(o.name); }
+        for p in db.trusted { keys.insert(index::key(p.package)); }
+        for r in db.releases { keys.insert(r.name); }
+        for k in keys {
+            if k.starts_with("native/") { continue; }
+            let ps = server::store::owners_for(db, k);
+            if !ps.is_empty() { data.owners.insert(k, ps); }
+        }
+    }
+    let idx = packages::load(dir, readmes, data);
+    for e in idx.errors { eprintln(f"index: {e}"); }
+    let all: List<Package> = List::new();
+    for p in idx.packages {
+        if !removed.contains(index::key(p.name)) { all.push(p); }
+    }
+    let have: Set<str> = Set::new();
+    for s in all { have.insert(s.name); }
+
+    // OG cards for og/render.ts, one per line: card version, name, package
+    // version, description; the home card has no name.
+    let package_card = try og_inputs("package.html");
+    let og_v: Dict<str, str> = Dict::new();
+    let mani = StrBuf::new();
+    mani.push_str(f"{site.og}\t\t\t\n");
+    for s in all {
+        if s.library { continue; }
+        let text = s.name + "\t" + s.latest.version + "\t" + s.desc.replace("\t", " ").replace("\n", " ");
+        let v = og_version(package_card, text);
+        og_v.insert(s.name, v);
+        mani.push_str(v + "\t" + text + "\n");
+    }
+    try fs::write("og/manifest.tsv", mani.to_str());
+
+    let files: Dict<str, str> = Dict::new();
+    let guide = markdown::render(try fs::read_to_str("pages/publishing.md"), layout::md(|h| h));
+    guide.html = web::chrome::align_classes(guide.html);
+    files.insert("index.html", layout::page(site, "index.html", site.title, layout::landing(all)));
+    files.insert("publishing.html", layout::page_desc(site, "publishing.html", "Using and publishing packages", "How to add a package as a dependency, and how a version gets into the index.", layout::guide(guide)));
+    files.insert("404.html", layout::page(site, "404.html", "Not found", layout::not_found()));
+    // The policies, in English at /<name> and Korean at /ko/<name>.
+    let policies: List<(str, str, str, str)> = [
+        ("terms", "Terms of use", "이용약관", "The terms of using the Nabi package registry."),
+        ("privacy", "Privacy notice", "개인정보 처리방침", "What the Nabi package registry keeps about you, and why."),
+        ("policy", "Usage policy", "이용 정책", "What may be published in the Nabi package registry, and how reports are handled."),
+    ];
+    for (slug, en, ko, about) in policies {
+        for korean in [false, true] {
+            let doc = markdown::render(try fs::read_to_str(if korean { f"pages/ko/{slug}.md" } else { f"pages/{slug}.md" }), layout::md(|h| h));
+            doc.html = web::chrome::align_classes(doc.html);
+            let out = if korean { f"ko/{slug}.html" } else { f"{slug}.html" };
+            let other = if korean { "/" + slug } else { "/ko/" + slug };
+            files.insert(out, layout::page_desc(site, out, if korean { ko } else { en }, about, layout::legal(doc, other, korean), "", "", if korean { "ko" } else { "en" }));
+        }
+    }
+    let rows: List<layout::Row> = List::new();
+    for s in all { rows.push(layout::row_of(s)); }
+    let (list_title, list_body) = layout::list_page(rows, "", "");
+    files.insert("packages/index.html", layout::page(site, "packages/index.html", list_title, list_body));
+    for s in all {
+        let out = layout::package_out(s.name);
+        // A standard library tier: one page, no versions or tabs.
+        if s.library {
+            files.insert(out, layout::page_desc(site, out, s.name, s.desc, layout::library_page(site, s)));
+            continue;
+        }
+        let about = if s.desc.is_empty() { f"{s.name} {s.latest.version}, a Nabi package" } else { s.desc };
+        // Until render.ts draws this card, link previews get the site card.
+        let (og, alt) = if drawn(site, "og/" + s.name + ".png", og_v[s.name]) {
+            (site.base_url + "/og/" + s.name + ".png?v=" + og_v[s.name], f"{s.name} {s.latest.version}: {about}")
+        } else { ("", "") };
+        files.insert(out, layout::page_desc(site, out, s.name, about, layout::package_page(site, s), og, alt));
+        if s.has_lib { api_pages(site, s, have, about, og, alt, files); }
+        let vo = layout::tab_out(s.name, "versions");
+        files.insert(vo, layout::page_desc(site, vo, f"Versions of {s.name}", about, layout::versions_page(site, s), og, alt));
+        let dpo = layout::tab_out(s.name, "dependencies");
+        files.insert(dpo, layout::page_desc(site, dpo, f"Dependencies of {s.name}", about, layout::deps_page(site, s, have), og, alt));
+        let rdo = layout::tab_out(s.name, "dependents");
+        files.insert(rdo, layout::page_desc(site, rdo, f"Dependents of {s.name}", about, layout::dependents_page(site, s), og, alt));
+        for v in s.views {
+            let vabout = if v.desc.is_empty() { f"{s.name} {v.at}, a Nabi package" } else { v.desc };
+            let po = layout::ver_out(s.name, v.at);
+            files.insert(po, layout::page_desc(site, po, f"{s.name} {v.at}", vabout, layout::package_page(site, v), og, alt));
+            if v.has_lib { api_pages(site, v, have, vabout, og, alt, files); }
+        }
+    }
+
+    // Search index: every package, its latest version, description and keywords.
+    let sx = StrBuf::new();
+    sx.push('[');
+    for k in 0..all.len() {
+        let s = all[k];
+        if k > 0 { sx.push_str(",\n"); }
+        let ks: List<str> = List::new();
+        for kw in s.meta.keywords { ks.push(json_str(kw)); }
+        sx.push_str(f"{{\"t\":{json_str(s.name)},\"u\":{json_str(layout::url(layout::package_out(s.name)))},\"v\":{json_str(if s.library { "with nabi" } else { s.latest.version })},\"p\":{json_str(s.desc)},\"k\":[{ks.join(",")}]{if s.official { ",\"o\":1" } else { "" }}{if packages::has_bin(s) { ",\"b\":1" } else { "" }}}}");
+    }
+    sx.push_str("]\n");
+
+    // Built beside the old site, then swapped in: `serve` keeps serving.
+    let out_root = site.out + ".new";
+    if fs::exists(out_root) { try fs::remove_dir_all(out_root); }
+    for out in files.keys() { try write(out_root, out, files[out]); }
+    let urls: List<str> = List::new();
+    for out in files.keys() {
+        if out != "404.html" { urls.push(site.base_url + layout::url(out)); }
+    }
+    urls.sort();
+    let map = StrBuf::new();
+    map.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
+    for u in urls { map.push_str(f"<url><loc>{markdown::esc(u)}</loc></url>\n"); }
+    map.push_str("</urlset>\n");
+    try write(out_root, "sitemap.xml", map.to_str());
+    try write(out_root, "robots.txt", f"User-agent: *\nDisallow: /me\nSitemap: {site.base_url}/sitemap.xml\n");
+    try write(out_root, "search-index.json", sx.to_str());
+    try write(out_root, ".packages.nabion", (try nabion::to_str(rows)) + "\n");
+    let statics: Set<str> = Set::new();
+    statics.insert("search-index.json");
+    // Served by `serve`, not files.
+    statics.insert("login");
+    statics.insert("me");
+    // The kit's files (web/, built in), its fonts, then static/.
+    for f in kit::files() {
+        try fs::write(out_root + "/" + f.name, f.data);
+        statics.insert(f.name);
+    }
+    for name in try kit::copy_fonts(kit::FONTS_DIR, out_root + "/fonts") { statics.insert("fonts/" + name); }
+    try for e in fs::walk("static") {
+        if !e.is_file() { continue; }
+        let name = e.path().as_str()["static/".len():];
+        // the TypeScript the page scripts are built from stays home
+        if kit::is_source(name) { continue; }
+        try fs::copy(e.path(), out_root + "/" + name);
+        statics.insert(name);
+    }
+    // Rendered cards outlive the rebuild while still current: each has a
+    // `.v` beside it naming the version render.ts drew (server.nabi).
+    let cards: List<(str, str)> = [("og.png", site.og)];
+    for s in all {
+        if !s.library { cards.push(("og/" + s.name + ".png", og_v[s.name])); }
+    }
+    for (card, v) in cards {
+        if !drawn(site, card, v) { continue; }
+        let from = site.out + "/" + card;
+        try fs::create_dir_all(dir_of(out_root + "/" + card));
+        try fs::copy(from, out_root + "/" + card);
+        try fs::copy(from + ".v", out_root + "/" + card + ".v");
+    }
+
+    let old = site.out + ".old";
+    if fs::exists(old) { try fs::remove_dir_all(old); }
+    if fs::exists(site.out) { try fs::rename(site.out, old); }
+    try fs::rename(out_root, site.out);
+    if fs::exists(old) { try fs::remove_dir_all(old); }
+    out_root = site.out;
+
+    let bad = check(files, statics);
+    for b in bad { eprintln(f"broken link: {b}"); }
+    let readme_n = 0usize;
+    for s in all {
+        if !s.readme.is_empty() { readme_n += 1; }
+    }
+    println(f"{dir}: {all.len()} packages ({readme_n} with README), {idx.errors.len()} index errors → {out_root}/ ({files.len()} html), {bad.len()} broken links, {t0.elapsed():?}");
+    if strict && (bad.len() > 0 || idx.errors.len() > 0) { process::exit(1); }
+}
+
+#[test]
+fn og_versions() {
+    let d = Digest::new(HashAlgorithm::Sha256);
+    let a = og_version(d, "abc");
+    if a != "ba7816bf8f" || og_version(d, "abc") != a || og_version(d, "abd") == a { panic(a); }
+}
+
+#[test]
+fn link_check() {
+    let files: Dict<str, str> = Dict::new();
+    files.insert("index.html", "<a href=\"/packages\">a</a><a href=\"/packages/json#x\">b</a><a href=\"#top\">c</a><img src=\"/nabi.svg\">");
+    files.insert("packages/index.html", "<a href=\"packages/json.html\">rel</a><a href=\"/packages/json.html\">html</a><a href=\"/packages/\">slash</a><a href=\"/nope\">gone</a><a href=\"#top\">top</a>");
+    files.insert("packages/json.html", "<h2 id=\"x\">x</h2><a href=\"/login\">in</a>");
+    let statics: Set<str> = Set::new();
+    statics.insert("nabi.svg");
+    statics.insert("login");
+    let bad = check(files, statics);
+    let want = ["(relative; write /packages/json.html)", "(not canonical; write /packages/json)", "(not canonical; write /packages)", "/nope (no page)", "index.html: #top (no anchor)", "packages/index.html: #top (no anchor)"];
+    if bad.len() != want.len() { panic(f"{bad:?}"); }
+    for w in want {
+        let hit = false;
+        for b in bad {
+            if b.contains(w) { hit = true; }
+        }
+        if !hit { panic(f"no `{w}` in {bad:?}"); }
+    }
+}

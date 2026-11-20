@@ -1,0 +1,3 @@
+//! `csvq '<query>' file.csv`: run a query over a CSV file.
+
+fn main() -> i32 { 0 }

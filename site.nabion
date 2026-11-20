@@ -1,0 +1,12 @@
+// Site configuration (read by main.nabi).
+Site {
+    title: "Nabi packages",
+    tagline: "The Nabi package registry",
+    description: "The Nabi package registry: find a package, then add it with nabi add <name>.",
+    index: "../packages-index",
+    index_repo: "https://github.com/nabi-lang/packages-index",
+    base_url: "https://packages.nabi-lang.org",
+    docs: "https://docs.nabi-lang.org",
+    cache: ".cache",
+    out: "public",
+}

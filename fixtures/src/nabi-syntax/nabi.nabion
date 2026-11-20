@@ -1,0 +1,12 @@
+Package {
+    name: "nabi-syntax",
+    version: "0.1.0",
+    nabi_version: "0.1.0",
+    toolchain: "0.1",
+    description: "Tokenizer and HTML highlighter for Nabi and NABION",
+    license: "MIT OR Apache-2.0",
+    repository: "https://github.com/nabi-lang/nabi-syntax",
+    keywords: ["nabi", "syntax", "highlighting", "tokenizer"],
+    categories: ["text-processing", "development-tools"],
+    deps: {},
+}

@@ -1,0 +1,19 @@
+{
+  "name": "packages.nabi-lang.org",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript and TSX for the page scripts: npm run build bundles the .js the site builds in, npm run check type-checks; og/render.ts draws the link preview cards with puppeteer-core",
+  "scripts": {
+    "build": "node --no-warnings web/tools/build.ts web/js static",
+    "check": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "esbuild": "0.25.12",
+    "puppeteer-core": "25.17.0",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "preact": "10.29.8"
+  }
+}

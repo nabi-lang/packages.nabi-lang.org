@@ -1,0 +1,5 @@
+// packages-index: the registry index of Nabi packages.
+// `api`: where `nabi login` / `nabi publish` / `nabi yank` talk to.
+Config {
+    api: "https://packages.nabi-lang.org",
+}

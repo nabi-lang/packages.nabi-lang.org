@@ -1,0 +1,18 @@
+Package {
+    name: "ode",
+    version: "0.1.0",
+    nabi_version: "0.1.0",
+    toolchain: "0.1",
+    description: "Differential equations on core arrays: adaptive Runge-Kutta, Radau, BDF, Rosenbrock and automatic stiff switching with dense output and events, fixed-step and symplectic integrators, boundary value problems",
+    license: "MIT OR Apache-2.0",
+    repository: "https://github.com/nabi-lang/ode",
+    keywords: ["ode", "differential-equations", "runge-kutta", "stiff", "numerics"],
+    categories: ["mathematics", "science"],
+    deps: {
+        "linalg": Dep::path("../linalg", version: "^0.1"),
+    },
+    features: {
+        "default": ["ops"],
+        "ops": [],
+    },
+}

@@ -1,0 +1,297 @@
+// The account pages: `/me` with its tokens, trusted publishers and
+// owners, and the forms that change them.
+
+use pkg::Site;
+use pkg::index;
+use pkg::layout;
+use pkg::meta;
+use pkg::secret;
+use pkg::server::admin::{Audit, audit};
+use pkg::server::limit;
+use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, may_manage, remove_owner, remove_trusted};
+use pkg::server::store::{Account, Db, SESSION_COOKIE, Session, TOKEN_DAYS, TOKEN_DAYS_MAX, Token, account_of, invites_of, load_db, now_secs, save_db, session_of};
+use pkg::server::{Cfg, Resp, cookie, is_admin, LOCK, may_act, message, page, redirect};
+use pkg::trust;
+use pkg::trust::TrustedPublisher;
+use markdown::esc;
+use std::env;
+use web::http;
+use web::http::Request;
+
+const MAX_TOKENS: usize = 20;
+
+/// `YYYY-MM-DD` (UTC) of a unix time.
+pub fn date(t: i64) -> str {
+    if t <= 0i64 { return "never"; }
+    let z = t / 86400i64 + 719468i64;
+    let era = z / 146097i64;
+    let doe = z - era * 146097i64;
+    let yoe = (doe - doe / 1460i64 + doe / 36524i64 - doe / 146096i64) / 365i64;
+    let doy = doe - (365i64 * yoe + yoe / 4i64 - yoe / 100i64);
+    let mp = (5i64 * doy + 2i64) / 153i64;
+    let d = doy - (153i64 * mp + 2i64) / 5i64 + 1i64;
+    let m = if mp < 10i64 { mp + 3i64 } else { mp - 9i64 };
+    let y = yoe + era * 400i64 + (if m <= 2i64 { 1i64 } else { 0i64 });
+    let p2 = |x: i64| if x < 10i64 { f"0{x}" } else { f"{x}" };
+    f"{y}-{p2(m)}-{p2(d)}"
+}
+
+fn me_page(cfg: Cfg, site: Site, path: str, db: Db, s: Session, fresh: str) -> Resp {
+    let a = account_of(db, s.account) ?? Account { id: 0i64, login: "", created: 0i64 };
+    let csrf = esc(s.csrf);
+    let b = StrBuf::new();
+    let shown = if a.name.is_empty() { a.login } else { a.name };
+    let gh = f"https://github.com/{esc(http::pct_encode(a.login))}";
+    b.push_str(f"<h1 class=\"t-h1\">Account</h1>\n<section class=\"profile\" aria-labelledby=\"profile\"><h2 class=\"sr-only\" id=\"profile\">Profile</h2>{layout::avatar(a.id, 80, false)}<div class=\"who-is\"><p class=\"t-h3\">{esc(shown)}</p><p>Logged in with GitHub as <a href=\"{gh}\"><strong>{esc(a.login)}</strong></a></p></div></section>\n");
+    b.push_str("<p class=\"t-small muted\">Your name, login and avatar come from your GitHub account; they are updated each time you log in.</p>\n");
+    b.push_str(f"<form method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Log out</button></form>\n");
+    invites_section(b, csrf, db, a.id);
+    b.push_str("<h2 class=\"t-h3\">Publish tokens</h2>\n");
+    let admin = is_admin(cfg, a.id);
+    if !may_act(cfg, a.id) {
+        b.push_str("<p>Publishing is not open yet: this account can log in, but cannot create tokens, add trusted publishers or owners, publish or yank. <a href=\"/publishing#publishing\">Publishing</a> says how it works.</p>\n");
+        return page(site, path, "Account", b.to_str(), 200);
+    }
+    let trusted = managed(db, a.id, admin);
+    if !fresh.is_empty() {
+        b.push_str(f"<div class=\"callout help\"><span class=\"lab\">New token, shown once: copy it now</span><pre class=\"cmd\"><code>{esc(fresh)}</code></pre><p>Save it with <code class=\"ic\">nabi login</code>, which reads it from stdin.</p></div>\n");
+    }
+    let mine: List<Token> = List::new();
+    for t in db.tokens {
+        if t.account == a.id { mine.push(t); }
+    }
+    if mine.is_empty() {
+        b.push_str("<p>No tokens yet.</p>\n");
+    } else {
+        b.push_str("<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Packages</th><th scope=\"col\">Created</th><th scope=\"col\">Expires</th><th scope=\"col\">Last used</th><th scope=\"col\"><span class=\"sr-only\">Revoke</span></th></tr></thead>\n<tbody>\n");
+        let now = now_secs();
+        for t in mine {
+            let pk = if t.packages.is_empty() { "<span class=\"muted\">all yours</span>" } else { esc(t.packages.join(", ")) };
+            let ex = if t.expires <= now { f"<span class=\"tag\">expired</span> {date(t.expires)}" } else { date(t.expires) };
+            b.push_str(f"<tr><td>{esc(t.name)}</td><td class=\"mono\">{pk}</td><td>{date(t.created)}</td><td>{ex}</td><td>{date(t.last_used)}</td><td><form method=\"post\" action=\"/me/tokens/{esc(t.id)}/revoke\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Revoke</button></form></td></tr>\n");
+        }
+        b.push_str("</tbody>\n</table></div>\n");
+    }
+    b.push_str(f"<form method=\"post\" action=\"/me/tokens\" class=\"token-form\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><label>Name <input name=\"name\" maxlength=\"64\" required></label> <label>Packages <input name=\"packages\" maxlength=\"512\" placeholder=\"all yours\" aria-describedby=\"token-help\"></label> <label>Days <input name=\"days\" type=\"number\" min=\"1\" max=\"{TOKEN_DAYS_MAX}\" value=\"{TOKEN_DAYS}\" required></label> <button class=\"btn btn-sm\" type=\"submit\">Create token</button></form>\n<p class=\"t-small muted\" id=\"token-help\">Packages: names separated by commas, to let the token publish and yank only those; empty, it acts for every package you own. A token works for the number of days given, at most {TOKEN_DAYS_MAX}.</p>\n");
+    trusted_section(b, csrf, trusted);
+    owners_section(b, csrf, db, a.id, admin);
+    if admin { moderation_section(b, db); }
+    page(site, path, "Account", b.to_str(), 200)
+}
+
+/// The account's open invitations to own a package, each with Accept and
+/// Decline.
+fn invites_section(b: StrBuf, csrf: str, db: Db, id: i64) {
+    let open = invites_of(db, id);
+    if open.is_empty() { return; }
+    b.push_str("<h2 class=\"t-h3\">Invitations</h2>\n<p>An owner asked you to share these packages. Accept to publish and yank them and to manage their owners.</p>\n<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>Package</th><th>Invited by</th><th></th></tr></thead>\n<tbody>\n");
+    for v in open {
+        let by = account_of(db, v.by) ?? Account { id: v.by, login: "", created: 0i64 };
+        let form = |act: str, label: str, cls: str| f"<form method=\"post\" action=\"/me/invites/{act}\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"package\" value=\"{esc(v.name)}\"><button class=\"{cls} btn-sm\" type=\"submit\">{label}</button></form>";
+        b.push_str(f"<tr><td>{esc(v.name)}</td><td>{esc(by.login)}</td><td>{form("accept", "Accept", "btn")} {form("decline", "Decline", "btn-2")}</td></tr>\n");
+    }
+    b.push_str("</tbody>\n</table></div>\n");
+}
+
+/// For an admin: the locked accounts, taken-down packages and approved
+/// names on record (changed through the admin API).
+fn moderation_section(b: StrBuf, db: Db) {
+    b.push_str("<h2 class=\"t-h3\">Moderation</h2>\n<p>Changed with an admin token through <code class=\"ic\">/api/v1/admin/lock</code>, <code class=\"ic\">/api/v1/admin/takedown</code> and <code class=\"ic\">/api/v1/admin/approve</code>; each change is kept in <code class=\"ic\">audit.nabion</code>.</p>\n");
+    let rows = StrBuf::new();
+    for l in db.locked { rows.push_str(f"<tr><td>account {l.id}</td><td>locked</td><td>{esc(l.reason)}</td><td>{date(l.at)}</td></tr>\n"); }
+    for x in db.removed {
+        let what = if x.version.is_empty() { x.name } else { f"{x.name} {x.version}" };
+        rows.push_str(f"<tr><td>{esc(what)}</td><td>taken down</td><td>{esc(x.reason)}</td><td>{date(x.at)}</td></tr>\n");
+    }
+    for n in db.approved { rows.push_str(f"<tr><td>{esc(n)}</td><td>name approved</td><td></td><td></td></tr>\n"); }
+    if rows.is_empty() {
+        b.push_str("<p>Nothing on record.</p>\n");
+    } else {
+        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>What</th><th>Action</th><th>Reason</th><th>Since</th></tr></thead>\n<tbody>\n{rows.to_str()}</tbody>\n</table></div>\n");
+    }
+}
+
+/// The owners of the packages the account manages (every package with owners
+/// on record, for an admin), a remove button on each, and the add form.
+fn owners_section(b: StrBuf, csrf: str, db: Db, id: i64, admin: bool) {
+    b.push_str("<h2 class=\"t-h3\">Owners</h2>\n");
+    b.push_str("<p>A package's owners publish and yank it and manage its trusted publishers and owners. A user logs in here once before being invited, and owns the package once they accept on their account page. An organization or team (<code class=\"ic\">org/team</code>) is shown on the package's page once one of its repositories is a trusted publisher of it; its members publish through trusted publishing.</p>\n");
+    let rows = StrBuf::new();
+    for o in db.owners {
+        if o.name.starts_with("native/") || !may_manage(db, o.name, id, admin) { continue; }
+        let who: List<meta::Person> = List::new();
+        for x in o.accounts {
+            if let a: Account = account_of(db, x) { who.push(meta::Person { login: a.login, name: a.name, id: a.id }); }
+        }
+        for g in o.orgs { who.push(meta::Person { login: g.login, id: g.id, org: true }); }
+        for p in who {
+            // An account is removed by its id: its login may have changed.
+            let id_field = if p.org { "" } else { f"<input type=\"hidden\" name=\"id\" value=\"{p.id}\">" };
+            rows.push_str(f"<tr><td>{esc(o.name)}</td><td>{layout::person_link(p, 20)}</td><td><form method=\"post\" action=\"/me/owners/remove\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"package\" value=\"{esc(o.name)}\"><input type=\"hidden\" name=\"login\" value=\"{esc(p.login)}\">{id_field}<button class=\"btn-2 btn-sm\" type=\"submit\">Remove</button></form></td></tr>\n");
+        }
+    }
+    for v in db.invites {
+        if v.package.starts_with("native/") || !may_manage(db, v.package, id, admin) { continue; }
+        let u = account_of(db, v.account) ?? Account { id: v.account, login: "", created: 0i64 };
+        rows.push_str(f"<tr><td>{esc(v.package)}</td><td>{layout::person_link(meta::Person { login: u.login, name: u.name, id: u.id }, 20)} <span class=\"muted\">invited</span></td><td><form method=\"post\" action=\"/me/owners/remove\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"package\" value=\"{esc(v.package)}\"><input type=\"hidden\" name=\"login\" value=\"{esc(u.login)}\"><input type=\"hidden\" name=\"id\" value=\"{u.id}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Withdraw</button></form></td></tr>\n");
+    }
+    if rows.is_empty() {
+        b.push_str("<p>No owners on record yet.</p>\n");
+    } else {
+        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>Package</th><th>Owner</th><th></th></tr></thead>\n<tbody>\n{rows.to_str()}</tbody>\n</table></div>\n");
+    }
+    b.push_str(f"<form method=\"post\" action=\"/me/owners\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><label>Package <input name=\"package\" maxlength=\"64\" required></label> <label>Owner <input name=\"login\" placeholder=\"login, org or org/team\" maxlength=\"80\" required></label> <button class=\"btn btn-sm\" type=\"submit\">Add</button></form>\n");
+}
+
+/// The trusted publishers of the packages the account manages, a remove
+/// button on each (not on PACKAGES_TRUSTED's), and the form to add one.
+fn trusted_section(b: StrBuf, csrf: str, list: List<TrustedPublisher>) {
+    b.push_str("<h2 class=\"t-h3\">Trusted publishers</h2>\n");
+    b.push_str(f"<p>A GitHub Actions workflow named here publishes its package with no token kept anywhere: it trades the job's OIDC token for one that lasts {trust::TOKEN_SECS / 60i64} minutes. <a href=\"/publishing#trusted-publishing\">Publishing</a> has the workflow.</p>\n");
+    if list.is_empty() {
+        b.push_str("<p>No trusted publishers yet.</p>\n");
+    } else {
+        b.push_str("<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>Package</th><th>Repository</th><th>Workflow</th><th>Environment</th><th></th></tr></thead>\n<tbody>\n");
+        for p in list {
+            let env = if p.environment.is_empty() { "<span class=\"muted\">any</span>" } else { esc(p.environment) };
+            let act = if p.seeded { "<span class=\"muted\">server config</span>" } else { f"<form method=\"post\" action=\"/me/trusted/{esc(p.id)}/remove\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Remove</button></form>" };
+            b.push_str(f"<tr><td>{esc(p.package)}</td><td>{esc(p.repository)}</td><td>{esc(p.workflow)}</td><td>{env}</td><td>{act}</td></tr>\n");
+        }
+        b.push_str("</tbody>\n</table></div>\n");
+    }
+    b.push_str(f"<form method=\"post\" action=\"/me/trusted\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><label>Package <input name=\"package\" maxlength=\"64\" required></label> <label>Repository <input name=\"repository\" placeholder=\"owner/repo\" maxlength=\"140\" required></label> <label>Workflow <input name=\"workflow\" placeholder=\"publish.yml\" maxlength=\"255\" required></label> <label>Environment <input name=\"environment\" placeholder=\"optional\" maxlength=\"255\"></label> <button class=\"btn btn-sm\" type=\"submit\">Add</button></form>\n");
+}
+
+/// `/me`, `/logout`, `/me/tokens..`, `/me/trusted..`, `/me/owners..` and
+/// `/me/invites..`: the session's account pages. The data file is read
+/// as it is; each change takes `LOCK` for its own read and write.
+pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
+    let db = try load_db(cfg);
+    let s = session_of(db, r) ?? Session { hash: "", account: 0i64, csrf: "", expires: 0i64 };
+    if s.hash.is_empty() {
+        return if r.method == "GET" { redirect("/login", []) } else { message(site, r.path, 401, "Not logged in", "Log in first.") };
+    }
+    if r.method == "GET" { return me_page(cfg, site, r.path, db, s, ""); }
+    if !limit::allow("ip:" + client, 2i64 * cfg.rate) || !limit::allow(f"acct:{s.account}", cfg.rate) {
+        let m = message(site, r.path, 429, "Too many changes", "Wait a minute, then send the form again.");
+        m.headers.push("Retry-After: 60");
+        return m;
+    }
+    if !r.header("content-type").starts_with("application/x-www-form-urlencoded") {
+        return message(site, r.path, 415, "Bad form", "Send the form from the account page.");
+    }
+    let f = http::form(r.body);
+    if !secret::same(f.get("csrf") ?? "", s.csrf) {
+        return message(site, r.path, 403, "Bad form", "The form expired; reload the account page.");
+    }
+    if r.path == "/logout" {
+        using g = LOCK.lock() {
+            let d = try load_db(cfg);
+            let keep: List<Session> = List::new();
+            for x in d.sessions {
+                if x.hash != s.hash { keep.push(x); }
+            }
+            d.sessions = keep;
+            try save_db(cfg, d);
+        }
+        audit(cfg, Audit { at: now_secs(), by: s.account, action: "logout", target: s.hash[:16] });
+        return redirect("/", [cookie(SESSION_COOKIE, "", 0i64)]);
+    }
+    let a = account_of(db, s.account) ?? Account { id: 0i64, login: "", created: 0i64 };
+    if r.path == "/me/invites/accept" || r.path == "/me/invites/decline" {
+        let package = (f.get("package") ?? "").trim();
+        let yes = r.path == "/me/invites/accept";
+        try accept_invite(cfg, a, package, yes) catch e { return message(site, r.path, e.status, "Invitation", e.msg); };
+        return redirect("/me", []);
+    }
+    let admin = is_admin(cfg, a.id);
+    if !may_act(cfg, a.id) {
+        return message(site, r.path, 403, "Publishing is not open yet", "This account can log in, but cannot create tokens, add trusted publishers or owners, publish or yank yet.");
+    }
+    if r.path == "/me/owners" || r.path == "/me/owners/remove" {
+        let package = (f.get("package") ?? "").trim();
+        let who = (f.get("login") ?? "").trim();
+        if r.path == "/me/owners" {
+            try add_owner(cfg, a, admin, package, who) catch e { return message(site, r.path, e.status, "Owner not added", e.msg); };
+        } else {
+            let id = try (f.get("id") ?? "0").trim().parse::<i64>() catch _ { 0i64 };
+            try remove_owner(cfg, a, admin, package, who, id) catch e { return message(site, r.path, e.status, "Owner not removed", e.msg); };
+        }
+        return redirect("/me", []);
+    }
+    if r.path == "/me/trusted" {
+        let p = TrustedPublisher { package: (f.get("package") ?? "").trim(), repository: (f.get("repository") ?? "").trim(), workflow: (f.get("workflow") ?? "").trim(), environment: (f.get("environment") ?? "").trim() };
+        try add_trusted(cfg, a, admin, p) catch e { return message(site, r.path, e.status, "Trusted publisher not added", e.msg); };
+        return redirect("/me", []);
+    }
+    if let rest: str = r.path.strip_prefix("/me/trusted/") {
+        try remove_trusted(cfg, a, admin, rest.strip_suffix("/remove") ?? "") catch e { return message(site, r.path, e.status, "Trusted publisher not removed", e.msg); };
+        return redirect("/me", []);
+    }
+    if r.path == "/me/tokens" {
+        let name = (f.get("name") ?? "").trim();
+        if name.is_empty() || name.char_count() > 64 {
+            return message(site, r.path, 400, "Bad token name", "A token name is 1 to 64 characters.");
+        }
+        let dt = (f.get("days") ?? "").trim();
+        let days = if dt.is_empty() { TOKEN_DAYS } else { try dt.parse::<i64>() catch _ { 0i64 } };
+        if days < 1i64 || days > TOKEN_DAYS_MAX {
+            return message(site, r.path, 400, "Bad token lifetime", f"A token lasts 1 to {TOKEN_DAYS_MAX} days; write a number of days, such as {TOKEN_DAYS}.");
+        }
+        let only = token_packages(f.get("packages") ?? "") ?? {
+            return message(site, r.path, 400, "Bad package list", "Write package names separated by commas, such as `json, toml`, or leave it empty for all your packages.");
+        };
+        let tok = "pkg_" + try secret::random_hex(32);
+        let id = try secret::random_hex(8);
+        let shown = db;
+        using g = LOCK.lock() {
+            let d = try load_db(cfg);
+            let n = 0usize;
+            for t in d.tokens {
+                if t.account == a.id { n += 1; }
+            }
+            if n >= MAX_TOKENS { return message(site, r.path, 400, "Too many tokens", f"Revoke one first (at most {MAX_TOKENS})."); }
+            let now = now_secs();
+            d.tokens.push(Token { id: id, name: name, account: a.id, hash: secret::sha256_hex(tok), created: now, last_used: 0i64, expires: now + days * 86400i64, packages: only });
+            try save_db(cfg, d);
+            shown = d;
+        }
+        audit(cfg, Audit { at: now_secs(), by: a.id, action: "token-create", target: f"{id} {name}" });
+        return me_page(cfg, site, r.path, shown, s, tok);
+    }
+    // `/me/tokens/<id>/revoke`
+    let id = (r.path.strip_prefix("/me/tokens/") ?? "").strip_suffix("/revoke") ?? "";
+    using g = LOCK.lock() {
+        let d = try load_db(cfg);
+        let keep: List<Token> = List::new();
+        let gone = false;
+        for t in d.tokens {
+            if t.id == id && t.account == a.id { gone = true; } else { keep.push(t); }
+        }
+        if !gone { return message(site, r.path, 404, "No such token", "It was revoked already."); }
+        d.tokens = keep;
+        try save_db(cfg, d);
+    }
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: "token-revoke", target: id });
+    redirect("/me", [])
+}
+
+/// The package names of a token form, as `index::key`s; none when one is
+/// not a package name. Empty: every package.
+fn token_packages(text: str) -> List<str> | none {
+    let out: List<str> = List::new();
+    for w in text.replace(" ", ",").split(",") {
+        if w.is_empty() { continue; }
+        if !pkg::packages::is_name(w.to_lowercase()) { return none; }
+        let k = index::key(w);
+        if !out.contains(k) { out.push(k); }
+    }
+    if out.len() > 32 { return none; }
+    out
+}
+
+#[test]
+fn dates() {
+    assert(date(0i64) == "never" && date(1700000000i64) == "2023-11-14" && date(951782400i64) == "2000-02-29", "dates");
+    assert((token_packages("") ?? ["x"]).is_empty() && (token_packages("json, Nabi-Syntax,json") ?? List::new()).join(" ") == "json nabi_syntax" && token_packages("a b/c") is none, "token packages");
+}

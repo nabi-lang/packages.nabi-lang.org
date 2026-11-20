@@ -1,0 +1,1 @@
+Package { name: "plot", version: "0.1.0", deps: [], source: Dep::git("https://github.com/nabi-lang/plot", rev: "620344757ce805404bf455df7ea6e295001241eb"), tree: "f48128b30ba7c721fb085f1672b6f23bf46395fd", yanked: false, nabi_version: "0.1.0", official: true }

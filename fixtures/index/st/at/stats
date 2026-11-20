@@ -1,0 +1,1 @@
+Package { name: "stats", version: "0.1.0", deps: [{ name: "linalg", req: "^0.1", kind: "normal" }, { name: "specfun", req: "^0.1", kind: "normal", package: "special" }], source: Dep::git("https://github.com/nabi-lang/stats", rev: "452f4e951b5be41e8b874687e61925a4c528f516"), tree: "ebbf6c4c0ab1c78125de6e9f77bbed3223af59a5", yanked: false, nabi_version: "0.1.0", official: true }

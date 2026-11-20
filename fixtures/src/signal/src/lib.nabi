@@ -1,0 +1,24 @@
+//! Signal processing over `core::array` arrays: FFTs of any
+//! length, convolution, windows, FIR and IIR filters, spectral
+//! estimation and peak finding, in pure Nabi.
+
+pub mod conv;
+pub mod fft;
+pub mod filter;
+pub mod ops;
+pub mod peaks;
+pub mod spectral;
+pub mod units;
+pub mod window;
+
+mod convert;
+mod error;
+
+pub use conv::{convolve, correlate, convolve2d, correlate2d, Mode, Method};
+pub use convert::{Samples, RealSamples, complex, abs, real, imag, angle};
+pub use error::SignalError;
+pub use fft::{fft, ifft, rfft, irfft, fftn, ifftn, Plan, RealPlan, Norm};
+pub use filter::{Band, butter, cheby1, cheby2, bessel, firwin, lfilter, sosfilt, filtfilt, sosfiltfilt, freqz, sosfreqz};
+pub use peaks::{find_peaks, Peaks};
+pub use spectral::{welch, periodogram, stft, istft, spectrogram, hilbert};
+pub use window::Window;

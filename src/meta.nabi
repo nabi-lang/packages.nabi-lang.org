@@ -1,0 +1,271 @@
+// What the index does not hold: a version's descriptive metadata, sent
+// with the publish and kept in the data file, and who published, yanked
+// and unyanked it.
+
+use std::nabion;
+use std::nabion::Value;
+
+/// The manifest's descriptive fields; `""` / empty / `none`: not given.
+#[derive(Nabion)]
+pub struct Meta {
+    pub description: str = "";
+    /// An SPDX expression.
+    pub license: str = "";
+    /// A path in the package's tree.
+    pub license_file: str = "";
+    /// `Name <email>` each.
+    pub authors: List<str> = List::new();
+    pub homepage: str = "";
+    pub documentation: str = "";
+    pub repository: str = "";
+    /// A path in the package's tree.
+    pub readme: str = "";
+    pub keywords: List<str> = List::new();
+    pub categories: List<str> = List::new();
+    pub include: List<str> = List::new();
+    pub exclude: List<str> = List::new();
+    /// `true`, `false`, or the registries it may be published to.
+    pub publish: Value = Value::None;
+    /// The free-form `metadata` table.
+    pub metadata: Value = Value::None;
+    /// The native library it links, from the index entry.
+    pub links: str = "";
+    pub default_run: str = "";
+    /// Whether it has a library target, and its binaries; `none` / empty:
+    /// not sent.
+    pub has_lib: bool | none = none;
+    pub bin_names: List<str> = List::new();
+    /// Bytes of the packed package, as `nabi publish` packed it.
+    pub size: i64 | none = none;
+    /// Keys this server does not know, kept as sent (`{ .. }`); `none`:
+    /// there were none. Shown with the rest, never checked.
+    pub extra: Value = Value::None;
+}
+
+pub fn empty() -> Meta { try! nabion::from_str("Meta {}") }
+
+/// The GitHub Actions run behind a trusted publish, from its OIDC claims.
+#[derive(Nabion)]
+pub struct Via {
+    /// `owner/repo`.
+    pub repository: str;
+    /// File name under `.github/workflows/`.
+    pub workflow: str;
+    /// The ref the workflow ran for (`refs/tags/v1.0.0`).
+    pub ref: str = "";
+    /// Decimal; "": not given.
+    pub run_id: str = "";
+    pub run_attempt: str = "";
+    /// GitHub's id of the repository's owner (`repository_owner_id`); 0:
+    /// not recorded.
+    pub owner_id: i64 = 0i64;
+}
+
+/// Who a trusted publish is shown as: the repository's owner (the
+/// organisation or user), not the account that started the run.
+pub fn owner_of(v: Via) -> str {
+    if let p: (str, str) = v.repository.split_once("/") { p.0 } else { v.repository }
+}
+
+/// A GitHub user or organisation as a page shows it: an owner or a
+/// publisher.
+pub struct Person {
+    /// A login, an organisation, or `org/team`.
+    pub login: str;
+    /// GitHub's display name; "": none.
+    pub name: str = "";
+    /// GitHub's numeric id (the org's, for a team); 0: not known.
+    pub id: i64 = 0i64;
+    /// An organisation or team on record.
+    pub org: bool = false;
+    /// Not on record: the owner of a trusted publisher's repository.
+    pub derived: bool = false;
+}
+
+/// GitHub's avatar of account `id` at `px` pixels; "" when the id is not
+/// known. Built from the id alone, so no address a user sent is loaded.
+pub fn avatar_url(id: i64, px: i32) -> str {
+    if id <= 0i64 { return ""; }
+    f"https://avatars.githubusercontent.com/u/{id}?s={px}&v=4"
+}
+
+/// Who `a` is shown as: the account, or for a trusted publish the
+/// repository's owner.
+pub fn person_of(a: Actor) -> Person {
+    match a.via {
+        v: Via => Person { login: owner_of(v), id: v.owner_id },
+        none => Person { login: a.login, id: a.id },
+    }
+}
+
+/// An account at a moment: who did something, and when (unix seconds).
+/// For a trusted publish, the GitHub user who triggered the run (id 0 and
+/// login "" when the token named none) and the run.
+#[derive(Nabion)]
+pub struct Actor {
+    pub id: i64;
+    pub login: str;
+    pub at: i64;
+    pub via: Via | none = none;
+}
+
+/// `owner/repo/.github/workflows/<file>@<ref>` split into repository,
+/// file and ref.
+pub fn split_workflow_ref(w: str) -> (str, str, str) | none {
+    let (path, r) = w.split_once("@") ?? (w, "");
+    let (repo, file) = path.split_once("/.github/workflows/") ?? { return none; };
+    if repo.is_empty() || file.is_empty() { return none; }
+    (repo, file, r)
+}
+
+fn digits(s: str) -> bool {
+    if s.is_empty() || s.len() > 20 { return false; }
+    for ch in s.chars() {
+        if !ch.is_ascii_digit() { return false; }
+    }
+    true
+}
+
+/// The run's page; "" when the run id is missing or not a number.
+pub fn run_url(v: Via) -> str {
+    if !digits(v.run_id) || v.repository.is_empty() { return ""; }
+    let attempt = if digits(v.run_attempt) && v.run_attempt != "1" { f"/attempts/{v.run_attempt}" } else { "" };
+    f"https://github.com/{v.repository}/actions/runs/{v.run_id}{attempt}"
+}
+
+/// One published version. `name` is `index::key`, `native/` prefixed for
+/// native packages. Versions published before the server kept these
+/// have no `published_by`.
+#[derive(Nabion)]
+pub struct Release {
+    pub name: str;
+    pub version: str;
+    pub meta: Meta;
+    pub published_by: Actor | none;
+    pub yanked_by: Actor | none;
+    pub unyanked_by: Actor | none;
+    /// Why it was yanked (`Yank { message }`); `""` when not given or
+    /// unyanked.
+    pub yank_message: str = "";
+    /// Downloads counted by the server. Always 0: clients fetch the git
+    /// source; the archive below is the registry's own copy of it.
+    pub downloads: i64 = 0i64;
+    /// SHA-256 of the source archive kept at publish (`archive_file`);
+    /// "" when none was kept.
+    pub archive: str = "";
+    /// Its size in bytes.
+    pub archive_size: i64 = 0i64;
+    /// Its index line was written with `official: true`.
+    pub official: bool = false;
+}
+
+/// Where the source archive of version `version` of `k` (`index::key`)
+/// is kept under the data directory: `git archive` of the published
+/// commit, so the version outlives its repository.
+pub fn archive_file(data: str, k: str, version: str) -> str { f"{data}/archives/{k}/{version}.tar.gz" }
+
+/// Where the README sent with version `version` of `k` (`index::key`,
+/// `native/` prefixed) is kept under the data directory.
+pub fn readme_file(data: str, k: str, version: str) -> str { f"{data}/readme/{k}/{version}.md" }
+
+fn given(v: Value) -> bool {
+    match v {
+        Value::None => false,
+        Value::Str(s) => !s.is_empty(),
+        Value::List(xs) => !xs.is_empty(),
+        _ => true,
+    }
+}
+
+/// `m` as a record of the fields it has, for the API; the unknown keys
+/// it was sent follow the known ones.
+pub fn to_value(m: Meta) -> Value {
+    let out: Dict<str, Value> = Dict::new();
+    if let Value::Struct { name: _, fields } = nabion::to_value(m) {
+        for (k, v) in fields {
+            if k != "extra" && given(v) { out.insert(k, v); }
+        }
+    }
+    if let Value::Struct { name: _, fields } = m.extra {
+        for (k, v) in fields {
+            if !out.contains_key(k) { out.insert(k, v); }
+        }
+    }
+    Value::Struct { name: none, fields: out }
+}
+
+/// `m`'s fields with the empty ones taken from `under`.
+pub fn over(m: Meta, under: Meta) -> Meta {
+    let a = nabion::to_value(m);
+    let b = nabion::to_value(under);
+    if let Value::Struct { name: n, fields: fa } = a {
+        if let Value::Struct { name: _, fields: fb } = b {
+            for (k, v) in fb {
+                if !given(fa.get(k) ?? Value::None) { fa.insert(k, v); }
+            }
+            return try nabion::from_value(Value::Struct { name: n, fields: fa }) catch _ { m };
+        }
+    }
+    m
+}
+
+#[cfg(test)]
+fn expect(ok: bool, what: str) {
+    if !ok { panic(what); }
+}
+
+#[test]
+fn avatars() {
+    expect(avatar_url(341800840i64, 64) == "https://avatars.githubusercontent.com/u/341800840?s=64&v=4", avatar_url(341800840i64, 64));
+    expect(avatar_url(0i64, 64).is_empty() && avatar_url(-1i64, 64).is_empty(), "unknown id");
+    expect(person_of(Actor { id: 5i64, login: "ann", at: 1i64 }).id == 5i64, "person of an account");
+    let pv = person_of(Actor { id: 5i64, login: "ann", at: 1i64, via: Via { repository: "nabi-lang/json", workflow: "publish.yml", owner_id: 341800840i64 } });
+    expect(pv.login == "nabi-lang" && pv.id == 341800840i64, "person of a trusted publish");
+    let bare: Via = try nabion::from_str("Via { repository: \"a/b\", workflow: \"p.yml\" }") catch e { panic(f"{e}"); };
+    expect(bare.owner_id == 0i64, "via without an owner id");
+}
+
+#[test]
+fn records() {
+    let m = empty();
+    m.description = "d";
+    m.keywords = ["a"];
+    let u = empty();
+    u.description = "x";
+    u.license = "MIT";
+    let o = over(m, u);
+    expect(o.description == "d" && o.license == "MIT" && o.keywords.len() == 1, "over");
+    let flat = try! nabion::to_str_flat(to_value(o));
+    expect(flat == "{ description: \"d\", license: \"MIT\", keywords: [\"a\"] }", flat);
+    let r = Release { name: "geom", version: "0.1.0", meta: o, published_by: Actor { id: 1i64, login: "a", at: 2i64 }, yanked_by: none, unyanked_by: none };
+    let back: Release = try nabion::from_str(try! nabion::to_str(r)) catch e { panic(f"{e}"); };
+    expect(back.meta.license == "MIT" && back.yanked_by is none, "round trip");
+    let bare: Release = try nabion::from_str("Release { name: \"x\", version: \"1.0.0\", meta: Meta {} }") catch e { panic(f"{e}"); };
+    expect(bare.published_by is none && bare.meta.description.is_empty() && bare.meta.size is none && bare.downloads == 0i64, "defaults");
+    let acct: Release = try nabion::from_str("Release { name: \"x\", version: \"1.0.0\", meta: Meta {}, published_by: Actor { id: 7, login: \"ann\", at: 3 }, yanked_by: none }") catch e { panic(f"{e}"); };
+    expect(acct.published_by is Actor && acct.unyanked_by is none, "actor without via");
+    if let a: Actor = acct.published_by { expect(a.login == "ann" && a.via is none, "actor via none"); }
+    let v = Via { repository: "acme/geom", workflow: "publish.yml", ref: "refs/tags/v1", run_id: "99", run_attempt: "1" };
+    let t = Release { name: "geom", version: "0.2.0", meta: empty(), published_by: Actor { id: 5i64, login: "ann", at: 1i64, via: v }, yanked_by: none, unyanked_by: none };
+    let tb: Release = try nabion::from_str(try! nabion::to_str(t)) catch e { panic(f"{e}"); };
+    let w = (tb.published_by ?? Actor { id: 0i64, login: "", at: 0i64 }).via ?? Via { repository: "", workflow: "" };
+    expect(w.run_id == "99" && w.ref == "refs/tags/v1", "via round trip");
+    expect(run_url(v) == "https://github.com/acme/geom/actions/runs/99", run_url(v));
+    v.run_attempt = "2";
+    expect(run_url(v) == "https://github.com/acme/geom/actions/runs/99/attempts/2", run_url(v));
+    v.run_id = "9x";
+    expect(run_url(v).is_empty(), "bad run id");
+    let (r, f, g) = split_workflow_ref("acme/geom/.github/workflows/publish.yml@refs/tags/v1") ?? ("", "", "");
+    expect(r == "acme/geom" && f == "publish.yml" && g == "refs/tags/v1", "workflow ref");
+    expect(split_workflow_ref("acme/geom") is none, "not a workflow ref");
+    let x = empty();
+    x.has_lib = true;
+    x.size = 1234i64;
+    let ex: Dict<str, Value> = Dict::new();
+    ex.insert("msrv_note", Value::Str("n"));
+    x.extra = Value::Struct { name: none, fields: ex };
+    let xf = try! nabion::to_str_flat(to_value(x));
+    expect(xf == "{ has_lib: true, size: 1234, msrv_note: \"n\" }", xf);
+    let xb: Meta = try nabion::from_str(try! nabion::to_str(x)) catch e { panic(f"{e}"); };
+    expect((xb.size ?? 0i64) == 1234i64 && xb.extra == x.extra, "extra round trip");
+}

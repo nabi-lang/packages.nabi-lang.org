@@ -1,0 +1,19 @@
+Package {
+    name: "optimize",
+    version: "0.1.0",
+    nabi_version: "0.1.0",
+    toolchain: "0.1",
+    description: "Numerical optimization on core arrays: root finding, minimization, constraints, linear and quadratic programming, least squares, curve fitting, global search; derivatives by automatic differentiation",
+    license: "MIT OR Apache-2.0",
+    repository: "https://github.com/nabi-lang/optimize",
+    keywords: ["optimization", "root-finding", "least-squares", "curve-fitting", "autodiff"],
+    categories: ["mathematics", "science"],
+    deps: {
+        "autodiff": Dep::path("../autodiff", version: "^0.1"),
+        "linalg": Dep::path("../linalg", version: "^0.1"),
+    },
+    features: {
+        "default": ["ops"],
+        "ops": [],
+    },
+}

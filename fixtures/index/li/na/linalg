@@ -1,0 +1,1 @@
+Package { name: "linalg", version: "0.1.0", deps: [], source: Dep::git("https://github.com/nabi-lang/linalg", rev: "466238e4c6769075b31317cf87f84e88c3a78b42"), tree: "4524d6cb44d3dae779909b5cc7a1e0d3be67a7df", yanked: false, nabi_version: "0.1.0", official: true }

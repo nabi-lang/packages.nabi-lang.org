@@ -1,0 +1,1 @@
+Package { name: "autodiff", version: "0.1.0", deps: [{ name: "linalg", req: "^0.1", kind: "normal" }], source: Dep::git("https://github.com/nabi-lang/autodiff", rev: "7bb0ec2a3e4e98cec50694a814e1a8831673f6f7"), tree: "58d78a2c5de88454a017dd0e6975a4ecd726c94a", yanked: false, nabi_version: "0.1.0", official: true }

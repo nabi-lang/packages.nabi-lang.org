@@ -1,0 +1,1 @@
+Package { name: "optimize", version: "0.1.0", deps: [{ name: "autodiff", req: "^0.1", kind: "normal" }, { name: "linalg", req: "^0.1", kind: "normal" }], source: Dep::git("https://github.com/nabi-lang/optimize", rev: "5b1c282aa0e3c77ba4a128965abea0749a72fc0a"), tree: "60ccb46a9ad9d8d51b90bd46218547198605888a", yanked: false, nabi_version: "0.1.0", official: true }

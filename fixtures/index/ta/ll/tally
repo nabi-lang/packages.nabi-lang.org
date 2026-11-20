@@ -1,0 +1,1 @@
+Package { name: "tally", version: "0.2.0", deps: [], source: Dep::git("https://github.com/packages-demo/tally", rev: "eb8c90ccae83f321694eaac0baab96fcdacc547d"), tree: "60ad4133705103182a900f0f3255a21de1b5e234", yanked: false, nabi_version: "0.1.0" }

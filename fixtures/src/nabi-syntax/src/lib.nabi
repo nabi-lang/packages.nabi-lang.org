@@ -1,0 +1,677 @@
+//! Tokenizer and HTML highlighter for Nabi and NABION: keywords, types,
+//! strings (f-string holes as code, nested; raw strings), chars, numbers,
+//! comments, attributes and macros. `r#name` is an identifier, never a
+//! keyword. The classes follow grammars/classes.nabion, the table the
+//! TextMate grammars in grammars/ are tested against.
+
+/// What a token is. `Text` is everything else (identifiers, raw
+/// identifiers, labels, operators, punctuation, whitespace).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Keyword,
+    Type,
+    Str,
+    Number,
+    Comment,
+    Attribute,
+    Text,
+    /// A macro call `name!` or a meta template token `@name`.
+    Macro,
+}
+
+impl Kind {
+    /// The CSS class `highlight_*` puts on the token's `<span>`: `k`,
+    /// `t`, `s`, `n`, `c`, `a`, `m`, or `""` for `Text` (not wrapped).
+    pub fn class(self) -> str {
+        match self {
+            Kind::Keyword => "k",
+            Kind::Type => "t",
+            Kind::Str => "s",
+            Kind::Number => "n",
+            Kind::Comment => "c",
+            Kind::Attribute => "a",
+            Kind::Text => "",
+            Kind::Macro => "m",
+        }
+    }
+}
+
+/// A slice of the source. Concatenating the `text` of all tokens gives
+/// the source back.
+#[derive(Clone, Debug)]
+pub struct Token {
+    pub kind: Kind;
+    pub text: str;
+}
+
+// Keywords everywhere but in name positions. The last six are reserved;
+// only `move` has syntax (`[move x]`).
+const RESERVED: [str; 39] = [
+    "let", "fn", "if", "else", "match", "while", "loop", "for", "return", "break", "continue",
+    "try", "throw", "async", "await", "yield", "unsafe", "using", "struct", "enum", "trait",
+    "impl", "pub", "mod", "use", "as", "is", "ref", "true", "false", "none", "self", "Self",
+    "macro", "defer", "dyn", "move", "gen", "do",
+];
+
+// Keywords only in their positions; `pkg` `sub` `sup` `some` are
+// handled apart.
+const CONTEXTUAL: [str; 13] = [
+    "type", "any", "in", "where", "throws", "rethrows", "catch", "finally", "const", "static",
+    "extern", "mut", "union",
+];
+
+// Keywords that stay keywords before `:`.
+const VALUES: [str; 5] = ["true", "false", "none", "self", "Self"];
+
+const NABION_KEYWORDS: [str; 3] = ["true", "false", "none"];
+
+const TYPES: [str; 22] = [
+    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+    "f16", "bf16", "f32", "f64", "bool", "char", "str", "int", "float", "c_char",
+];
+
+/// Tokens of Nabi source.
+pub fn tokens(src: str) -> List<Token> { lex(src, false) }
+
+/// Tokens of NABION source: as Nabi, but only `true` / `false` / `none`
+/// are keywords and a name before `:` is a field.
+pub fn tokens_nabion(src: str) -> List<Token> { lex(src, true) }
+
+/// Nabi source as HTML: tokens as `<span class="..">` (see
+/// `Kind::class`), `&` / `<` / `>` escaped. Goes inside `<pre><code>`.
+pub fn highlight_nabi(src: str) -> str { to_html(tokens(src)) }
+
+/// NABION source as HTML, as `highlight_nabi`.
+pub fn highlight_nabion(src: str) -> str { to_html(tokens_nabion(src)) }
+
+/// Tokens as HTML, as `highlight_nabi`.
+pub fn to_html(toks: List<Token>) -> str {
+    let out = StrBuf::new();
+    for t in toks {
+        let cls = t.kind.class();
+        if cls.is_empty() {
+            esc_into(out, t.text);
+        } else {
+            out.push_str(f"<span class=\"{cls}\">");
+            esc_into(out, t.text);
+            out.push_str("</span>");
+        }
+    }
+    out.to_str()
+}
+
+fn esc_into(out: StrBuf, s: str) {
+    for c in s.chars() {
+        if c == '&' {
+            out.push_str("&amp;");
+        } else if c == '<' {
+            out.push_str("&lt;");
+        } else if c == '>' {
+            out.push_str("&gt;");
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+fn is_ident(c: char) -> bool { c.is_alphanumeric() || c == '_' }
+
+fn is_ident_start(c: char) -> bool { is_ident(c) && !c.is_ascii_digit() }
+
+fn is_space(c: char) -> bool { c == ' ' || c == '\t' }
+
+fn is_reserved(w: str) -> bool {
+    for k in RESERVED {
+        if k == w { return true; }
+    }
+    false
+}
+
+fn is_contextual(w: str) -> bool {
+    for k in CONTEXTUAL {
+        if k == w { return true; }
+    }
+    false
+}
+
+fn is_value(w: str) -> bool {
+    for k in VALUES {
+        if k == w { return true; }
+    }
+    false
+}
+
+fn is_nabion_keyword(w: str) -> bool {
+    for k in NABION_KEYWORDS {
+        if k == w { return true; }
+    }
+    false
+}
+
+fn is_radix_digit(c: char, radix: char) -> bool {
+    if c == '_' { return true; }
+    if radix == 'x' { return c.is_ascii_hexdigit(); }
+    if radix == 'b' { return c == '0' || c == '1'; }
+    c >= '0' && c <= '7'
+}
+
+fn lex(src: str, nabion: bool) -> List<Token> {
+    let cs: List<char> = List::new();
+    for c in src.chars() { cs.push(c); }
+    let lx = Lexer { cs: cs, nabion: nabion, toks: List::new(), text: StrBuf::new() };
+    let start = lx.shebang();
+    _ = lx.code(start, false);
+    lx.flush();
+    lx.toks
+}
+
+struct Lexer {
+    cs: List<char>;
+    nabion: bool;
+    toks: List<Token>;
+    /// Pending `Text`, merged until the next other token.
+    text: StrBuf;
+}
+
+impl Lexer {
+    fn flush(self) {
+        if self.text.is_empty() { return; }
+        self.toks.push(Token { kind: Kind::Text, text: self.text.to_str() });
+        self.text.clear();
+    }
+
+    fn plain(self, c: char) { self.text.push(c); }
+
+    fn emit(self, kind: Kind, a: usize, b: usize) {
+        if a >= b { return; }
+        if kind == Kind::Text {
+            for k in a..b { self.text.push(self.cs[k]); }
+            return;
+        }
+        self.flush();
+        let s = StrBuf::new();
+        for k in a..b { s.push(self.cs[k]); }
+        self.toks.push(Token { kind: kind, text: s.to_str() });
+    }
+
+    fn at(self, k: usize) -> char {
+        if k < self.cs.len() { self.cs[k] } else { '\0' }
+    }
+
+    /// The first index from `k` that is not a space or tab.
+    fn skip_space(self, k: usize) -> usize {
+        let j = k;
+        while j < self.cs.len() && is_space(self.cs[j]) { j += 1; }
+        j
+    }
+
+    /// The end of the identifier starting at `k` (`k` if none).
+    fn ident_end(self, k: usize) -> usize {
+        let j = k;
+        if j < self.cs.len() && is_ident_start(self.cs[j]) {
+            while j < self.cs.len() && is_ident(self.cs[j]) { j += 1; }
+        }
+        j
+    }
+
+    /// A `#!` first line that does not open `#![..]` is a comment.
+    fn shebang(self) -> usize {
+        if self.nabion || self.at(0) != '#' || self.at(1) != '!' { return 0; }
+        if self.at(self.skip_space(2)) == '[' { return 0; }
+        let k = 0usize;
+        while k < self.cs.len() && self.cs[k] != '\n' { k += 1; }
+        self.emit(Kind::Comment, 0, k);
+        k
+    }
+
+    /// End of the quoted literal starting at `i` (`"` or `'`).
+    fn quote_end(self, i: usize, q: char) -> usize {
+        let cs = self.cs;
+        let k = i + 1;
+        while k < cs.len() {
+            let c = cs[k];
+            if c == '\\' {
+                k += 2;
+                continue;
+            }
+            if c == q { return k + 1; }
+            if c == '\n' && q == '\'' { return k; }
+            k += 1;
+        }
+        cs.len()
+    }
+
+    /// End of the char literal whose `'` is at `i`, or 0 if `'` does not
+    /// open one: `'\..'` always does, else one char and a closing `'`.
+    fn char_end(self, i: usize) -> usize {
+        let a = self.at(i + 1);
+        if a == '\\' {
+            let k = self.quote_end(i, '\'');
+            if k > i + 2 && self.at(k - 1) == '\'' { return k; }
+            return 0;
+        }
+        if a != '\'' && a != '\n' && a != '\0' && self.at(i + 2) == '\'' { return i + 3; }
+        0
+    }
+
+    /// End of the raw string `r"..."` / `r#"..."#` whose `r` is at `i`:
+    /// the first `"` followed by as many `#` as opened it.
+    fn raw_end(self, i: usize) -> usize {
+        let cs = self.cs;
+        let n = cs.len();
+        let k = i + 1;
+        while k < n && cs[k] == '#' { k += 1; }
+        let hashes = k - i - 1;
+        if k >= n || cs[k] != '"' { return k; }
+        k += 1;
+        while k < n {
+            if cs[k] == '"' {
+                let h = 0usize;
+                while h < hashes && k + 1 + h < n && cs[k + 1 + h] == '#' { h += 1; }
+                if h == hashes { return k + 1 + h; }
+            }
+            k += 1;
+        }
+        n
+    }
+
+    /// End of the block comment at `i`; block comments nest.
+    fn block_comment_end(self, i: usize) -> usize {
+        let n = self.cs.len();
+        let k = i + 2;
+        let depth = 1;
+        while k < n {
+            if self.cs[k] == '/' && self.at(k + 1) == '*' {
+                depth += 1;
+                k += 2;
+            } else if self.cs[k] == '*' && self.at(k + 1) == '/' {
+                depth -= 1;
+                k += 2;
+                if depth == 0 { return k; }
+            } else {
+                k += 1;
+            }
+        }
+        n
+    }
+
+    /// End of the attribute `#[..]` / `#![..]` at `i`: the `]` closing
+    /// its `[`, past strings and chars; it may span lines.
+    fn attribute_end(self, i: usize) -> usize {
+        let n = self.cs.len();
+        let k = if self.cs[i + 1] == '!' { i + 3 } else { i + 2 };
+        let depth = 1;
+        while k < n {
+            let c = self.cs[k];
+            if c == '"' {
+                k = self.quote_end(k, '"');
+            } else if c == '\'' && self.char_end(k) > 0 {
+                k = self.char_end(k);
+            } else if c == 'r' && (self.at(k + 1) == '"' || self.at(k + 1) == '#') && !(k > 0 && is_ident(self.cs[k - 1])) {
+                k = self.raw_end(k);
+            } else {
+                if c == '[' { depth += 1; }
+                if c == ']' {
+                    depth -= 1;
+                    if depth == 0 { return k + 1; }
+                }
+                k += 1;
+            }
+        }
+        n
+    }
+
+    /// End of the number at `i`: `0x`/`0b`/`0o` digits, or decimal digits
+    /// with an optional `.digits` and exponent, then any suffix (`u8`,
+    /// `f32`, `kg`). `1.` is a float; `1..2` and `1.foo` are not.
+    fn number_end(self, i: usize) -> usize {
+        let n = self.cs.len();
+        let k = i;
+        let p = self.at(i + 1).to_ascii_lowercase();
+        if self.cs[i] == '0' && (p == 'x' || p == 'b' || p == 'o') && is_radix_digit(self.at(i + 2), p) {
+            k = i + 2;
+            while k < n && is_radix_digit(self.cs[k], p) { k += 1; }
+            return self.ident_end(k);
+        }
+        while k < n && (self.cs[k].is_ascii_digit() || self.cs[k] == '_') { k += 1; }
+        let dot = self.at(k) == '.' && self.at(k + 1) != '.' && !is_ident_start(self.at(k + 1));
+        if dot {
+            k += 1;
+            if self.at(k).is_ascii_digit() {
+                while k < n && (self.cs[k].is_ascii_digit() || self.cs[k] == '_') { k += 1; }
+            }
+        }
+        let e = self.at(k);
+        if e == 'e' || e == 'E' {
+            let d = if self.at(k + 1) == '+' || self.at(k + 1) == '-' { k + 2 } else { k + 1 };
+            if self.at(d).is_ascii_digit() {
+                k = d;
+                while k < n && (self.cs[k].is_ascii_digit() || self.cs[k] == '_') { k += 1; }
+            }
+        }
+        self.ident_end(k)
+    }
+
+    /// An f-string from its `f` at `i`: text as `Str`, hole code as code
+    /// (it may reuse the quote and nest f-strings). Returns its end.
+    fn fstr(self, i: usize) -> usize {
+        let cs = self.cs;
+        let n = cs.len();
+        let triple = i + 3 < n && cs[i + 2] == '"' && cs[i + 3] == '"';
+        let k = if triple { i + 4 } else { i + 2 };
+        let run = i;
+        while k < n {
+            let c = cs[k];
+            let nx = if k + 1 < n { cs[k + 1] } else { ' ' };
+            if c == '\\' || ((c == '{' || c == '}') && nx == c) {
+                k += 2;
+            } else if c == '"' && (!triple || (k + 2 < n && nx == '"' && cs[k + 2] == '"')) {
+                let e = if triple { k + 3 } else { k + 1 };
+                self.emit(Kind::Str, run, e);
+                return e;
+            } else if c == '{' {
+                self.emit(Kind::Str, run, k + 1);
+                k = self.hole(k + 1);
+                run = k;
+                if k < n { k += 1; }
+            } else {
+                k += 1;
+            }
+        }
+        self.emit(Kind::Str, run, n);
+        n
+    }
+
+    /// Hole code from `i`, then its spec (with nested `{..}` / `${..}`
+    /// holes) as `Str`. Returns the index of the closing `}`.
+    fn hole(self, i: usize) -> usize {
+        let cs = self.cs;
+        let n = cs.len();
+        let k = self.code(i, true);
+        if k >= n || cs[k] != ':' { return k; }
+        let run = k;
+        while k < n && cs[k] != '}' && cs[k] != '"' {
+            let nx = if k + 1 < n { cs[k + 1] } else { ' ' };
+            if cs[k] == '$' && nx == '$' {
+                k += 2;
+            } else if cs[k] == '{' || (cs[k] == '$' && nx == '{') {
+                let open = if cs[k] == '$' { k + 2 } else { k + 1 };
+                self.emit(Kind::Str, run, open);
+                k = self.hole(open);
+                run = k;
+                if k < n { k += 1; }
+            } else {
+                k += 1;
+            }
+        }
+        self.emit(Kind::Str, run, k);
+        k
+    }
+
+    /// Whether the word `i..k` glued to a `"` is no string prefix: a
+    /// keyword (`if"x"`), or `rb` / `br`, which are not Nabi.
+    fn bad_prefix(self, i: usize, k: usize) -> bool {
+        let (a, b) = (self.cs[i], self.at(i + 1));
+        let w = StrBuf::new();
+        for j in i..k { w.push(self.cs[j]); }
+        is_reserved(w.to_str()) || (k == i + 2 && ((a == 'r' && b == 'b') || (a == 'b' && b == 'r')))
+    }
+
+    /// Whether the word at `i` follows `.` (not `..`): a member name.
+    fn after_dot(self, i: usize) -> bool {
+        i > 0 && self.cs[i - 1] == '.' && !(i > 1 && self.cs[i - 2] == '.')
+    }
+
+    /// Whether the word at `i` follows the ASCII word `w` and a space:
+    /// the name in `fn name` / `mod name`.
+    fn after_word(self, i: usize, w: str) -> bool {
+        let j = i;
+        while j > 0 && is_space(self.cs[j - 1]) { j -= 1; }
+        let wl = w.len();
+        if j == i || j < wl { return false; }
+        let p = j - wl;
+        let m = 0usize;
+        for c in w.chars() {
+            if self.cs[p + m] != c { return false; }
+            m += 1;
+        }
+        !(p > 0 && is_ident(self.cs[p - 1]))
+    }
+
+    /// Whether the word `return` ends right at `i`: `return@name`.
+    fn after_return(self, i: usize) -> bool {
+        if i < 6 { return false; }
+        let p = i - 6;
+        let m = 0usize;
+        for c in "return".chars() {
+            if self.cs[p + m] != c { return false; }
+            m += 1;
+        }
+        !(p > 0 && is_ident(self.cs[p - 1]))
+    }
+
+    /// Whether `pub(` (spaces allowed) comes right before `i`.
+    fn after_pub_paren(self, i: usize) -> bool {
+        let j = i;
+        while j > 0 && is_space(self.cs[j - 1]) { j -= 1; }
+        if j == 0 || self.cs[j - 1] != '(' { return false; }
+        j -= 1;
+        while j > 0 && is_space(self.cs[j - 1]) { j -= 1; }
+        j >= 3 && self.cs[j - 3] == 'p' && self.cs[j - 2] == 'u' && self.cs[j - 1] == 'b'
+            && !(j > 3 && is_ident(self.cs[j - 4]))
+    }
+
+    /// Whether a single `:` follows `k`: a field or binding name.
+    fn colon_ahead(self, k: usize) -> bool {
+        let j = self.skip_space(k);
+        self.at(j) == ':' && self.at(j + 1) != ':'
+    }
+
+    /// Whether `k` is followed by what ends a value: `=` (not `==` /
+    /// `=>`), `,`, `)`, `]` or `.` (not `..`).
+    fn value_end_ahead(self, k: usize) -> bool {
+        let j = self.skip_space(k);
+        let c = self.at(j);
+        let d = self.at(j + 1);
+        (c == '=' && d != '=' && d != '>') || c == ',' || c == ')' || c == ']' || (c == '.' && d != '.')
+    }
+
+    /// Whether `type` ending at `k` starts an alias: `type Name =`,
+    /// `type Name<`, `type Name;`, `type Name:`.
+    fn alias_ahead(self, k: usize) -> bool {
+        let j = self.skip_space(k);
+        if j == k { return false; }
+        if self.at(j) == 'r' && self.at(j + 1) == '#' { j += 2; }
+        let e = self.ident_end(j);
+        if e == j { return false; }
+        let c = self.at(self.skip_space(e));
+        c == '=' || c == '<' || c == ';' || c == ':'
+    }
+
+    /// Whether `some` at `i..k` is a parameter or return type: after `:`
+    /// or `->`, before a bound (`-> some Tr`, `x: some (A + B)`).
+    fn some_type_at(self, i: usize, k: usize) -> bool {
+        let j = i;
+        while j > 0 && is_space(self.cs[j - 1]) { j -= 1; }
+        let p = if j > 0 { self.cs[j - 1] } else { ' ' };
+        let after = (p == ':' && !(j > 1 && self.cs[j - 2] == ':'))
+            || (p == '>' && j > 1 && self.cs[j - 2] == '-');
+        let n = self.skip_space(k);
+        let c = self.at(n);
+        after && n > k && (c == '(' || is_ident_start(c))
+    }
+
+    /// The kind of the Nabi word `w` at `i..k`.
+    fn word_kind(self, w: str, i: usize, k: usize) -> Kind {
+        let reserved = is_reserved(w);
+        let contextual = is_contextual(w);
+        if (reserved || contextual) && !is_value(w) && self.colon_ahead(k) { return Kind::Text; }
+        if contextual && self.value_end_ahead(k) { return Kind::Text; }
+        if w == "type" {
+            return if self.alias_ahead(k) { Kind::Keyword } else { Kind::Text };
+        }
+        if w == "some" {
+            return if self.some_type_at(i, k) { Kind::Keyword } else { Kind::Text };
+        }
+        if w == "union" {
+            let j = self.skip_space(k);
+            let c = self.at(j);
+            let raw = c == 'r' && self.at(j + 1) == '#';
+            return if j > k && (is_ident_start(c) || raw) { Kind::Keyword } else { Kind::Text };
+        }
+        if (w == "pkg" || w == "sup") && self.at(k) == ':' && self.at(k + 1) == ':' {
+            return Kind::Keyword;
+        }
+        if (w == "pkg" || w == "sub") && self.after_pub_paren(i) && self.at(self.skip_space(k)) == ')' {
+            return Kind::Keyword;
+        }
+        if reserved || contextual { return Kind::Keyword; }
+        if is_type(w) { return Kind::Type; }
+        Kind::Text
+    }
+
+    /// The kind of the NABION word `w` ending at `k`.
+    fn nabion_kind(self, w: str, k: usize) -> Kind {
+        if self.colon_ahead(k) { return Kind::Text; }
+        if is_nabion_keyword(w) { return Kind::Keyword; }
+        let c = w.chars().next() ?? 'a';
+        if c.is_uppercase() { Kind::Type } else { Kind::Text }
+    }
+
+    /// A word at `i` ending at `k`: a name, keyword, type or macro.
+    /// Returns where it ends.
+    fn word(self, i: usize, k: usize) -> usize {
+        let w = StrBuf::new();
+        for j in i..k { w.push(self.cs[j]); }
+        let word = w.to_str();
+        if self.nabion {
+            self.emit(self.nabion_kind(word, k), i, k);
+            return k;
+        }
+        if self.after_dot(i) || self.after_word(i, "fn") || self.after_word(i, "mod") {
+            self.emit(Kind::Text, i, k);
+            return k;
+        }
+        if self.at(k) == '!' && self.at(k + 1) != '=' && !is_reserved(word) {
+            self.emit(Kind::Macro, i, k + 1);
+            return k + 1;
+        }
+        self.emit(self.word_kind(word, i, k), i, k);
+        k
+    }
+
+    /// Code from `start`. In a hole, stop at its closing `}` or spec `:`
+    /// (bracket depth 0) and return where; else run to the end.
+    fn code(self, start: usize, in_hole: bool) -> usize {
+        let cs = self.cs;
+        let n = cs.len();
+        let i = start;
+        let depth = 0;
+        while i < n {
+            let c = cs[i];
+            let nx = if i + 1 < n { cs[i + 1] } else { ' ' };
+            if in_hole && depth == 0 && (c == '}' || (c == ':' && nx != ':')) {
+                return i;
+            }
+            if c == '(' || c == '[' || c == '{' { depth += 1; }
+            if c == ')' || c == ']' || c == '}' { depth -= 1; }
+            if c == ':' && nx == ':' {
+                self.plain(':');
+                self.plain(':');
+                i += 2;
+            } else if c == '/' && nx == '/' {
+                let k = i;
+                while k < n && cs[k] != '\n' { k += 1; }
+                self.emit(Kind::Comment, i, k);
+                i = k;
+            } else if c == '/' && nx == '*' {
+                let k = self.block_comment_end(i);
+                self.emit(Kind::Comment, i, k);
+                i = k;
+            } else if c == '"' {
+                let k = self.quote_end(i, '"');
+                self.emit(Kind::Str, i, k);
+                i = k;
+            } else if c == '\'' {
+                // A char literal, else a label `'name` or a stray quote.
+                let k = self.char_end(i);
+                if k > 0 {
+                    self.emit(Kind::Str, i, k);
+                    i = k;
+                } else if is_ident_start(nx) {
+                    let e = self.ident_end(i + 1);
+                    self.emit(Kind::Text, i, e);
+                    i = e;
+                } else {
+                    self.plain(c);
+                    i += 1;
+                }
+            } else if !self.nabion && c == '#' && (nx == '[' || (nx == '!' && self.at(i + 2) == '[')) {
+                let k = self.attribute_end(i);
+                self.emit(Kind::Attribute, i, k);
+                i = k;
+            } else if !self.nabion && c == '!' && nx == 'i' && self.at(i + 2) == 'n' && !is_ident(self.at(i + 3)) {
+                // `x !in xs`: one keyword, the negated `in`.
+                self.emit(Kind::Keyword, i, i + 3);
+                i += 3;
+            } else if !self.nabion && c == '@' && is_ident_start(nx) {
+                // `return@each` names a closure's callee; `@x` is a template token.
+                let k = self.ident_end(i + 1);
+                let kind = if self.after_return(i) { Kind::Text } else { Kind::Macro };
+                self.emit(kind, i, k);
+                i = k;
+            } else if c.is_ascii_digit() {
+                let k = self.number_end(i);
+                self.emit(Kind::Number, i, k);
+                i = k;
+            } else if is_ident(c) {
+                let k = self.ident_end(i);
+                let word_f = k == i + 1 && c == 'f';
+                if word_f && self.at(k) == '"' {
+                    i = self.fstr(i);
+                } else if k == i + 1 && c == 'r' && self.at(k) == '#' && is_ident_start(self.at(k + 1)) {
+                    // A raw identifier: a name even when spelled as a keyword.
+                    let e = self.ident_end(k + 1);
+                    if !self.after_dot(i) && self.at(e) == '!' && self.at(e + 1) != '=' {
+                        self.emit(Kind::Macro, i, e + 1);
+                        i = e + 1;
+                    } else {
+                        self.emit(Kind::Text, i, e);
+                        i = e;
+                    }
+                } else if k == i + 1 && c == 'r' && (self.at(k) == '"' || self.at(k) == '#') {
+                    let e = self.raw_end(i);
+                    self.emit(Kind::Str, i, e);
+                    i = e;
+                } else if k == i + 1 && c == 'b' && self.at(k) == '"' {
+                    let e = self.quote_end(k, '"');
+                    self.emit(Kind::Str, i, e);
+                    i = e;
+                } else if k == i + 1 && (c == 'c' || c == 'b') && self.at(k) == '\'' && self.char_end(k) > 0 {
+                    let e = self.char_end(k);
+                    self.emit(Kind::Str, i, e);
+                    i = e;
+                } else if !self.nabion && self.at(k) == '"' && !self.bad_prefix(i, k) {
+                    // `date"2024-01-15"`: a `#[literal]` string prefix.
+                    let e = self.quote_end(k, '"');
+                    self.emit(Kind::Str, i, e);
+                    i = e;
+                } else {
+                    i = self.word(i, k);
+                }
+            } else {
+                self.plain(c);
+                i += 1;
+            }
+        }
+        n
+    }
+}
+
+fn is_type(w: str) -> bool {
+    for k in TYPES {
+        if k == w { return true; }
+    }
+    let c = w.chars().next() ?? 'a';
+    c.is_uppercase()
+}

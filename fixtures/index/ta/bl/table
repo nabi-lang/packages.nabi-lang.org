@@ -1,0 +1,1 @@
+Package { name: "table", version: "0.1.0", deps: [{ name: "json", req: "^0.1", kind: "normal" }], source: Dep::git("https://github.com/nabi-lang/table", rev: "ae4b1d0da2026d63da7108daaa6fa6ba650c9d88"), tree: "76f752688a0bbf807ee4a617bd7b9c8b6d8b8e46", yanked: false, nabi_version: "0.1.0", official: true }

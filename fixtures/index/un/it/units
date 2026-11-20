@@ -1,0 +1,1 @@
+Package { name: "units", version: "0.1.0", deps: [], source: Dep::git("https://github.com/nabi-lang/units", rev: "1012df97c1de3ae8fdd213b7197a92f98290de43"), tree: "b555f34cc7a86ef69091a4ef503c92a914b36725", yanked: false, nabi_version: "0.1.0", official: true }

@@ -1,0 +1,83 @@
+// Rate limits: requests a client (address, account or token) may make in
+// a one-minute window, kept in memory; a refused request gets a 429.
+
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::server::Cfg;
+use pkg::server::store::now_secs;
+use std::net::TcpStream;
+use web::http::Request;
+
+/// Logins (the OAuth redirect and its callback) a minute per address.
+pub const LOGINS: i64 = 20i64;
+// Changes (API calls and account forms that change something) are
+// limited per account or token to Cfg.rate a minute, per address to
+// twice that.
+/// Trusted publishing exchanges a minute per address.
+pub const EXCHANGES: i64 = 20i64;
+/// Reads that cost work, a minute per address: searches and package 404
+/// pages (both scan every name), and API reads (the data file, archives).
+pub const READS: i64 = 300i64;
+
+struct Window {
+    start: i64;
+    count: i64;
+}
+
+static WINDOWS: Mutex<Dict<str, Window>> = Mutex::new(Dict::new());
+
+/// Count one request of `key` (`ip:..`, `acct:..`); whether it is within
+/// `per_min`.
+pub fn allow(key: str, per_min: i64) -> bool {
+    using g = WINDOWS.lock() {
+        let d = g.get();
+        let t = now_secs();
+        // Old windows go when the table grows, never everyone's at once
+        // (a client could force that and reset its own).
+        if d.len() > 4096 {
+            let keep: Dict<str, Window> = Dict::new();
+            for (k, w) in d.iter() {
+                if t - w.start < 60i64 { keep.insert(k, w); }
+            }
+            d = keep;
+            g.set(d);
+        }
+        let w = d.get(key) ?? Window { start: t, count: 0i64 };
+        if t - w.start >= 60i64 { w = Window { start: t, count: 0i64 }; }
+        w.count += 1i64;
+        d.insert(key, w);
+        w.count <= per_min
+    }
+}
+
+/// `allow`, as the error a route throws.
+pub fn check(key: str, per_min: i64) throws (ApiError) {
+    if !allow(key, per_min) { throw index::err(429, "too many requests; wait a minute and try again"); }
+}
+
+/// The client's address. Without PACKAGES_CLIENT_HEADER the TCP peer, so
+/// a client cannot forge it; with it, that header as the trusted proxy
+/// set it (the last entry of a list: a client may prepend, not append).
+pub fn client_of(cfg: Cfg, s: TcpStream, r: Request) -> str {
+    if !cfg.client_header.is_empty() {
+        let v = r.header(cfg.client_header);
+        if !v.is_empty() {
+            if let k: usize = v.rfind(",") { return v[k + 1:].trim(); }
+            return v.trim();
+        }
+    }
+    let a = try s.peer_addr() catch _ { return "?"; };
+    let t = f"{a}";
+    if let k: usize = t.rfind(":") { t[:k] } else { t }
+}
+
+#[test]
+fn windows() {
+    let key = f"test:{now_secs()}";
+    for _ in 0..3 { assert(allow(key, 3i64), "within"); }
+    assert(!allow(key, 3i64), "past the limit");
+    assert(allow(key + "-other", 3i64), "another key");
+    let s = 0;
+    try check(key, 3i64) catch e { s = e.status; };
+    assert(s == 429, "429");
+}

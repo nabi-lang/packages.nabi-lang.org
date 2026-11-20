@@ -1,0 +1,1 @@
+Package { name: "sparse", version: "0.1.0", deps: [{ name: "linalg", req: "^0.1", kind: "normal" }], source: Dep::git("https://github.com/nabi-lang/sparse", rev: "be96639fc4690a28f5c3e59a95522b4cbae8f6a1"), tree: "6b3fcb5c1b6d422d1501588421845d69966c5dce", yanked: false, nabi_version: "0.1.0", official: true }

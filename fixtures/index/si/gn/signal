@@ -1,0 +1,1 @@
+Package { name: "signal", version: "0.1.0", deps: [{ name: "linalg", req: "^0.1", kind: "normal" }], source: Dep::git("https://github.com/nabi-lang/signal", rev: "beb3c95869978dbcaa7ec658716a490e4d7e0115"), tree: "9d5c48f7d30956ce5f0f64cca5a4c611db044f30", yanked: false, nabi_version: "0.1.0", official: true }

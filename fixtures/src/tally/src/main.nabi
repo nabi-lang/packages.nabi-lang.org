@@ -1,0 +1,15 @@
+//! `tally [path..]`: lines, words and bytes per file and per extension.
+
+use std::env;
+use std::fs;
+
+fn main() throws -> i32 {
+    let total = 0usize;
+    for p in env::args().skip(1) {
+        let text = try fs::read_to_str(p);
+        total += text.split("\n").count();
+        println(f"{p}: {text.len()} bytes");
+    }
+    println(f"{total} lines");
+    0
+}

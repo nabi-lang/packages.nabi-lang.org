@@ -1,0 +1,44 @@
+//! Interpolation, splines, smoothing and integration of data on core's
+//! `Array`.
+
+pub mod bspline;
+pub mod curve;
+pub mod diff;
+pub mod integrate;
+#[cfg(feature = "ops")]
+pub mod ops;
+pub mod poly;
+pub mod ppoly;
+pub mod scatter;
+pub mod smooth;
+
+mod banded;
+mod barycentric;
+mod cubic;
+mod data;
+mod error;
+mod grid;
+mod hermite;
+mod linear;
+mod tensor;
+
+pub use barycentric::{Barycentric, barycentric};
+pub use bspline::fit::{make_interp_spline, make_lsq_spline};
+pub use bspline::smooth::splrep;
+pub use bspline::{BSpline, splev, splint, sproot};
+pub use cubic::{Boundary, cubic_spline, cubic_spline_with};
+pub use curve::{Curve, Extrapolate};
+pub use diff::{Estimate, derivative, differentiate, fd_weights, gradient, gradient_nd};
+pub use error::InterpError;
+pub use grid::{GridMethod, RegularGrid, bilinear, grid};
+pub use hermite::{akima, cubic_hermite, makima, pchip};
+pub use integrate::{Quad, cumulative_trapezoid, dblquad, dblquad_over, fixed_quad, gauss_legendre, quad, romb, romberg, simpson, tplquad, tplquad_over, trapezoid};
+pub use linear::{Linear, Step, StepKind, linear, nearest, next, previous, step};
+pub use poly::chebyshev::Chebyshev;
+pub use poly::polynomial::Polynomial;
+pub use ppoly::PPoly;
+pub use scatter::{Delaunay, KdTree, Kernel, LinearND, NearestND, Neighbors, Rbf, griddata};
+pub use smooth::lowess::lowess;
+pub use smooth::savgol::{Edge, savgol_coeffs, savgol_filter};
+pub use smooth::spline::make_smoothing_spline;
+pub use tensor::{TensorSpline, bicubic};

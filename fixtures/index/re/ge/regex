@@ -1,0 +1,1 @@
+Package { name: "regex", version: "0.1.0", deps: [], source: Dep::git("https://github.com/nabi-lang/regex", rev: "cc598deeb07f0f80442729c3d0fd8c1f580b7f92"), tree: "fe754e519c04a9352f265451c35c7348e3c85b87", yanked: false, nabi_version: "0.1.0", official: true }

@@ -1,0 +1,18 @@
+Package {
+    name: "autodiff",
+    version: "0.1.0",
+    nabi_version: "0.1.0",
+    toolchain: "0.1",
+    description: "Automatic differentiation on core arrays: dual numbers, multi-lane duals, hyper-duals, Taylor jets and a reverse-mode tape; gradients, Jacobians, Hessians",
+    license: "MIT OR Apache-2.0",
+    repository: "https://github.com/nabi-lang/autodiff",
+    keywords: ["autodiff", "automatic-differentiation", "gradient", "jacobian", "numerics"],
+    categories: ["mathematics", "science"],
+    deps: {
+        "linalg": Dep::path("../linalg", version: "^0.1"),
+    },
+    features: {
+        "default": ["ops"],
+        "ops": [],
+    },
+}

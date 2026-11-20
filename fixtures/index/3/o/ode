@@ -1,0 +1,1 @@
+Package { name: "ode", version: "0.1.0", deps: [{ name: "linalg", req: "^0.1", kind: "normal" }], source: Dep::git("https://github.com/nabi-lang/ode", rev: "2518868a0940c16d252c11120610d2a8b22f93c8"), tree: "17853f8dbaa11d6b62090ea5b0315a77f0efe317", yanked: false, nabi_version: "0.1.0", official: true }

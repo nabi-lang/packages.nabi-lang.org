@@ -1,0 +1,12 @@
+Package {
+    name: "csvq",
+    version: "0.3.0",
+    nabi_version: "0.1.0",
+    description: "Query CSV files with filter, select and group-by expressions: a library and a command-line tool",
+    license: "MIT OR Apache-2.0",
+    keywords: ["csv", "query", "cli", "data"],
+    categories: ["command-line-utilities", "science"],
+    deps: {
+        "table": Dep::version("^0.1"),
+    },
+}

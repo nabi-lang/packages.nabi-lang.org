@@ -1,0 +1,374 @@
+// API docs of a package, from its sources at the published commit: one
+// page per public module reachable from `src/lib.nabi` through `pub mod`,
+// listing its `pub` items with their `///` docs, at the pages and ids
+// `nabi doc` gives them (`docs/read.html#struct.Event`,
+// `#Event.len`). Signatures are shown as written.
+//
+// The sources are scanned by web::apidoc (the scanner behind the std API
+// pages too); this file walks a package's tree and renders. Docs come from
+// the package's author and are rendered untrusted.
+
+use markdown::esc;
+use web::apidoc::nav;
+use web::apidoc::{Item, Module};
+
+/// Every public module of the package `krate` (its name as code spells it,
+/// `nabi_syntax`), from `src/lib.nabi` through `mod` items, as
+/// web::apidoc::pages shows them (items re-exported from private modules
+/// inline); `read` gives a file of the tree. Empty when there is no
+/// `src/lib.nabi`.
+pub fn collect(krate: str, read: fn(str) -> (str | none)) -> List<Module> { web::apidoc::pages(web::apidoc::walk(read, "src/lib.nabi", krate, "")) }
+
+/// `src` with a link mapper for relative links in docs.
+fn md(text: str, link: fn(str) -> str) -> str {
+    if text.trim().is_empty() { return ""; }
+    "<div class=\"md\">" + web::chrome::align_classes(markdown::render_untrusted(text, markdown::Options { link: link, code: doc_code }).html) + "</div>"
+}
+
+/// Fenced code in a doc comment is Nabi unless it says otherwise.
+fn doc_code(lang: str, body: str) -> (str | none) {
+    if lang == "" || lang == "nabi" { return nabi_syntax::highlight_nabi(body); }
+    if lang == "nabion" { return nabi_syntax::highlight_nabion(body); }
+    none
+}
+
+/// The first sentence of `doc`, as text.
+pub fn summary(doc: str) -> str {
+    let t = doc.trim().replace("\n", " ");
+    if let k: usize = t.find(". ") { return t[:k + 1]; }
+    t
+}
+
+const KINDS: [(str, str); 8] = [
+    ("use", "Re-exports"), ("struct", "Structs"), ("enum", "Enums"), ("trait", "Traits"),
+    ("type", "Type aliases"), ("fn", "Functions"), ("const", "Constants"), ("static", "Statics"),
+];
+
+fn sig_html(sig: str) -> str {
+    if sig.contains("\n") || !sig.contains("fn ") { return nabi_syntax::highlight_nabi(sig); }
+    let fn_at = sig.find("fn ") ?? 0;
+    let pieces: List<str> = List::new();
+    let seps: List<str> = List::new();
+    let cur = StrBuf::new();
+    let sep = "";
+    let depth = 0;
+    let params = false;
+    let done = false;
+    let skip = false;
+    let prev = ' ';
+    let pos = 0usize;
+    for c in sig.chars() {
+        let at = pos;
+        pos += c.len_utf8();
+        if skip {
+            skip = false;
+            if c == ' ' { continue; }
+        }
+        if depth == 0 && done && c == ' ' && (sig[at:].starts_with(" -> ") || sig[at:].starts_with(" where ")) {
+            pieces.push(cur.to_str());
+            seps.push(sep);
+            cur.clear();
+            sep = " ";
+            prev = c;
+            continue;
+        }
+        cur.push(c);
+        if c == '(' || c == '[' || c == '{' || c == '<' {
+            depth += 1;
+        } else if c == ')' || c == ']' || c == '}' || (c == '>' && prev != '-') {
+            depth -= 1;
+        }
+        if c == '(' && depth == 1 && !params && !done && at > fn_at {
+            params = true;
+            pieces.push(cur.to_str());
+            seps.push(sep);
+            cur.clear();
+            sep = "<wbr>";
+        } else if c == ')' && depth == 0 && params {
+            params = false;
+            done = true;
+        } else if c == ',' && depth == 1 && params {
+            pieces.push(cur.to_str());
+            seps.push(sep);
+            cur.clear();
+            sep = " ";
+            skip = true;
+        }
+        prev = c;
+    }
+    if !cur.is_empty() {
+        pieces.push(cur.to_str());
+        seps.push(sep);
+    }
+    let out = StrBuf::new();
+    for k in 0..pieces.len() {
+        out.push_str(seps[k]);
+        out.push_str(f"<span class=\"nw\">{nabi_syntax::highlight_nabi(pieces[k])}</span>");
+    }
+    out.to_str()
+}
+
+/// The page of module `m` among docs whose root page is
+/// `dir/index.html` (`packages/<name>/<version>/docs`): one page per
+/// public module, as `nabi doc` lays them out (web::apidoc::page_of).
+pub fn page(dir: str, m: Module) -> str {
+    let rel: List<str> = List::new();
+    let root = true;
+    for seg in m.path.split("::") {
+        if !root { rel.push(seg); }
+        root = false;
+    }
+    web::apidoc::page_of(dir, rel)
+}
+
+/// The address of output file `out` (`url::canon`).
+fn addr(out: str) -> str { web::url::canon("/" + out) }
+
+fn module_at(mods: List<Module>, path: str) -> Module | none {
+    for m in mods {
+        if m.path == path { return m; }
+    }
+    none
+}
+
+fn item_html(it: Item, link: fn(str) -> str) -> str {
+    let id = web::apidoc::anchor(it);
+    let title = if it.kind == "impl" { "impl " + it.name } else { it.name };
+    let out = StrBuf::new();
+    out.push_str(f"<section class=\"api-item\" id=\"{esc(id)}\"><h3><a href=\"#{esc(id)}\">{esc(title)}</a></h3>");
+    if !it.sig.is_empty() { out.push_str(f"<pre class=\"sig\"><code>{sig_html(it.sig)}</code></pre>"); }
+    out.push_str(md(it.doc, link));
+    if it.members.len() > 0 {
+        out.push_str("<ul class=\"members\">");
+        for mb in it.members {
+            out.push_str(f"<li id=\"{esc(it.name + "." + mb.name)}\"><div class=\"m-h\"><pre><code>{sig_html(mb.sig)}</code></pre></div>{md(mb.doc, link)}</li>");
+        }
+        out.push_str("</ul>");
+    }
+    if it.traits.len() > 0 {
+        out.push_str(f"<details class=\"impls grow\"><summary>{if it.traits.len() == 1 { "1 trait implementation" } else { f"{it.traits.len()} trait implementations" }}</summary><ul>");
+        for t in it.traits { out.push_str(f"<li><code>{nabi_syntax::highlight_nabi(t)}</code></li>"); }
+        out.push_str("</ul></details>");
+    }
+    out.push_str("</section>");
+    out.to_str()
+}
+
+/// A `pub use` line (id `reexport.<names>`) and, for each item or module
+/// of the package it brings in, a link to its page; a re-exported item
+/// also gets the id it would have here (`struct.Event` at the root for
+/// `pub use read::Event`), unless the page has one of its own.
+fn use_html(m: Module, it: Item, mods: List<Module>, dir: str) -> str {
+    let own: Set<str> = Set::new();
+    for x in m.items {
+        if x.kind != "use" { own.insert(web::apidoc::anchor(x)); }
+    }
+    let links: List<str> = List::new();
+    for r in web::apidoc::reexports(m, it, mods) {
+        let q = r.module ?? { continue; };
+        if let x: Item = r.item {
+            let rid = x.kind + "." + r.name;
+            let attr = if own.contains(rid) { "" } else { f" id=\"{esc(rid)}\"" };
+            own.insert(rid);
+            links.push(f"<a{attr} href=\"{esc(addr(page(dir, q)))}#{esc(web::apidoc::anchor(x))}\"><code>{esc(r.name)}</code></a>");
+        } else if r.name != "*" {
+            links.push(f"<a href=\"{esc(addr(page(dir, q)))}\"><code>{esc(r.name)}</code></a>");
+        }
+    }
+    let to = if links.is_empty() { "" } else { f"<span class=\"to\">{links.join(", ")}</span>" };
+    f"<li id=\"{esc(web::apidoc::anchor(it))}\"><code>{nabi_syntax::highlight_nabi(it.sig)}</code>{to}</li>"
+}
+
+/// The page of module `m`: the breadcrumb (web::apidoc::nav) and its
+/// path, its doc, its public child modules, its items by kind. `mods`
+/// are every page of the docs whose root page is `dir/index.html`.
+pub fn body(mods: List<Module>, m: Module, dir: str, link: fn(str) -> str) -> str {
+    let out = StrBuf::new();
+    let root = mods[0].path;
+    let crumb = nav::crumb(nav::kind_of(m, root), nav::trail(mods, m, root, |q: Module| addr(page(dir, q))));
+    // The path in full, to copy; the breadcrumb links up.
+    out.push_str(f"<section class=\"api-mod\">{crumb}<h2 class=\"api-path\"><code>{esc(m.path).replace("::", "::<wbr>")}</code></h2>");
+    out.push_str(md(m.doc, link));
+    let bare = true;
+    let kids = StrBuf::new();
+    for c in m.children {
+        if let q: Module = module_at(mods, m.path + "::" + c) { kids.push_str(f"<li><a href=\"{esc(addr(page(dir, q)))}\"><code>{esc(c)}</code></a> <span>{esc(summary(q.doc))}</span></li>"); }
+    }
+    if !kids.is_empty() {
+        bare = false;
+        out.push_str(f"<h3 class=\"t-label\" id=\"modules\">Modules</h3><ul class=\"uses mods\">{kids.to_str()}</ul>");
+    }
+    for (kind, label) in KINDS {
+        let its: List<Item> = List::new();
+        for it in m.items {
+            if it.kind == kind { its.push(it); }
+        }
+        if its.len() == 0 { continue; }
+        bare = false;
+        out.push_str(f"<h3 class=\"t-label\" id=\"{kind}\">{label}</h3>");
+        if kind == "use" {
+            out.push_str("<ul class=\"uses\">");
+            for it in its { out.push_str(use_html(m, it, mods, dir)); }
+            out.push_str("</ul>");
+            continue;
+        }
+        for it in its { out.push_str(item_html(it, link)); }
+    }
+    if m.impls.len() > 0 {
+        bare = false;
+        out.push_str("<h3 class=\"t-label\" id=\"impl\">Implementations</h3>");
+        for it in m.impls { out.push_str(item_html(it, link)); }
+    }
+    if bare { out.push_str("<p class=\"t-ui muted\">No public items.</p>"); }
+    out.push_str("</section>");
+    out.to_str()
+}
+
+/// The navigation beside the page of `m` (web::apidoc::nav::side): the
+/// package at `version`, named as code spells it, its modules as a tree,
+/// this page's items, and `deps`.
+pub fn side(mods: List<Module>, m: Module, dir: str, version: str, deps: List<nav::Package>) -> str {
+    let href = |q: Module| addr(page(dir, q));
+    let root = mods[0];
+    nav::side(nav::Package { name: root.path, version: version, href: href(root), here: m.path == root.path }, nav::tree(mods, m, root.path, href), nav::items(m, root.path, |_it: Item, id: str| "#" + id, ""), "Dependencies", deps)
+}
+
+/// Number of items the page of `m` lists (re-exports aside).
+pub fn count(m: Module) -> usize {
+    let n = 0usize;
+    for it in m.items {
+        if it.kind != "use" { n += 1; }
+    }
+    n + m.impls.len()
+}
+
+/// Whether `name` is an item declared, or re-exported, at the crate root.
+fn at_root(mods: List<Module>, name: str) -> bool {
+    if mods.is_empty() { return false; }
+    for it in mods[0].items {
+        if it.kind != "use" && it.name == name { return true; }
+        if it.kind == "use" {
+            for n in use_names(it.sig) {
+                if n == name { return true; }
+            }
+        }
+    }
+    false
+}
+
+/// The names a `use` line brings in: `use a::b::{C, d as e};` -> `C`, `e`.
+fn use_names(line: str) -> List<str> {
+    let out: List<str> = List::new();
+    let t = line.trim();
+    t = t.strip_prefix("pub ") ?? t;
+    t = (t.strip_prefix("use ") ?? t).trim_end();
+    t = (t.strip_suffix(";") ?? t).trim();
+    let list = t;
+    if let k: usize = t.find("{") {
+        list = t[k + 1:];
+        list = list.strip_suffix("}") ?? list;
+    } else if let k: usize = t.rfind("::") {
+        list = t[k + 2:];
+    }
+    for part in list.split(",") {
+        let p = part.trim();
+        if let k: usize = p.find(" as ") { p = p[k + 4:].trim(); }
+        if !p.is_empty() && p != "self" && p != "*" { out.push(p); }
+    }
+    out
+}
+
+fn is_type_kind(mods: List<Module>, name: str) -> bool {
+    if mods.is_empty() { return false; }
+    for it in mods[0].items {
+        if it.name == name && (it.kind == "struct" || it.kind == "enum" || it.kind == "trait") { return true; }
+    }
+    // A re-exported name: a type when it is capitalized.
+    at_root(mods, name) && !name.is_empty() && name[:1] != name[:1].to_lowercase()
+}
+
+/// The import line the install box shows, from the package's own code: the
+/// README's first `use <krate>::..;` line when every name in it is at the
+/// crate root (cut to its first type when long), else the first type the
+/// root module's doc names in backticks, else `use <krate>;`. Empty when
+/// there is no API to check against.
+pub fn import_line(krate: str, mods: List<Module>, readme: str) -> str {
+    if mods.is_empty() { return ""; }
+    for raw in readme.lines() {
+        let l = raw.trim();
+        if !l.starts_with("use " + krate + "::") || !l.ends_with(";") { continue; }
+        let names = use_names(l);
+        let ok = names.len() > 0;
+        for n in names {
+            if !at_root(mods, n) { ok = false; }
+        }
+        if !ok { continue; }
+        if l.char_count() <= 36 { return l; }
+        for n in names {
+            if is_type_kind(mods, n) { return f"use {krate}::{n};"; }
+        }
+        return f"use {krate}::{names[0]};";
+    }
+    let doc = mods[0].doc;
+    let parts: List<str> = List::new();
+    for p in doc.split("`") { parts.push(p); }
+    let k = 1usize;
+    while k < parts.len() {
+        if is_type_kind(mods, parts[k]) { return f"use {krate}::{parts[k]};"; }
+        k += 2;
+    }
+    f"use {krate};"
+}
+
+#[test]
+fn signature_pieces() {
+    // The head, each parameter, the return type; `fn(T) -> bool` inside a
+    // parameter stays whole.
+    let h = sig_html("pub fn retain(self, keep: fn(T) -> bool) -> List<T>");
+    assert(h.split("class=\"nw\"").count() == 5, h);
+    assert(h.contains("<wbr><span") && !h.contains("( ") && !h.contains("<span class=\"nw\"> "), h);
+    assert(sig_html("pub struct List<T>").split("class=\"nw\"").count() == 1, "not a fn");
+}
+
+#[test]
+fn imports() {
+    let lib = "//! A thing. `parse` reads into a `Value`.\npub mod read;\nmod conv;\npub use read::{Event, Tokenizer};\n/// A value.\npub enum Value { A, B }\npub fn parse(s: str) -> Value { Value::A }\n";
+    let files: Dict<str, str> = Dict::new();
+    files.insert("src/lib.nabi", lib);
+    files.insert("src/read.nabi", "/// Events.\npub struct Event { pub at: usize; }\npub struct Tokenizer {}\nimpl Tokenizer {\n    pub fn new() -> Tokenizer { Tokenizer {} }\n    fn hidden(self) {}\n}\n");
+    let mods = collect("j", |p| files.get(p));
+    assert(mods.len() == 2 && mods[1].path == "j::read", "modules");
+    assert(mods[1].items.len() == 2 && mods[1].items[1].members.len() == 1, "members");
+    assert(count(mods[0]) == 2 && count(mods[1]) == 2, "count");
+    assert(import_line("j", mods, "") == "use j::Value;", "from the doc");
+    assert(import_line("j", mods, "```nabi\nuse j::{Event, parse};\n```") == "use j::{Event, parse};", "from the readme");
+    assert(import_line("j", mods, "use j::{Nope};\n") == "use j::Value;", "unknown names skipped");
+    assert(import_line("j", mods, "use j::{Event, Tokenizer, parse, Value};\n") == "use j::Event;", "long line cut");
+    assert(import_line("j", List::new(), "") == "", "no api");
+    assert(use_names("pub use a::b::{C, d as e};").len() == 2, "use names");
+    assert(mods[0].items[0].kind == "use" && mods[0].items[0].sig == "pub use read::{Event, Tokenizer}", "brace use");
+    assert(page("d", mods[0]) == "d/index.html" && page("d", mods[1]) == "d/read.html", "pages");
+    assert(body(mods, mods[1], "d", |h| h).contains("id=\"Tokenizer.new\""), "member ids");
+    let root = body(mods, mods[0], "d", |h| h);
+    assert(root.contains("<span class=\"to\"><a id=\"struct.Event\" href=\"/d/read#struct.Event\"><code>Event</code></a>, <a id=\"struct.Tokenizer\" href=\"/d/read#struct.Tokenizer\">"), root);
+    assert(root.contains("id=\"reexport.Event.Tokenizer\"") && root.contains("id=\"modules\"") && root.contains("<a href=\"/d/read\"><code>read</code></a>"), "re-export id, modules");
+    let read = body(mods, mods[1], "d", |h| h);
+    assert(read.contains("<span class=\"api-kind\">Module</span><a href=\"/d\">j</a><span class=\"sep\" aria-hidden=\"true\">\u{203A}</span><a class=\"here\" href=\"/d/read\" aria-current=\"page\">read</a></nav><h2 class=\"api-path\"><code>j::<wbr>read</code></h2>"), read);
+}
+
+#[test]
+fn inline_reexports() {
+    let files: Dict<str, str> = Dict::new();
+    files.insert("src/lib.nabi", "//! Root.\nmod read;\npub mod write;\npub use read::{Event, parse as read_all};\npub use write::Sink;\n");
+    files.insert("src/read.nabi", "/// One event.\npub struct Event { pub at: usize; }\nimpl Event {\n    pub fn len(self) -> usize { 0 }\n}\n/// Parses.\npub fn parse() {}\n");
+    files.insert("src/write.nabi", "pub struct Sink {}\n");
+    let mods = collect("j", |p| files.get(p));
+    assert(mods.len() == 2 && mods[1].path == "j::write", "no section for the private module");
+    let html = body(mods, mods[0], "d", |h| h);
+    assert(html.contains("<section class=\"api-item\" id=\"struct.Event\"><h3><a href=\"#struct.Event\">Event</a></h3>") && html.contains("id=\"Event.len\"") && html.contains("One event.") && !html.contains("<li id=\"Event.at\"><div class=\"m-h\"><pre><code><span class=\"k\">pub</span> at: <span class=\"t\">usize</span></code></pre></div><div"), html);
+    assert(html.contains("id=\"fn.read_all\"") && !html.contains("parse"), "renamed");
+    assert(html.contains("<a id=\"struct.Sink\" href=\"/d/write#struct.Sink\">") && html.contains("<a href=\"/d/write\"><code>write</code></a>"), "a public module's item stays a link");
+    let nv = side(mods, mods[0], "d", "1.0.0", [nav::Package { name: "dep", version: "^0.2", href: "/packages/dep/latest/docs" }]);
+    assert(nv.contains("href=\"#struct.Event\"") && nv.contains("href=\"#fn.read_all\"") && nv.contains("<h2 class=\"t-label\">Modules</h2><ul class=\"api-tree\"><li><a href=\"/d/write\">write</a></li></ul>") && nv.contains("<p class=\"api-pkg\"><a href=\"/d\" aria-current=\"page\"><span>j</span><small>1.0.0</small></a></p>") && nv.contains("<a href=\"/packages/dep/latest/docs\">dep<small>^0.2</small></a>"), nv);
+    assert(count(mods[0]) == 2 && count(mods[1]) == 1 && import_line("j", mods, "") == "use j;", f"{count(mods[0])}");
+}

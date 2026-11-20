@@ -1,0 +1,14 @@
+Package {
+    name: "signal",
+    version: "0.1.0",
+    nabi_version: "0.1.0",
+    toolchain: "0.1",
+    description: "Signal processing: FFT of any length, convolution, windows, FIR / IIR filter design and filtering, spectral estimation, peaks",
+    license: "MIT OR Apache-2.0",
+    repository: "https://github.com/nabi-lang/signal",
+    keywords: ["signal", "fft", "dsp", "filter", "spectrum"],
+    categories: ["science", "mathematics"],
+    deps: {
+        "linalg": Dep::path("../linalg", version: "^0.1"),
+    },
+}

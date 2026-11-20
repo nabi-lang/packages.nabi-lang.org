@@ -1,0 +1,1 @@
+Package { name: "nabi-syntax", version: "0.1.0", deps: [], source: Dep::git("https://github.com/nabi-lang/nabi-syntax", rev: "f3d5ea61ce2f7b95d5276dc0b02965dff7158ce6"), tree: "0e497b9675e9643eb3a15ab78d5814e7a3226463", yanked: false, nabi_version: "0.1.0", official: true }
