@@ -2,7 +2,6 @@
 // package list, publishing guide, one page per package plus its tab pages.
 
 use pkg::Site;
-use pkg::apidoc;
 use pkg::docs::Status;
 use pkg::meta;
 use pkg::packages;
@@ -30,24 +29,14 @@ pub fn tab_out(name: str, tab: str) -> str { f"packages/{name}/{tab}.html" }
 /// A version's page.
 pub fn ver_out(name: str, v: str) -> str { f"packages/{name}/{v}.html" }
 
-/// The docs of version `v` (docs.nabi), or of the latest one for
-/// `latest`: the root module's page, `/docs/<name>/<v>`, a stable
-/// address. The other public modules' pages are beside it
-/// (apidoc::page): `/docs/<name>/<v>/read` for `read`. The docs live
-/// under a prefix of their own, apart from the package pages, so that
-/// no package or module name meets a route of the site.
-pub fn docs_out(name: str, v: str) -> str { docs_dir(name, v) + "/index.html" }
-
-/// The directory of version `v`'s docs pages.
-pub fn docs_dir(name: str, v: str) -> str { f"docs/{name}/{v}" }
+/// The docs of version `v` of package `name` (`latest`: its newest), on
+/// the docs site, which renders them from what the registry made of that
+/// version (GET /api/v1/packages/<name>/<v>/docs), as docs.rs does for
+/// crates.io.
+pub fn docs_url(site: Site, name: str, v: str) -> str { f"{site.docs}/packages/{name}/{v}" }
 
 /// The readme page of `s`: the package's own, or the version's it shows.
 fn readme_out(s: Package) -> str { if s.at.is_empty() { package_out(s.name) } else { ver_out(s.name, s.at) } }
-
-fn api_out(s: Package) -> str { docs_out(s.name, api_at(s)) }
-
-/// The version part of the docs pages of `s`: `latest` on the package's own.
-pub fn api_at(s: Package) -> str { if s.at.is_empty() { "latest" } else { s.at } }
 
 /// `/name?v=<content version>` of a stylesheet or script (main.nabi
 /// load_site); `serve` caches it for good at that version.
@@ -637,7 +626,7 @@ fn commit_link(v: Version) -> str {
     if tree.is_empty() { f"<code title=\"{esc(v.rev)}\">{short(v.rev)}</code>" } else { f"<a href=\"{esc(tree)}\" title=\"{esc(v.rev)}\"><code>{short(v.rev)}</code></a>" }
 }
 
-fn package_head(s: Package, tab: str) -> str {
+fn package_head(site: Site, s: Package, tab: str) -> str {
     let l = s.latest;
     // One plain line for narrow screens, where the side panel comes last.
     let sum: List<str> = List::new();
@@ -669,7 +658,7 @@ fn package_head(s: Package, tab: str) -> str {
     };
     tabs.push_str(t("readme", "Readme", url(readme_out(s)), ""));
     // An executable alone has no API: no Docs tab, as on crates.io.
-    if s.has_lib { tabs.push_str(t("docs", "Docs", url(api_out(s)), "")); }
+    if s.has_lib { tabs.push_str(f"<a href=\"{esc(docs_url(site, s.name, if s.at.is_empty() { "latest" } else { s.at }))}\">Docs <span aria-hidden=\"true\">↗</span></a>"); }
     tabs.push_str(t("versions", "Versions", url(tab_out(s.name, "versions")), f"{s.versions.len()}"));
     // A version page lists its dependencies in the side panel; these two
     // tabs are the latest version's.
@@ -954,7 +943,7 @@ fn dates_note(s: Package) -> str {
 }
 
 fn package_frame(site: Site, s: Package, tab: str, main: str) -> str {
-    f"{package_head(s, tab)}<div class=\"frame package-body\">
+    f"{package_head(site, s, tab)}<div class=\"frame package-body\">
 <div class=\"main\">
 {main}</div>
 {side(site, s)}</div>
@@ -1005,66 +994,11 @@ pub fn package_page(site: Site, s: Package) -> str {
     package_frame(site, s, "readme", readme)
 }
 
-/// When and from what the docs of `s` were made, for the Docs tab.
-fn docs_note(s: Package) -> str {
-    let l = s.latest;
-    let when = if let st: Status = s.docs { if st.at > 0i64 { f" when it was published ({when_tag(packages::utc_minute(st.at), "", false)})" } else { "" } } else { "" };
-    f"<p class=\"t-ui muted\">The public items of {esc(s.name)} {esc(l.version)} and their doc comments, read from its source at {commit_link(l)}{when}. Signatures are shown as written; an item re-exported from a private module is shown where it is re-exported.</p>"
-}
-
-/// The Docs tab (`/docs/<name>/<version>`, `/docs/<name>/latest`):
-/// the page of public module `m` of the version (the root's when none),
-/// as made when it was published (docs.nabi), with the docs' navigation
-/// (apidoc::side) in place of the side panel's details; else why there
-/// are none. `have` are the packages in the index: a dependency among
-/// them links to its docs.
-pub fn api_page(site: Site, s: Package, have: Set<str>, m: web::apidoc::Module | none = none) -> str {
-    let l = s.latest;
-    if s.api.is_empty() {
-        let body = if s.api_none == "failed" {
-            let why = if let st: Status = s.docs { st.message } else { "" };
-            f"<p class=\"callout help docs-failed\"><span class=\"lab\">docs failed</span><span>The docs of {esc(s.name)} {esc(l.version)} could not be made: {esc(why)}. The version is published and installs as usual; only this page is missing.</span></p>\n"
-        } else {
-            let why = if s.api_none == "lib" { "this package has no <code class=\"ic\">src/lib.nabi</code>." } else { "its source could not be read when the site was built. It is tried again on the next build." };
-            f"<p class=\"empty\">No docs: {why}</p>\n"
-        };
-        return package_frame(site, s, "docs", body);
-    }
-    let link = |h: str| packages::repo_link(l.url, l.rev, h);
-    let page = m ?? s.api[0];
-    let dir = docs_dir(s.name, api_at(s));
-    let deps: List<web::apidoc::nav::Package> = List::new();
-    for d in l.deps {
-        if d.kind != "normal" { continue; }
-        let dn = packages::real(d);
-        let href = if d.registry.is_empty() && have.contains(dn) { url(docs_out(dn, "latest")) } else { "" };
-        deps.push(web::apidoc::nav::Package { name: d.name, version: d.req, href: href });
-    }
-    let nav = apidoc::side(s.api, page, dir, l.version, deps);
-    let n = apidoc::count(page);
-    // Narrow screens: the side panel is hidden, the navigation folds
-    // under the note.
-    let main = f"{docs_note(s)}
-<details class=\"syms-m grow\"><summary>Contents <span class=\"ct\">{n}</span></summary><nav class=\"syms\" aria-label=\"Contents\">{nav}</nav></details>
-<div class=\"api\">{apidoc::body(s.api, page, dir, link)}</div>
-";
-    let side = f"<aside class=\"meta api-side\" aria-label=\"Docs\">
-<section class=\"inst-side\"><h2 class=\"t-label\">Install</h2>{install_box(s, "i")}</section>
-<nav class=\"syms syms-w\" aria-label=\"Contents\">{nav}</nav>
-</aside>
-";
-    f"{package_head(s, "docs")}<div class=\"frame package-body\">
-<div class=\"main\">
-{main}</div>
-{side}</div>
-"
-}
-
 /// The Versions table's Docs cell of version `v`.
-fn docs_cell(s: Package, v: str) -> str {
+fn docs_cell(site: Site, s: Package, v: str) -> str {
     for x in s.views {
         if x.at != v { continue; }
-        let href = esc(url(docs_out(s.name, v)));
+        let href = esc(docs_url(site, s.name, v));
         if x.api_none == "" { return f"<a href=\"{href}\">docs</a>"; }
         if x.api_none == "failed" {
             let why = if let st: Status = x.docs { st.message } else { "" };
@@ -1095,7 +1029,7 @@ pub fn versions_page(site: Site, s: Package) -> str {
         } else { none_yet };
         let sz = if let n: i64 = v.meta.size { size(n) } else { "<span class=\"muted\">unknown</span>" };
         let tc = if v.nabi_version.is_empty() { "<span class=\"muted\">any</span>" } else { esc(packages::admits(v.nabi_version)) };
-        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{if v.license.is_empty() { "<span class=\"muted\">none</span>" } else { esc(v.license) }}</td><td>{sz}</td><td>{tc}</td><td>{docs_cell(s, v.version)}</td><td class=\"mono\">{commit_link(v)}</td><td class=\"mono\"><code title=\"{esc(v.tree)}\">{short(v.tree)}</code></td></tr>");
+        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{if v.license.is_empty() { "<span class=\"muted\">none</span>" } else { esc(v.license) }}</td><td>{sz}</td><td>{tc}</td><td>{docs_cell(site, s, v.version)}</td><td class=\"mono\">{commit_link(v)}</td><td class=\"mono\"><code title=\"{esc(v.tree)}\">{short(v.tree)}</code></td></tr>");
     }
     let body = f"<h2 class=\"t-h3\">{plural(s.versions.len(), "version", "versions")}</h2>
 <p class=\"t-ui muted\">Newest first. Published is when the version's line was added to the index (UTC); size is the package as <code class=\"ic\">nabi publish</code> packed it. A yanked version stays in the index for the projects that pinned it; new resolves skip it.</p>

@@ -89,30 +89,6 @@ fn missing_package(site: Site, p: str, rest: str, query: str) -> Resp | none {
     none
 }
 
-/// Where an old or short docs address lives now: the docs moved from
-/// `/packages/<name>/<v>/docs/..` to `/docs/<name>/<v>/..`; `/docs/<name>`
-/// is its latest docs; the standard library's tiers `std`, `core` and
-/// `bare` ship with the toolchain, so their docs are on the docs site.
-pub fn docs_moved(site: Site, p: str) -> str | none {
-    if let rest: str = p.strip_prefix("/packages/") {
-        let (name, r1) = rest.split_once("/") ?? (return none);
-        let (ver, r2) = r1.split_once("/") ?? (return none);
-        if r2 == "docs" { return f"/docs/{name}/{ver}"; }
-        if let tail: str = r2.strip_prefix("docs/") { return f"/docs/{name}/{ver}/{tail}"; }
-        return none;
-    }
-    let rest = p.strip_prefix("/docs/") ?? (return none);
-    let (name, more) = rest.split_once("/") ?? (rest, "");
-    if name == "std" || name == "core" || name == "bare" {
-        // `/docs/core/<version>/<module>`: the docs site has the tier's
-        // modules beside its root.
-        let tail = if let i: usize = more.find("/") { more[i:] } else { "" };
-        return f"{site.docs}/latest/std/{name}{tail}";
-    }
-    if more.is_empty() && !name.is_empty() { return f"/docs/{name}/latest"; }
-    none
-}
-
 pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     let p = r.path;
     if p == "/api/health" && (r.method == "GET" || r.method == "HEAD") { return health(site); }
@@ -147,9 +123,6 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     }
     if let c: str = url::canonical(p) {
         return Resp { status: 301, headers: [url::moved(c, r.query), "Cache-Control: public, max-age=3600"], body: "", file: "" };
-    }
-    if let to: str = docs_moved(site, p) {
-        return Resp { status: 301, headers: [url::moved(to, r.query), "Cache-Control: public, max-age=3600"], body: "", file: "" };
     }
     // A search or another order: the list page, filtered and sorted here
     // (it works without JS). The bare list is a file.
@@ -219,16 +192,4 @@ fn health_answers() {
     try fs::remove_dir_all(out) catch _ {};
     assert(ok.status == 200 && ok.body == "ok\nnabi 9.9.9\npackages 0\n", ok.body);
     assert(no.status == 503 && no.body.starts_with("failing\n"), no.body);
-}
-
-#[test]
-fn docs_addresses_move() {
-    let site = Site { title: "", tagline: "", index_repo: "", out: "", docs: "https://docs.example" };
-    let to = |p: str| docs_moved(site, p) ?? "-";
-    assert(to("/packages/json/0.2.0/docs") == "/docs/json/0.2.0", to("/packages/json/0.2.0/docs"));
-    assert(to("/packages/json/latest/docs/read") == "/docs/json/latest/read", "a module page");
-    assert(to("/packages/json/0.2.0") == "-" && to("/packages/json/versions") == "-", "package pages stay");
-    assert(to("/docs/json") == "/docs/json/latest", "bare name");
-    assert(to("/docs/json/0.2.0") == "-" && to("/docs/json/latest/read") == "-", "docs pages are files");
-    assert(to("/docs/std") == "https://docs.example/latest/std/std" && to("/docs/core/latest/option") == "https://docs.example/latest/std/core/option", "the std tiers");
 }

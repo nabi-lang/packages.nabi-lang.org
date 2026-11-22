@@ -211,39 +211,6 @@ html:not(.js) .ipanel+.ipanel{border-top:1px solid var(--line)}
 .tbl code{font-size:13px}
 .tbl tr:hover td{background:none}
 
-/* API tab: modules, items, members (nabi.css), the Symbols list */
-.api{display:flex;flex-direction:column;gap:40px;min-width:0}
-.api-mod{display:flex;flex-direction:column;gap:12px;min-width:0}
-.api-mod>.md,.api-item>.md{max-width:760px}
-.api-path{font-size:20px;line-height:28px;letter-spacing:-0.01em;font-weight:500;padding-bottom:8px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
-.api-path code{font-weight:500}
-.api-mod>.t-label{margin-top:12px;color:var(--ink-2)}
-.api-item{min-width:0;scroll-margin-top:16px}
-.api-mod>.t-label+.api-item{border-top:0;padding-top:0}
-.api-item h3{overflow-wrap:anywhere}
-pre.sig,.uses code{font-size:14px;line-height:22px}
-/* signatures sit in a code box here */
-pre.sig{padding:10px 14px;background:var(--code);border:1px solid var(--line);border-radius:var(--r);overflow-wrap:anywhere;overflow-x:auto}
-.members>li{scroll-margin-top:16px}
-.members .md{margin-top:6px;color:var(--ink-2)}
-.api-item:target>h3{background:var(--acc-bg)}
-.uses{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
-.uses li{display:flex;flex-wrap:wrap;gap:0 12px}
-.uses .to{color:var(--ink-3)}
-.uses .to a{scroll-margin-top:16px}
-.api .a{color:var(--n)}
-.api-side{position:sticky;top:0;max-height:100vh;overflow-y:auto;box-sizing:border-box;align-self:start}
-/* the docs' navigation (web::apidoc::nav, styled in nabi.css); its
-   links' padding hangs into the panel's margin */
-.syms{min-width:0}
-.syms .api-nav{margin:0 -8px}
-.uses.mods span{color:var(--ink-3)}
-.t-label .ct,.syms-m .ct{font-family:var(--mono);font-weight:400;color:var(--ink-3);font-size:12px;margin-left:4px}
-.syms-m{display:none;border:1px solid var(--line);border-radius:var(--r);padding:0 12px}
-.syms-m summary{cursor:pointer;padding:10px 0;font-size:14px;line-height:20px;font-weight:500}
-.syms-m .syms{padding:0 10px 8px}
-.api-mod>.api-crumb{margin-bottom:-4px}
-
 /* markdown: readmes and the guide */
 .md{display:flex;flex-direction:column;gap:16px;max-width:760px;min-width:0}
 .md>*{margin:0}
@@ -319,8 +286,6 @@ pre.sig{padding:10px 14px;background:var(--code);border:1px solid var(--line);bo
   .inst-head{display:block;max-width:560px}
   .inst-side{display:none!important}
   .package-head .sum{display:block}
-  .api-side{display:none}
-  .syms-m{display:block}
 }
 @media (max-width:720px){
   .frame{padding-left:16px;padding-right:16px}

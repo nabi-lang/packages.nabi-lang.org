@@ -143,22 +143,6 @@ fn og_inputs(tpl: str) throws -> Digest {
     d
 }
 
-/// The docs pages of `s` (the package's latest, or the version it shows):
-/// the root module's at `layout::docs_out`, each other public module's
-/// at `apidoc::page` beside it.
-fn api_pages(site: Site, s: Package, have: Set<str>, about: str, og: str, alt: str, files: Dict<str, str>) {
-    let at = layout::api_at(s);
-    let of = if s.at.is_empty() { s.name } else { f"{s.name} {s.at}" };
-    let root = layout::docs_out(s.name, at);
-    files.insert(root, layout::page_desc(site, root, f"Docs of {of}", about, layout::api_page(site, s, have), og, alt));
-    let dir = layout::docs_dir(s.name, at);
-    for k in 1..s.api.len() {
-        let m = s.api[k];
-        let out = apidoc::page(dir, m);
-        files.insert(out, layout::page_desc(site, out, f"{m.path}: docs of {of}", about, layout::api_page(site, s, have, m), og, alt));
-    }
-}
-
 /// Whether the live site has `card` drawn at version `v`: its `.v` matches.
 fn drawn(site: Site, card: str, v: str) -> bool {
     let f = site.out + "/" + card;
@@ -362,7 +346,6 @@ fn main() throws {
             (site.base_url + "/og/" + s.name + ".png?v=" + og_v[s.name], f"{s.name} {s.latest.version}: {about}")
         } else { ("", "") };
         files.insert(out, layout::page_desc(site, out, s.name, about, layout::package_page(site, s), og, alt));
-        if s.has_lib { api_pages(site, s, have, about, og, alt, files); }
         let vo = layout::tab_out(s.name, "versions");
         files.insert(vo, layout::page_desc(site, vo, f"Versions of {s.name}", about, layout::versions_page(site, s), og, alt));
         let dpo = layout::tab_out(s.name, "dependencies");
@@ -373,7 +356,6 @@ fn main() throws {
             let vabout = if v.desc.is_empty() { f"{s.name} {v.at}, a Nabi package" } else { v.desc };
             let po = layout::ver_out(s.name, v.at);
             files.insert(po, layout::page_desc(site, po, f"{s.name} {v.at}", vabout, layout::package_page(site, v), og, alt));
-            if v.has_lib { api_pages(site, v, have, vabout, og, alt, files); }
         }
     }
 
