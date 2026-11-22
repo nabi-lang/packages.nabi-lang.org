@@ -1,6 +1,6 @@
 ## Overview
 
-The registry answers a few public reads at `https://packages.nabi-lang.org/api/v1/`: a package's versions and who published them, a version's README, source archive and docs, and every package's docs state. They need no token. Writes (`nabi publish`, `nabi yank`, owners, trusted publishers) take a token and are made with `nabi`; they are not described here.
+The registry answers a few public reads at `https://packages.nabi-lang.org/api/v1/`: a package's versions and who published them, a version's README, source archive and docs, every package's docs state, and the security advisories. They need no token. Writes (`nabi publish`, `nabi yank`, owners, trusted publishers) take a token and are made with `nabi`; they are not described here.
 
 ```sh
 curl https://packages.nabi-lang.org/api/v1/packages/json
@@ -72,6 +72,31 @@ The docs the registry made of that version when it was published: `PackageDocs {
 
 Every package (taken-down ones left out), as a list of `{ name, description, deps, official, versions }`: `deps` names the latest version's normal dependencies, and each version is `{ version, yanked, repository, rev, docs }`, `docs` being its docs' `state`, or `""` when none were made.
 
+## Advisories
+
+`GET /api/v1/advisories`
+
+Every published [security advisory](/advisories), newest first, withdrawn ones included (with `withdrawn` set). In JSON each is an [OSV](https://ossf.github.io/osv-schema/) record, schema 1.6.0, in `{"advisories": [..]}`; in NABION, `Advisories { advisories: [Advisory { .. }] }`, where OSV's `type` is `kind`. `?package=<name>` keeps those that name the package.
+
+```sh
+curl 'https://packages.nabi-lang.org/api/v1/advisories?format=json'
+```
+
+`GET /api/v1/advisories/<id>` is one (`NABI-2026-0001`), `GET /api/v1/packages/<name>/advisories` those of a package. A record:
+
+| Field | Meaning |
+|-------|---------|
+| `id` | `NABI-<year>-<number>` |
+| `aliases` | The same vulnerability elsewhere: `CVE-..`, `GHSA-..` |
+| `summary`, `details` | One line; Markdown |
+| `affected` | Each `{ package: { ecosystem: "Nabi", name }, ranges, versions }`; a range is `{ type: "SEMVER", events }`, each event one of `introduced` (`"0"`: from the first version), `fixed`, `last_affected`, `limit` |
+| `severity` | `{ type: "CVSS_V3", score: "CVSS:3.1/.." }` (or `CVSS_V4`); may be empty |
+| `references` | `{ type, url }`; the first is the advisory's page here |
+| `credits` | `{ name, contact, type }` |
+| `published`, `modified`, `withdrawn` | RFC 3339 times, UTC; `withdrawn` only on a withdrawn one |
+
+A version is affected when a range covers it (evaluated as OSV says: from each `introduced` up to the next `fixed`, through a `last_affected`) or `versions` lists it, and the advisory is not withdrawn. Package and version pages show the advisories that affect them.
+
 ## Badges
 
 `GET /packages/<name>/badge.svg`
@@ -84,7 +109,7 @@ An SVG badge of the latest version for a README, with its Markdown on the packag
 
 ## Caching
 
-An answer that may be cached (READMEs a minute, docs an hour, archives a day) carries an `ETag`; send it back in `If-None-Match` for a `304` with no body. Package info and the docs list are never cached (`no-store`).
+An answer that may be cached (READMEs a minute, docs an hour, archives a day) carries an `ETag`; send it back in `If-None-Match` for a `304` with no body. Package info, the docs list and advisories are never cached (`no-store`).
 
 ## Rate limits
 
@@ -97,7 +122,7 @@ An error is a status and `Error { message: ".." }` (`{"message": ".."}` in JSON)
 | Status | When |
 |--------|------|
 | 400 | A bad `format` |
-| 404 | No such package, version, README, archive or docs, or no such route |
+| 404 | No such package, version, README, archive, docs or advisory, or no such route |
 | 405 | A method other than `GET` or `HEAD` |
 | 429 | Over the rate limit; wait `Retry-After` seconds |
 | 451 | The registry took the package or version down; `message` says why |

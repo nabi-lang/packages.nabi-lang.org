@@ -1,0 +1,342 @@
+// Security advisories through the API; osv.nabi has the record.
+//
+//   GET  /api/v1/advisories                  the public ones; ?package=<name>;
+//                                            ?state=draft with a token: its drafts
+//   GET  /api/v1/advisories/<id>             one; a draft to the owners of its
+//                                            packages and the admins
+//   GET  /api/v1/packages/<name>/advisories  the public ones on a package (api.nabi)
+//   POST /api/v1/advisories                  an admin's is published, an owner's a draft
+//   PUT  /api/v1/advisories/<id>             edit: admins any, owners their drafts
+//   POST /api/v1/advisories/<id>/publish     admins: publish a draft
+//   POST /api/v1/advisories/<id>/withdraw    admins: Withdraw { reason }
+//
+// Reads answer NABION, or OSV JSON when asked (api::wants_json). A body
+// is OSV JSON or `Advisory { .. }`; the server keeps the id, the times
+// and the state.
+
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::json;
+use pkg::osv;
+use pkg::osv::Advisory;
+use pkg::packages;
+use pkg::server::admin::{Audit, audit};
+use pkg::server::api::{Auth, authenticate, need, wants_json};
+use pkg::server::limit;
+use pkg::server::mail;
+use pkg::server::store::{Db, Event, SCOPE_ADMIN, SCOPE_OWNERS, load_db, now_secs, owners_of, record, save_db};
+use pkg::server::{Cfg, Resp, is_admin, LOCK, nabion_resp, STALE};
+use std::nabion;
+use std::nabion::Value;
+use web::http;
+use web::http::Request;
+
+const WHY_MAX: usize = 512;
+
+fn data(cfg: Cfg) throws (ApiError) -> Db { try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); } }
+
+fn save(cfg: Cfg, db: Db) throws (ApiError) { try save_db(cfg, db) catch e { throw index::err(500, f"data: {e}"); }; }
+
+fn json_resp(body: str) -> Resp {
+    Resp { status: 200, headers: ["Content-Type: application/json", "Cache-Control: no-store"], body: body + "\n", file: "" }
+}
+
+fn nabion_list(xs: List<Advisory>) -> Resp {
+    let vs: List<Value> = List::new();
+    for a in xs { vs.push(nabion::to_value(a)); }
+    nabion_resp(200, "Advisories", [("advisories", Value::List(vs))])
+}
+
+fn one(a: Advisory) -> Resp {
+    Resp { status: 200, headers: ["Content-Type: application/nabion; charset=utf-8", "Cache-Control: no-store"], body: (try! nabion::to_str_flat(a)) + "\n", file: "" }
+}
+
+fn answer(cfg: Cfg, xs: List<Advisory>, json: bool) -> Resp {
+    if json { json_resp(osv::list_json(xs, cfg.url)) } else { nabion_list(xs) }
+}
+
+/// The public advisories of `db` naming `name` ("" for all), newest
+/// first.
+fn public_of(db: Db, name: str) -> List<Advisory> {
+    let out: List<Advisory> = List::new();
+    let k = index::key(name);
+    for a in db.advisories {
+        if osv::public(a) && (name.is_empty() || osv::packages_of(a).contains(k)) { out.push(a); }
+    }
+    out.sort_by(|a: Advisory, b: Advisory| b.published.cmp(a.published));
+    out
+}
+
+/// `GET /api/v1/packages/<name>/advisories`.
+pub fn of_package(cfg: Cfg, db: Db, name: str, json: bool) throws (ApiError) -> Resp {
+    if !packages::is_name(name) { throw index::err(404, f"`{name}` is not a package name"); }
+    answer(cfg, public_of(db, name), json)
+}
+
+/// Whether `auth` may see and edit draft `a`: an admin, or an owner of
+/// every package it names.
+fn owns_all(db: Db, a: Advisory, id: i64) -> bool {
+    if id <= 0i64 { return false; }
+    for k in osv::packages_of(a) {
+        if !(owners_of(db, k) ?? List::new()).contains(id) { return false; }
+    }
+    true
+}
+
+fn find(db: Db, id: str) -> usize | none {
+    for i in 0..db.advisories.len() {
+        if db.advisories[i].id == id { return i; }
+    }
+    none
+}
+
+fn not_found(id: str) -> ApiError { index::err(404, f"no advisory `{id}`; the list is at /api/v1/advisories") }
+
+/// The advisory a body describes, the server's fields cleared.
+fn body_of(body: str) throws (ApiError) -> Advisory {
+    let a: Advisory = if body.trim().starts_with("{") { try osv::from_json(body) } else {
+        try nabion::from_str(body) catch e { throw index::err(400, f"the body is an OSV advisory in JSON, or `Advisory {{ summary: \"..\", details: \"..\", affected: [..] }}`: {e}"); }
+    };
+    a.id = "";
+    a.published = "";
+    a.modified = "";
+    a.withdrawn = "";
+    a.state = osv::DRAFT;
+    a.drafted_by = 0i64;
+    a.published_by = 0i64;
+    a.withdrawn_by = 0i64;
+    a.withdrawn_reason = "";
+    a.summary = a.summary.trim();
+    a
+}
+
+/// Checked, and every package it names in the index.
+fn checked(cfg: Cfg, a: Advisory) throws (ApiError) {
+    try osv::check(a);
+    for n in osv::names_of(a) {
+        if !(try index::exists(cfg.index, false, n)) { throw index::err(404, f"`{n}` is not in the index; an advisory names packages of this registry"); }
+    }
+}
+
+/// A token's account, which may write advisories: an admin's with the
+/// admin scope, or an owner's with the owners scope.
+fn writer(cfg: Cfg, db: Db, r: Request, client: str) throws (ApiError) -> Auth {
+    try limit::check("ip:" + client, 2i64 * cfg.rate);
+    let auth = try authenticate(cfg, db, r);
+    try limit::check(auth.key, cfg.rate);
+    if auth.scope is List<str> { throw index::err(403, "advisories are written with an account's token, not a trusted publishing one"); }
+    if !auth.admin { try need(cfg, auth, SCOPE_OWNERS); }
+    auth
+}
+
+fn admin_only(cfg: Cfg, auth: Auth, what: str) throws (ApiError) {
+    if auth.admin { return; }
+    if is_admin(cfg, auth.account.id) { throw index::err(403, f"{what} takes a token with the `{SCOPE_ADMIN}` scope and no package limit; create one on your account page ({cfg.url}/me)"); }
+    throw index::err(403, f"only the registry admins {what}; an owner drafts the advisory (POST /api/v1/advisories) and an admin publishes it");
+}
+
+fn mine(db: Db, auth: Auth, a: Advisory) throws (ApiError) {
+    if auth.admin || owns_all(db, a, auth.account.id) { return; }
+    let names = osv::names_of(a).join(", ");
+    throw index::err(403, f"only the owners of {names} and the admins write advisories on it; ask an owner, or write to security@nabi-lang.org");
+}
+
+fn note(ref db: Db, auth: Auth, a: Advisory, action: str) {
+    let now = now_secs();
+    for k in osv::packages_of(a) { record(ref db, Event { package: k, at: now, by: auth.account.id, who: auth.login, action: action, detail: a.id }); }
+}
+
+/// Mail the owners of each package `a` names, and who drafted it.
+fn tell(cfg: Cfg, a: Advisory) {
+    let also: List<i64> = if a.drafted_by > 0i64 { [a.drafted_by] } else { List::new() };
+    for x in a.affected {
+        let fixes = osv::fixed_in(x);
+        let fix = if fixes.is_empty() { "no fixed version yet" } else { "fixed in " + fixes.join(", ") };
+        let what = f"Security advisory {a.id} is published for {x.package.name}: {a.summary}\nAffected versions: {osv::ranges_text(x)}; {fix}.\n{cfg.url}{osv::href(a.id)}";
+        mail::notify(cfg, "advisory", index::key(x.package.name), x.package.name, f"Security advisory {a.id} on {x.package.name}", what, also);
+    }
+}
+
+fn create(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
+    let auth = try writer(cfg, try data(cfg), r, client);
+    let a = try body_of(r.body);
+    try checked(cfg, a);
+    let now = now_secs();
+    let out = a;
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        try mine(db, auth, a);
+        a.id = osv::next_id(db.advisories, now);
+        a.modified = osv::rfc3339(now);
+        a.drafted_by = auth.account.id;
+        if auth.admin {
+            a.state = osv::PUBLISHED;
+            a.published = a.modified;
+            a.published_by = auth.account.id;
+        }
+        db.advisories.push(a);
+        note(ref db, auth, a, if auth.admin { "advisory-publish" } else { "advisory-draft" });
+        try save(cfg, db);
+        out = a;
+    }
+    audit(cfg, Audit { at: now, by: auth.account.id, action: if auth.admin { "advisory-publish" } else { "advisory-draft" }, target: out.id });
+    if osv::live(out) {
+        STALE.store(1);
+        tell(cfg, out);
+    }
+    let resp = one(out);
+    resp.status = 201;
+    resp.headers.push(f"Location: /api/v1/advisories/{out.id}");
+    resp
+}
+
+fn edit(cfg: Cfg, r: Request, client: str, id: str) throws (ApiError) -> Resp {
+    let auth = try writer(cfg, try data(cfg), r, client);
+    let a = try body_of(r.body);
+    try checked(cfg, a);
+    let now = now_secs();
+    let out = a;
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        let i = find(db, id) ?? { throw not_found(id); };
+        let old = db.advisories[i];
+        try mine(db, auth, old);
+        try mine(db, auth, a);
+        if !auth.admin && old.state != osv::DRAFT { throw index::err(403, f"{id} is {old.state}: only the admins change it now; write to security@nabi-lang.org"); }
+        a.id = old.id;
+        a.state = old.state;
+        a.published = old.published;
+        a.withdrawn = old.withdrawn;
+        a.drafted_by = old.drafted_by;
+        a.published_by = old.published_by;
+        a.withdrawn_by = old.withdrawn_by;
+        a.withdrawn_reason = old.withdrawn_reason;
+        a.modified = osv::rfc3339(now);
+        db.advisories[i] = a;
+        note(ref db, auth, a, "advisory-edit");
+        try save(cfg, db);
+        out = a;
+    }
+    audit(cfg, Audit { at: now, by: auth.account.id, action: "advisory-edit", target: id });
+    if osv::public(out) { STALE.store(1); }
+    one(out)
+}
+
+fn publish(cfg: Cfg, r: Request, client: str, id: str) throws (ApiError) -> Resp {
+    let auth = try writer(cfg, try data(cfg), r, client);
+    try admin_only(cfg, auth, "publish advisories");
+    let now = now_secs();
+    let out = Advisory {};
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        let i = find(db, id) ?? { throw not_found(id); };
+        let a = db.advisories[i];
+        if a.state != osv::DRAFT { throw index::err(409, f"{id} is {a.state} already"); }
+        a.state = osv::PUBLISHED;
+        a.published = osv::rfc3339(now);
+        a.modified = a.published;
+        a.published_by = auth.account.id;
+        db.advisories[i] = a;
+        note(ref db, auth, a, "advisory-publish");
+        try save(cfg, db);
+        out = a;
+    }
+    audit(cfg, Audit { at: now, by: auth.account.id, action: "advisory-publish", target: id });
+    STALE.store(1);
+    tell(cfg, out);
+    one(out)
+}
+
+fn withdraw(cfg: Cfg, r: Request, client: str, id: str) throws (ApiError) -> Resp {
+    let auth = try writer(cfg, try data(cfg), r, client);
+    try admin_only(cfg, auth, "withdraw advisories");
+    let want = index::err(400, f"the body is `Withdraw {{ reason: \"..\" }}` or `{{\"reason\": \"..\"}}`: why it no longer applies, 1 to {WHY_MAX} bytes");
+    let why = if r.body.trim().starts_with("{") { json::fields(r.body).get("reason") ?? "" } else {
+        let v = try nabion::parse(r.body) catch _ { throw want; };
+        let got = "";
+        if let Value::Struct { name: _, fields } = v {
+            if let Value::Str(t) = fields.get("reason") ?? Value::None { got = t; }
+        }
+        got
+    };
+    why = why.trim();
+    if why.is_empty() || why.len() > WHY_MAX { throw want; }
+    let now = now_secs();
+    let out = Advisory {};
+    using g = LOCK.lock() {
+        let db = try data(cfg);
+        let i = find(db, id) ?? { throw not_found(id); };
+        let a = db.advisories[i];
+        if a.state == osv::WITHDRAWN { throw index::err(409, f"{id} is withdrawn already"); }
+        if a.state == osv::DRAFT { throw index::err(409, f"{id} is a draft, which nobody sees but its owners and the admins: edit it (PUT) or leave it unpublished"); }
+        a.state = osv::WITHDRAWN;
+        a.withdrawn = osv::rfc3339(now);
+        a.modified = a.withdrawn;
+        a.withdrawn_by = auth.account.id;
+        a.withdrawn_reason = why;
+        db.advisories[i] = a;
+        note(ref db, auth, a, "advisory-withdraw");
+        try save(cfg, db);
+        out = a;
+    }
+    audit(cfg, Audit { at: now, by: auth.account.id, action: "advisory-withdraw", target: id, reason: why });
+    STALE.store(1);
+    one(out)
+}
+
+/// The `/api/v1/advisories..` routes.
+pub fn route(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
+    let rest = (r.path.strip_prefix("/api/v1/advisories") ?? "").strip_prefix("/") ?? "";
+    let parts: List<str> = List::new();
+    if !rest.is_empty() {
+        for x in rest.split("/") { parts.push(x); }
+    }
+    let get = r.method == "GET" || r.method == "HEAD";
+    if parts.is_empty() {
+        if get {
+            let json = try wants_json(r);
+            try limit::check("read:" + client, limit::READS);
+            let db = try data(cfg);
+            let q = http::form(r.query);
+            let name = q.get("package") ?? "";
+            if !name.is_empty() && !packages::is_name(name) { throw index::err(400, f"`package` is a package name, not `{name}`"); }
+            let state = q.get("state") ?? "";
+            if state.is_empty() || state == osv::PUBLISHED { return answer(cfg, public_of(db, name), json); }
+            if state != osv::DRAFT { throw index::err(400, f"`state` is `draft` (with a token) or left out, not `{state}`"); }
+            let auth = try authenticate(cfg, db, r);
+            let out: List<Advisory> = List::new();
+            for a in db.advisories {
+                if a.state == osv::DRAFT && (auth.admin || owns_all(db, a, auth.account.id)) && (name.is_empty() || osv::packages_of(a).contains(index::key(name))) { out.push(a); }
+            }
+            return answer(cfg, out, json);
+        }
+        if r.method == "POST" { return try create(cfg, r, client); }
+        throw index::err(405, "use GET or POST /api/v1/advisories");
+    }
+    let id = parts[0];
+    if !osv::is_id(id) { throw index::err(404, f"`{id}` is not an advisory id such as NABI-2026-0001"); }
+    if parts.len() == 1 {
+        if get {
+            let json = try wants_json(r);
+            try limit::check("read:" + client, limit::READS);
+            let db = try data(cfg);
+            let i = find(db, id) ?? { throw not_found(id); };
+            let a = db.advisories[i];
+            if !osv::public(a) {
+                // A draft is answered to who may edit it, and is a 404
+                // to anyone else.
+                if r.header("authorization").is_empty() { throw not_found(id); }
+                let auth = try authenticate(cfg, db, r);
+                if !(auth.admin || owns_all(db, a, auth.account.id)) { throw not_found(id); }
+            }
+            return if json { json_resp(osv::to_json(a, cfg.url)) } else { one(a) };
+        }
+        if r.method == "PUT" { return try edit(cfg, r, client, id); }
+        throw index::err(405, f"use GET or PUT /api/v1/advisories/{id}");
+    }
+    if parts.len() == 2 && (parts[1] == "publish" || parts[1] == "withdraw") {
+        if r.method != "POST" { throw index::err(405, f"use POST /api/v1/advisories/{id}/{parts[1]}"); }
+        return if parts[1] == "publish" { try publish(cfg, r, client, id) } else { try withdraw(cfg, r, client, id) };
+    }
+    throw index::err(404, "no such API route");
+}

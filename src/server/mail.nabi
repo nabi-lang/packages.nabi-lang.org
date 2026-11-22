@@ -20,6 +20,7 @@ pub fn kinds() -> List<(str, str)> {
         ("owners", "owners of a package you own are invited, added or removed"),
         ("trusted", "trusted publishers of a package you own are added or removed"),
         ("token", "a publish token is created on your account"),
+        ("advisory", "a security advisory on a package you own is published"),
     ]
 }
 

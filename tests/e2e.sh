@@ -400,7 +400,7 @@ mail_to alice@example.com 'alice published geom 0.1.0.'
 mail_to alice@example.com 'https://packages.test/packages/geom'
 # Publish notices off from here on: the later publishes would pass the
 # hourly cap.
-req POST /me/notices -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&notify=on&kind-yank=on&kind-owners=on&kind-trusted=on&kind-token=on"
+req POST /me/notices -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&notify=on&kind-yank=on&kind-owners=on&kind-trusted=on&kind-token=on&kind-advisory=on"
 expect_code 303 "notice settings"
 [ "$(header location)" = "/me#notices" ] || fail "notice settings location: $(header location)"
 grep -q 'notify_off: \["publish"\]' <(db) || fail "publish notices off"
@@ -1241,6 +1241,105 @@ for c in "$first" "$sess"; do
 done
 grep -q 'action: "logout-all"' "$T/data/audit.nabion" || fail "audited: logout-all"
 ok "sessions"
+
+# Advisories: an owner drafts one on their package, an admin publishes
+# it (the owners are told), the affected versions' pages say so and the
+# public API answers OSV JSON; an admin withdraws it.
+kill "$server"; wait "$server" 2>/dev/null || true
+extra_env=(PACKAGES_REQUIRE_2FA=0 PACKAGES_MAIL_FROM= PACKAGES_OPEN_PUBLISHING=1)
+start_server 1001
+login admin
+req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&name=sec&$all_scopes"
+sec=(-H "Authorization: Bearer $(grep -o 'pkg_[0-9a-f]\{64\}' "$T/b" | head -1)")
+req POST /api/v1/owners "${sec[@]}" --data-binary 'Owner { package: "geom", login: "bob" }'
+expect_code 200 "invite an owner for advisories"
+login user
+req POST /me/invites/accept -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&package=geom"
+expect_code 303 "an owner for advisories"
+req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&name=sec&scopes=1&scope-owners=on"
+expect_code 200 "owner token"
+bsec=(-H "Authorization: Bearer $(grep -o 'pkg_[0-9a-f]\{64\}' "$T/b" | head -1)")
+adv='{"summary":"Path traversal in Shape::load","details":"A `..` in a path escapes the directory.","aliases":["CVE-2026-4242"],"affected":[{"package":{"ecosystem":"Nabi","name":"geom"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"0.2.0"}]}]}],"references":[{"type":"WEB","url":"https://example.org/report"}],"credits":[{"name":"Bob","type":"FINDER"}]}'
+req POST /api/v1/advisories "${bsec[@]}" -H 'Content-Type: application/json' --data-binary "$adv"
+expect_code 201 "owner drafts an advisory"
+expect_body 'state: "draft"' "a draft"
+aid=$(grep -o 'NABI-[0-9]\{4\}-[0-9]\{4,\}' "$T/b" | head -1)
+[ "$aid" = "NABI-$(date -u +%Y)-0001" ] || fail "advisory id: $aid"
+[ "$(header location)" = "/api/v1/advisories/$aid" ] || fail "advisory location: $(header location)"
+req GET "/api/v1/advisories/$aid"
+expect_code 404 "a draft is not public"
+req GET "/api/v1/advisories/$aid" "${bsec[@]}"
+expect_code 200 "a draft to its owner"
+req GET "/api/v1/advisories?state=draft&format=json" "${sec[@]}"
+expect_body "\"id\":\"$aid\"" "drafts for the admins"
+req GET "/api/v1/advisories?format=json"
+grep -q "$aid" "$T/b" && fail "a draft listed"
+req POST /api/v1/advisories "${bsec[@]}" --data-binary '{"summary":"x","affected":[{"package":{"ecosystem":"Nabi","name":"units"},"versions":["0.1.0"]}]}'
+expect_code 403 "an advisory on another's package"
+expect_body 'only the owners of units and the admins' "another's package body"
+req POST /api/v1/advisories "${bsec[@]}" --data-binary '{"summary":"x","affected":[{"package":{"ecosystem":"Nabi","name":"geom"},"ranges":[{"type":"SEMVER","events":[{"fixed":"0.2.0"}]}]}]}'
+expect_code 400 "a range without introduced"
+expect_body 'starts with an `introduced` event' "range body"
+req POST /api/v1/advisories "${bsec[@]}" --data-binary '{"summary":"x","colour":"red"}'
+expect_code 400 "an unknown field"
+req POST "/api/v1/advisories/$aid/publish" "${bsec[@]}"
+expect_code 403 "an owner publishes"
+expect_body 'only the registry admins publish advisories' "owner publish body"
+req PUT "/api/v1/advisories/$aid" "${bsec[@]}" --data-binary "${adv//Shape::load/Shape::open}"
+expect_code 200 "owner edits the draft"
+expect_body 'Shape::open' "edited"
+req POST "/api/v1/advisories/$aid/publish" "${sec[@]}"
+expect_code 200 "admin publishes"
+expect_body 'state: "published"' "published"
+req POST "/api/v1/advisories/$aid/publish" "${sec[@]}"
+expect_code 409 "published twice"
+req PUT "/api/v1/advisories/$aid" "${bsec[@]}" --data-binary "$adv"
+expect_code 403 "owner edits a published advisory"
+for who in 1001 1002; do
+    for _ in $(seq 20); do grep -q "to account $who: \[packages.test\] Security advisory $aid on geom" "$T/server.log" && break; sleep 0.1; done
+    grep -q "to account $who: \[packages.test\] Security advisory $aid on geom" "$T/server.log" || fail "advisory notice to $who"
+done
+req GET "/api/v1/advisories?format=json"
+expect_code 200 "advisories json"
+expect_body "{\"advisories\":\[{\"schema_version\":\"1.6.0\",\"id\":\"$aid\"" "osv list"
+[ "$(header access-control-allow-origin)" = "*" ] || fail "advisories cors"
+req GET /api/v1/advisories
+expect_body "Advisories { advisories: \[Advisory { id: \"$aid\"" "nabion list"
+req GET "/api/v1/advisories/$aid" -H 'Accept: application/json'
+expect_body '"ranges":\[{"type":"SEMVER","events":\[{"introduced":"0"},{"fixed":"0.2.0"}\]}\]' "osv ranges"
+expect_body "\"references\":\[{\"type\":\"ADVISORY\",\"url\":\"https://packages.test/advisories/$aid\"}" "advisory page reference"
+req GET /api/v1/packages/geom/advisories?format=json
+expect_body "\"id\":\"$aid\"" "a package's advisories"
+req GET "/api/v1/advisories?package=units&format=json"
+[ "$(cat "$T/b")" = '{"advisories":[]}' ] || fail "package filter: $(cat "$T/b")"
+req GET /api/v1/advisories/NABI-2026-9999
+expect_code 404 "no such advisory"
+for _ in $(seq 100); do grep -q 'callout vuln' "$T/site/public/packages/geom/0.1.0.html" 2>/dev/null && break; sleep 0.2; done
+req GET /packages/geom/0.1.0
+expect_body "1 advisory affects geom 0.1.0. <a href=\"/advisories/$aid\">$aid</a>: Path traversal in Shape::open" "banner on an affected version"
+req GET /packages/geom/versions
+expect_body 'tag vuln' "affected versions tagged"
+req GET "/advisories/$aid"
+expect_code 200 "advisory page"
+expect_body 'CVE-2026-4242' "advisory page aliases"
+req GET /advisories
+expect_body "href=\"/advisories/$aid\"" "advisory list"
+grep -q "/advisories/$aid</loc>" "$T/site/public/sitemap.xml" || fail "advisory in the sitemap"
+req POST "/api/v1/advisories/$aid/withdraw" "${sec[@]}" --data-binary '{"reason":""}'
+expect_code 400 "withdraw without a reason"
+req POST "/api/v1/advisories/$aid/withdraw" "${sec[@]}" --data-binary 'Withdraw { reason: "not exploitable" }'
+expect_code 200 "withdraw"
+expect_body 'state: "withdrawn"' "withdrawn"
+req GET "/api/v1/advisories/$aid?format=json"
+expect_body '"withdrawn":"' "osv withdrawn"
+for _ in $(seq 100); do grep -q 'callout vuln' "$T/site/public/packages/geom/0.1.0.html" 2>/dev/null || break; sleep 0.2; done
+req GET /packages/geom/0.1.0
+grep -q 'callout vuln' "$T/b" && fail "banner of a withdrawn advisory"
+for a in advisory-draft advisory-edit advisory-publish advisory-withdraw; do
+    grep -q "action: \"$a\"" "$T/data/audit.nabion" || fail "audited: $a"
+done
+grep -q "action:\"advisory-publish\",detail:\"$aid\"" <(db | tr -d ' \n') || fail "advisory in the package's events"
+ok "advisories"
 
 # Backups: `backup` copies the live database (the online backup API);
 # the copy holds the same data, in one file.

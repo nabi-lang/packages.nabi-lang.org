@@ -168,6 +168,10 @@ pub fn event_text(e: Event) -> str {
         "trusted-remove" => f"removed trusted publisher {d}",
         "token-create" => f"created token {d}",
         "token-revoke" => f"revoked token {d}",
+        "advisory-draft" => f"drafted advisory {d}",
+        "advisory-edit" => f"edited advisory {d}",
+        "advisory-publish" => f"published advisory {d}",
+        "advisory-withdraw" => f"withdrew advisory {d}",
         _ => f"{e.action} {d}".trim(),
     }
 }

@@ -15,6 +15,7 @@ use pkg::meta;
 use pkg::meta::{Release, Actor};
 use pkg::packages;
 use pkg::server::admin::admin_route;
+use pkg::server::advisories;
 use pkg::server::auth::exchange;
 use pkg::server::downloads;
 use pkg::server::limit;
@@ -65,9 +66,9 @@ pub fn api_route(cfg: Cfg, r: Request, client: str) -> Resp {
 }
 
 /// A read anyone may make, from any origin: package info, READMEs,
-/// archives and docs. Authenticated routes and writes are not.
+/// archives, docs and advisories. Authenticated routes and writes are not.
 pub fn public_read(r: Request) -> bool {
-    (r.method == "GET" || r.method == "HEAD") && (r.path == "/api/v1/docs" || r.path.starts_with("/api/v1/packages/") || r.path.starts_with("/api/v1/native/"))
+    (r.method == "GET" || r.method == "HEAD") && (r.path == "/api/v1/docs" || r.path == "/api/v1/advisories" || r.path.starts_with("/api/v1/advisories/") || r.path.starts_with("/api/v1/packages/") || r.path.starts_with("/api/v1/native/"))
 }
 
 /// `resp` readable by a page on any origin, and cached apart per Accept
@@ -346,28 +347,28 @@ fn download(cfg: Cfg, db: Db, name: str, version: str) throws (ApiError) -> Resp
 
 /// Who a request's token speaks for: an account, or a token traded for
 /// an OIDC token, which may touch only the packages in `scope`.
-struct Auth {
-    account: Account;
-    admin: bool;
+pub struct Auth {
+    pub account: Account;
+    pub admin: bool;
     /// `index::key`s an exchanged token may publish and yank; none: an
     /// account's token.
-    scope: List<str> | none;
+    pub scope: List<str> | none;
     /// Shown by `/api/v1/me` and recorded as the actor.
-    login: str;
+    pub login: str;
     /// The index commit's author.
-    who: str;
+    pub who: str;
     /// Recorded as who published or yanked.
-    actor: Actor;
+    pub actor: Actor;
     /// What its rate limit counts by.
-    key: str;
+    pub key: str;
     /// `index::key`s an account's token is limited to; empty: none.
-    only: List<str> = List::new();
+    pub only: List<str> = List::new();
     /// What the token may do (store::scopes).
-    scopes: List<str> = [SCOPE_NEW, SCOPE_UPDATE, SCOPE_YANK];
+    pub scopes: List<str> = [SCOPE_NEW, SCOPE_UPDATE, SCOPE_YANK];
 }
 
 /// Who did it, as a notice says: the account, or the workflow run.
-fn who_did(auth: Auth) -> str {
+pub fn who_did(auth: Auth) -> str {
     match auth.actor.via {
         v: meta::Via => f"GitHub Actions in {v.repository} (workflow {v.workflow}, run started by {auth.actor.login})",
         none => auth.login,
@@ -375,7 +376,7 @@ fn who_did(auth: Auth) -> str {
 }
 
 /// Refuse what `auth`'s token has no `scope` for, saying how to get it.
-fn need(cfg: Cfg, auth: Auth, scope: str) throws (ApiError) {
+pub fn need(cfg: Cfg, auth: Auth, scope: str) throws (ApiError) {
     if auth.scopes.contains(scope) { return; }
     throw index::err(403, f"this token may not {scope_says(scope)} (scope `{scope}`); create a token with that scope on your account page ({cfg.url}/me) and give it to `nabi login`");
 }
@@ -409,7 +410,7 @@ fn nabion_value(status: i32, v: Value) -> Resp {
 
 /// The account or exchanged token a request presents. Refused: none or
 /// a bad one, a locked account, an account that may not act.
-fn authenticate(cfg: Cfg, db: Db, r: Request) throws (ApiError) -> Auth {
+pub fn authenticate(cfg: Cfg, db: Db, r: Request) throws (ApiError) -> Auth {
     let presented = (r.header("authorization").strip_prefix("Bearer ") ?? "").trim();
     let no_account = Account { id: 0i64, login: "", created: 0i64 };
     let now = now_secs();
@@ -682,6 +683,7 @@ fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
         let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
         return try docs_index(cfg, db);
     }
+    if r.path == "/api/v1/advisories" || r.path.starts_with("/api/v1/advisories/") { return try advisories::route(cfg, r, client); }
     for (prefix, native) in [("/api/v1/packages/", false), ("/api/v1/native/", true)] {
         if let rest: str = r.path.strip_prefix(prefix) {
             let parts: List<str> = List::new();
@@ -694,6 +696,7 @@ fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
             if parts.len() == 3 && parts[2] == "readme" { return try readme_of(cfg, db, native, parts[0], parts[1], json); }
             if parts.len() == 3 && parts[2] == "download" && !native { return try download(cfg, db, parts[0], parts[1]); }
             if parts.len() == 3 && parts[2] == "docs" && !native { return try docs_of(cfg, db, parts[0], parts[1]); }
+            if parts.len() == 2 && parts[1] == "advisories" && !native { return try advisories::of_package(cfg, db, parts[0], json); }
             if parts.len() != 1 { throw index::err(404, "no such API route"); }
             return try package_info(cfg, db, native, parts[0]);
         }
