@@ -3,9 +3,10 @@
 // and the 404s that name a package.
 
 use pkg::Site;
+use pkg::json;
 use pkg::layout;
 use pkg::server::account::account_route;
-use pkg::server::api::api_route;
+use pkg::server::api::{api_route, open_to_all, wants_json};
 use pkg::server::auth::{callback, login};
 use pkg::server::limit;
 use pkg::server::{Cfg, Resp, html, HTML_CACHE, IMMUTABLE, message, shared_html};
@@ -90,7 +91,18 @@ fn missing_package(site: Site, p: str, rest: str, query: str) -> Resp | none {
 
 pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     let p = r.path;
-    if p == "/api/health" && (r.method == "GET" || r.method == "HEAD") { return health(site); }
+    if p == "/api/health" && (r.method == "GET" || r.method == "HEAD") {
+        let h = health(site);
+        if (try? wants_json(r)) ?? false {
+            h.body = f"{{\"status\":\"{if h.status == 200 { "ok" } else { "failing" }}\",\"nabi\":{json::quote(if site.release.is_empty() { "unknown" } else { site.release })},\"packages\":{rows(site).len()}}}\n";
+            h.headers[0] = "Content-Type: application/json";
+        }
+        return open_to_all(h);
+    }
+    // The API's reference is a page.
+    if p == "/api/v1" || p == "/api/v1/" {
+        return Resp { status: 301, headers: ["Location: /api", "Cache-Control: public, max-age=86400"], body: "", file: "" };
+    }
     if p == "/.well-known/security.txt" && (r.method == "GET" || r.method == "HEAD") {
         return Resp { status: 200, headers: ["Content-Type: text/plain; charset=utf-8", "Cache-Control: " + HTML_CACHE], body: web::chrome::security_txt(site.base_url), file: "" };
     }

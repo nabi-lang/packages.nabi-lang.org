@@ -6,6 +6,7 @@ use pkg::docs::Status;
 use pkg::meta;
 use pkg::packages;
 use pkg::packages::{Package, Version};
+use pkg::server::names;
 use core::cmp::Ordering;
 use markdown::{Options, esc};
 use web::build;
@@ -181,8 +182,8 @@ pub fn page_desc(site: Site, out: str, title: str, about: str, body: str, img: s
     let body = body.replace("class=\"anchor\" href=", "class=\"anchor\" tabindex=\"-1\" href=");
     let (ogimg, ogalt) = if img.is_empty() { (site.base_url + "/og.png" + (if site.og.is_empty() { "" } else { "?v=" + site.og }), f"{site.title}: {site.tagline}") } else { (img, alt) };
     let cur = |on: bool| if on { " aria-current=\"page\"" } else { "" };
-    let browse = cur(out == "packages/index.html" || out.starts_with("packages/"));
-    let publish = cur(out == "publishing.html");
+    let browse = cur(out.starts_with("packages/") || out.starts_with("categories/") || out.starts_with("keywords/"));
+    let publish = cur(out == "publishing.html" || out == "api.html");
     f"<!doctype html>
 <html lang=\"{lang}\" class=\"nb lt\">
 <head>
@@ -415,6 +416,12 @@ pub fn landing(all: List<Package>) -> str {
         f"<section aria-labelledby=\"official\" class=\"block\"><div class=\"list-head\"><h2 class=\"t-h3\" id=\"official\">Official packages</h2><span class=\"t-small\">Published from the nabi-lang organization · <a href=\"/packages?q=official:yes\">see all</a></span></div>
 {official_groups(official)}</section>"
     };
+    // The biggest categories, for browsing.
+    let cats = topics(all, true);
+    cats.sort_by(|a: Topic, b: Topic| if a.packages.len() != b.packages.len() { b.packages.len().cmp(a.packages.len()) } else { a.slug.cmp(b.slug) });
+    let cb = StrBuf::new();
+    for k in 0..cats.len().min(8) { cb.push_str(f"<li><a href=\"{esc(url(topic_out(true, cats[k].slug)))}\">{esc(cats[k].label)}</a><span class=\"ct\">{grouped(cats[k].packages.len())}</span></li>"); }
+    let browse = if cats.is_empty() { "" } else { f"<section><h2 class=\"t-h3\">Browse by category</h2><ul class=\"topics compact\">{cb.to_str()}</ul><p><a href=\"/categories\">All categories</a> · <a href=\"/keywords\">keywords</a></p></section>\n" };
     let example = if all.is_empty() { "json" } else { recent[0].name };
     let example_official = !all.is_empty() && recent[0].official;
     for s in all {
@@ -440,7 +447,7 @@ pub fn landing(all: List<Package>) -> str {
 <section><h2 class=\"t-h3\">Using a package</h2>
 {use_note}
 <div class=\"inst\"><div class=\"ipanel on\"><pre class=\"sh\"><code><span class=\"p\" aria-hidden=\"true\">$ </span>nabi add {esc(example)}</code></pre>{chrome::copy_button("nabi add " + example, false)}</div></div></section>
-<section><h2 class=\"t-h3\">Publishing</h2>
+{browse}<section><h2 class=\"t-h3\">Publishing</h2>
 <p>Packages are published here with <code class=\"ic\">nabi publish</code>, or from GitHub Actions with trusted publishing. Publishing is not open to everyone yet.</p>
 <p><a href=\"/publishing#publishing\">How publishing works</a></p></section>
 </aside>
@@ -485,24 +492,75 @@ fn official_grid(xs: List<Package>) -> str {
     b.to_str()
 }
 
-/// Edit distance (insert, delete, substitute) between `a` and `b`.
-fn distance(a: str, b: str) -> usize {
-    let x: List<char> = List::new();
-    for c in a.chars() { x.push(c); }
-    let y: List<char> = List::new();
-    for c in b.chars() { y.push(c); }
-    let prev: List<usize> = List::new();
-    for j in 0..y.len() + 1 { prev.push(j); }
-    for i in 0..x.len() {
-        let cur: List<usize> = [i + 1];
-        for j in 0..y.len() {
-            let sub = prev[j] + (if x[i] == y[j] { 0 } else { 1 });
-            let best = if prev[j + 1] + 1 < cur[j] + 1 { prev[j + 1] + 1 } else { cur[j] + 1 };
-            cur.push(if sub < best { sub } else { best });
+/// Edits a misspelt term of `n` characters may be from the word it
+/// meant: none under 3 characters, then 1, 2 from 5, 3 from 9.
+pub fn typo_room(n: usize) -> usize { if n < 3 { 0usize } else if n <= 4 { 1usize } else if n <= 8 { 2usize } else { 3usize } }
+
+/// `q` with each term that is in no name, description or keyword
+/// replaced by the nearest name, part of a name (split at `-` / `_`) or
+/// keyword within typo_room edits (names::edits); names win ties, then
+/// the shorter distance, then the word. None when no term changed.
+/// search.tsx corrects the same way.
+pub fn corrected(rows: List<Row>, q: str) -> str | none {
+    let words: List<(str, bool)> = List::new();
+    let seen: Set<str> = Set::new();
+    let add = |w: str, name: bool| {
+        if w.char_count() >= 2 && !seen.contains(w) {
+            seen.insert(w);
+            words.push((w, name));
         }
-        prev = cur;
+    };
+    for r in rows {
+        let n = r.name.to_lowercase();
+        add(n, true);
+        for part in n.replace("_", "-").split("-") { add(part, true); }
     }
-    prev[y.len()]
+    for r in rows {
+        for k in r.keywords {
+            let kl = k.to_lowercase();
+            add(kl, false);
+            for part in kl.replace("_", "-").split("-") { add(part, false); }
+        }
+    }
+    let found = |w: str| {
+        for r in rows {
+            if r.name.to_lowercase().contains(w) || r.desc.to_lowercase().contains(w) { return true; }
+            for k in r.keywords {
+                if k.to_lowercase().contains(w) { return true; }
+            }
+        }
+        false
+    };
+    let out: List<str> = List::new();
+    let changed = false;
+    for w in q.to_lowercase().replace("\t", " ").split(" ") {
+        if w.is_empty() { continue; }
+        let room = typo_room(w.char_count());
+        if w.starts_with("official:") || room == 0 || found(w) {
+            out.push(w);
+            continue;
+        }
+        let best = "";
+        let best_d = room + 1;
+        let best_name = false;
+        for (c, name) in words {
+            let d = names::edits(w, c);
+            if d > room { continue; }
+            let better = d < best_d || (d == best_d && ((name && !best_name) || (name == best_name && c < best)));
+            if better {
+                best = c;
+                best_d = d;
+                best_name = name;
+            }
+        }
+        if best.is_empty() {
+            out.push(w);
+        } else {
+            out.push(best);
+            changed = true;
+        }
+    }
+    if changed { out.join(" ") } else { none }
 }
 
 /// Up to three of `names` close to `name`: a few edits away, or one
@@ -513,7 +571,7 @@ pub fn closest(names: List<str>, name: str) -> List<str> {
     let room = if n <= 3 { 1usize } else if n <= 6 { 2usize } else { 3usize };
     let near: List<(usize, str)> = List::new();
     for c in names {
-        let d = distance(q, c);
+        let d = names::edits(q, c);
         if d <= room || (n >= 3 && (c.contains(q) || q.contains(c))) { near.push((d, c)); }
     }
     near.sort_by(|a: (usize, str), b: (usize, str)| if a.0 != b.0 { a.0.cmp(b.0) } else { a.1.cmp(b.1) });
@@ -537,6 +595,19 @@ pub fn list_page(rows: List<Row>, q: str, sort: str) -> (str, str) {
     // Without a query every row ties on relevance: that is name order.
     let sort = if sort == "name" || sort == "updated" { sort } else if terms.is_empty() { "name" } else { "relevance" };
     let hits = search(rows, q, sort);
+    // Nothing matched: a misspelling, most likely. Show the corrected
+    // query's matches and say so.
+    let fixed = "";
+    if hits.is_empty() && !terms.is_empty() {
+        if let c: str = corrected(rows, q) {
+            let again = search(rows, c, sort);
+            if !again.is_empty() {
+                fixed = c;
+                hits = again;
+                terms = terms_of(c);
+            }
+        }
+    }
     let order = if sort == "updated" { "recently updated first" } else if sort == "name" { "sorted by name" } else { "best match first" };
     let opts = StrBuf::new();
     for (v, label) in SORTS {
@@ -548,9 +619,12 @@ pub fn list_page(rows: List<Row>, q: str, sort: str) -> (str, str) {
     let (title, note) = if terms.is_empty() && only == "yes" {
         ("Official packages", f"{plural(hits.len(), "official package", "official packages")}, {order}. Official packages are published from the nabi-lang organization.")
     } else if terms.is_empty() && only.is_empty() {
-        ("All packages", f"{plural(rows.len(), "package", "packages")}, {order}.")
+        ("All packages", f"{plural(rows.len(), "package", "packages")}, {order}. Browse by <a href=\"/categories\">category</a> or <a href=\"/keywords\">keyword</a>.")
     } else if hits.is_empty() {
         (f"Search: {q}", f"No packages match {qt}.")
+    } else if !fixed.is_empty() {
+        let href = esc("/packages?q=" + http::pct_encode(fixed));
+        (f"Search: {q}", f"No packages match {qt}. Showing results for <a class=\"fixed\" href=\"{href}\"><q>{esc(fixed)}</q></a>: {plural(hits.len(), "package", "packages")}, {order}. <a href=\"/packages\">Show all packages</a>")
     } else {
         (f"Search: {q}", f"{if hits.len() == 1 { "1 package matches" } else { f"{grouped(hits.len())} packages match" }} {qt}, {order}. <a href=\"/packages\">Show all packages</a>")
     };
@@ -571,6 +645,127 @@ pub fn list_page(rows: List<Row>, q: str, sort: str) -> (str, str) {
 ")
 }
 
+// Browsing by category and keyword: /categories, /categories/<slug>,
+// /keywords, /keywords/<slug>, from the latest version's metadata.
+
+/// The address part of a category or keyword: lowercase ASCII letters
+/// and digits, each run of anything else one `-`, none at the ends; ""
+/// when nothing is left (a keyword in another script has no page).
+pub fn slug(s: str) -> str {
+    let out = StrBuf::new();
+    let dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            if dash && out.len() > 0 { out.push('-'); }
+            dash = false;
+            out.push(c.to_ascii_lowercase());
+        } else {
+            dash = true;
+        }
+    }
+    out.to_str()
+}
+
+/// A category or keyword and the packages whose latest version has it.
+pub struct Topic {
+    pub slug: str;
+    /// As the first package to name it spelt it; a category with its
+    /// first letter raised and `-` as spaces.
+    pub label: str;
+    pub packages: List<Package>;
+}
+
+/// The page of category (`cats`) or keyword `slug`.
+pub fn topic_out(cats: bool, slug: str) -> str { f"{if cats { "categories" } else { "keywords" }}/{slug}.html" }
+
+/// Where a category or keyword links: its page, or a search when it has
+/// no slug.
+pub fn topic_href(cats: bool, word: str) -> str {
+    let s = slug(word);
+    if s.is_empty() { "/packages?q=" + http::pct_encode(word) } else { url(topic_out(cats, s)) }
+}
+
+fn category_label(c: str) -> str {
+    let t = c.trim().replace("-", " ").replace("_", " ");
+    if t.is_empty() { return t; }
+    if t.byte(0) < 128u8 { t[:1].to_uppercase() + t[1:] } else { t }
+}
+
+/// Every category (`cats`) or keyword of `all`, by slug; each package
+/// once per topic, official ones first, then by name.
+pub fn topics(all: List<Package>, cats: bool) -> List<Topic> {
+    let labels: Dict<str, str> = Dict::new();
+    let members: Dict<str, List<Package>> = Dict::new();
+    for s in all {
+        if s.library { continue; }
+        let words = if cats { s.meta.categories } else { s.meta.keywords };
+        for w in words {
+            let k = slug(w);
+            if k.is_empty() { continue; }
+            if !labels.contains_key(k) {
+                labels.insert(k, if cats { category_label(w) } else { w.trim().to_lowercase() });
+                members.insert(k, List::new());
+            }
+            let ps = members[k];
+            let dup = false;
+            for p in ps {
+                if p.name == s.name { dup = true; }
+            }
+            if !dup { ps.push(s); }
+            members.insert(k, ps);
+        }
+    }
+    let out: List<Topic> = List::new();
+    for k in labels.keys() {
+        let ps = members[k];
+        ps.sort_by(|a: Package, b: Package| if a.official != b.official { b.official.cmp(a.official) } else { a.name.cmp(b.name) });
+        out.push(Topic { slug: k, label: labels[k], packages: ps });
+    }
+    out.sort_by(|a: Topic, b: Topic| a.slug.cmp(b.slug));
+    out
+}
+
+/// The links between the two indexes, the current one marked.
+fn topic_switch(cats: bool) -> str {
+    let cur = |on: bool| if on { " aria-current=\"page\"" } else { "" };
+    f"<nav class=\"topic-switch t-ui\" aria-label=\"Browse by\"><a href=\"/categories\"{cur(cats)}>Categories</a><a href=\"/keywords\"{cur(!cats)}>Keywords</a><a href=\"/packages\">All packages</a></nav>"
+}
+
+/// `/categories` or `/keywords`: every one with how many packages have
+/// it. The page title and the body.
+pub fn topics_page(ts: List<Topic>, cats: bool) -> (str, str) {
+    let title = if cats { "Categories" } else { "Keywords" };
+    let what = if cats { "category" } else { "keyword" };
+    let b = StrBuf::new();
+    for t in ts { b.push_str(f"<li><a href=\"{esc(url(topic_out(cats, t.slug)))}\">{esc(t.label)}</a><span class=\"ct\">{grouped(t.packages.len())}</span></li>"); }
+    let list = if ts.is_empty() { f"<p class=\"empty\">No package names a {what} yet.</p>" } else { f"<ul class=\"topics\">{b.to_str()}</ul>" };
+    let note = if cats { "The categories packages name in their manifest (<code class=\"ic\">categories</code>), with how many packages are in each." } else { "The keywords packages name in their manifest (<code class=\"ic\">keywords</code>), with how many packages have each." };
+    (title, f"<div class=\"frame list-page\">
+<div class=\"page-head\"><h1 class=\"t-h2\">{title}</h1><p class=\"t-small\">{plural(ts.len(), what, if cats { "categories" } else { "keywords" })}. {note}</p></div>
+{topic_switch(cats)}
+{list}
+</div>
+")
+}
+
+/// `/categories/<slug>` or `/keywords/<slug>`: its packages. The page
+/// title, its description and the body.
+pub fn topic_page(t: Topic, cats: bool) -> (str, str, str) {
+    let title = if cats { f"Category: {t.label}" } else { f"Keyword: {t.label}" };
+    let about = f"Nabi packages {if cats { "in the category" } else { "with the keyword" }} {t.label}.";
+    let b = StrBuf::new();
+    b.push_str("<ul class=\"rows\">");
+    for s in t.packages { b.push_str(package_row(row_of(s), "")); }
+    b.push_str("</ul>");
+    let all = if cats { "<a href=\"/categories\">All categories</a>" } else { "<a href=\"/keywords\">All keywords</a>" };
+    (title, about, f"<div class=\"frame list-page\">
+<nav class=\"crumbs\" aria-label=\"Breadcrumb\"><a href=\"{if cats { "/categories" } else { "/keywords" }}\">{if cats { "categories" } else { "keywords" }}</a> / {esc(t.slug)}</nav>
+<div class=\"page-head\"><h1 class=\"t-h2\">{esc(title)}</h1><p class=\"t-small\">{plural(t.packages.len(), "package", "packages")}, official first, then by name. {all}</p></div>
+{b.to_str()}
+</div>
+")
+}
+
 /// The registry's policies (`pages/<name>.md`, `pages/ko/<name>.md`):
 /// the text, and a link to it in the other language at `other`.
 pub fn legal(doc: markdown::Doc, other: str, ko: bool) -> str {
@@ -583,15 +778,16 @@ pub fn legal(doc: markdown::Doc, other: str, ko: bool) -> str {
 "
 }
 
-/// Body of `publishing.html`: the guide in `pages/publishing.md`.
-pub fn guide(doc: markdown::Doc) -> str {
+/// Body of `publishing.html`: the guide in `pages/publishing.md`; of
+/// `api.html`, with another `title`, the reference in `pages/api.md`.
+pub fn guide(doc: markdown::Doc, title: str = "Using and publishing packages") -> str {
     let toc = StrBuf::new();
     for h in doc.headings {
         if h.level == 2 { toc.push_str(f"<a href=\"#{esc(h.id)}\">{esc(h.text)}</a>"); }
     }
     f"<div class=\"frame doc\">
 <article class=\"prose md\">
-<h1 class=\"t-h1\">Using and publishing packages</h1>
+<h1 class=\"t-h1\">{esc(title)}</h1>
 {doc.html}</article>
 <nav class=\"toc\" aria-label=\"On this page\"><h2 class=\"t-label\">On this page</h2>{toc.to_str()}</nav>
 </div>
@@ -807,6 +1003,7 @@ fn side(site: Site, s: Package) -> str {
         let who = if pb.is_empty() { "" } else { f"{if when.is_empty() { "by" } else { " by" }} {pb}" };
         kv.push_str(f"<dt>Published</dt><dd>{when}{who}</dd>");
     }
+    kv.push_str(downloads_kv(s));
     if !m.license.is_empty() { kv.push_str(f"<dt>License</dt><dd>{esc(m.license)}</dd>"); }
     if !l.nabi_version.is_empty() { kv.push_str(f"<dt>Requires</dt><dd>{esc(packages::admits(l.nabi_version))}</dd>"); }
     if !m.links.is_empty() { kv.push_str(f"<dt>Links</dt><dd title=\"The native library it links\"><code class=\"ic\">{esc(m.links)}</code></dd>"); }
@@ -822,15 +1019,18 @@ fn side(site: Site, s: Package) -> str {
         }
         kv.push_str(f"<dt>Dependencies</dt><dd>{ds.join(", ")}</dd>");
     }
+    // The browse pages are the latest version's: an old version's
+    // keywords and categories search instead.
+    let old = !s.at.is_empty() && s.at != s.top;
     if !m.keywords.is_empty() {
         let ks: List<str> = List::new();
-        for k in m.keywords { ks.push(f"<a href=\"/packages?q={esc(http::pct_encode(k))}\">{esc(k)}</a>"); }
+        for k in m.keywords { ks.push(f"<a href=\"{esc(if old { "/packages?q=" + http::pct_encode(k) } else { topic_href(false, k) })}\">{esc(k)}</a>"); }
         kv.push_str(f"<dt>Keywords</dt><dd class=\"kws\">{ks.join(" ")}</dd>");
     }
     if !m.categories.is_empty() {
         let cs: List<str> = List::new();
-        for c in m.categories { cs.push(esc(c)); }
-        kv.push_str(f"<dt>{if cs.len() == 1 { "Category" } else { "Categories" }}</dt><dd>{cs.join(", ")}</dd>");
+        for c in m.categories { cs.push(f"<a href=\"{esc(if old { "/packages?q=" + http::pct_encode(c) } else { topic_href(true, c) })}\">{esc(c)}</a>"); }
+        kv.push_str(f"<dt>{if cs.len() == 1 { "Category" } else { "Categories" }}</dt><dd class=\"kws\">{cs.join(" ")}</dd>");
     }
     if !m.authors.is_empty() {
         let au: List<str> = List::new();
@@ -839,6 +1039,7 @@ fn side(site: Site, s: Package) -> str {
     }
     if !m.homepage.is_empty() { kv.push_str(f"<dt>Homepage</dt><dd><a href=\"{esc(m.homepage)}\">{esc(bare(m.homepage))}</a></dd>"); }
     if !m.documentation.is_empty() { kv.push_str(f"<dt>Documentation</dt><dd><a href=\"{esc(m.documentation)}\">{esc(bare(m.documentation))}</a></dd>"); }
+    kv.push_str(badge_kv(site, s));
     if let f: packages::Facts = s.facts {
         kv.push_str(f"<dt>Size</dt><dd>{size(f.bytes)} in {plural(f.files, "file", "files")}</dd>");
         if f.nabi_files > 0 { kv.push_str(f"<dt>Nabi code</dt><dd title=\"Lines that are not blank, in .nabi files\">{plural(f.nabi_lines, "line", "lines")} in {plural(f.nabi_files, "file", "files")}</dd>"); }
@@ -862,6 +1063,79 @@ fn side(site: Site, s: Package) -> str {
 {owners_box(s)}{publishers_box(s)}<section class=\"vers\"><h2 class=\"t-label\">Versions</h2><ul>{vb.to_str()}</ul>{dates_note(s)}{more}</section>
 </aside>
 "
+}
+
+// Badges: `/packages/<name>/badge.svg`, the latest version as a flat
+// shields-style badge for READMEs.
+
+/// The badge of package `name`.
+pub fn badge_out(name: str) -> str { f"packages/{name}/badge.svg" }
+
+/// About how wide `text` is in 11px Verdana, as the badge draws it.
+fn text_px(text: str) -> i64 {
+    let w = 0i64;
+    for c in text.chars() {
+        w += match c {
+            'i' | 'l' | 'j' | '|' | '\'' => 30i64,
+            '.' | ',' | ':' | ' ' | 'f' => 39i64,
+            't' => 43i64,
+            'r' | '-' | '(' | ')' => 46i64,
+            'm' => 107i64,
+            'w' => 89i64,
+            'M' | 'W' => 99i64,
+            x => if x >= 'A' && x <= 'Z' { 75i64 } else if x >= '0' && x <= '9' { 70i64 } else { 65i64 },
+        };
+    }
+    (w + 9i64) / 10i64
+}
+
+/// The flat badge of `s`: `nabi | v<latest>`, blue; orange for a
+/// pre-release, grey when every version is yanked. Its title and
+/// aria-label say the same for screen readers.
+pub fn badge(s: Package) -> str {
+    let l = s.latest;
+    let (value, color) = if l.yanked { ("yanked", "#9f9f9f") } else if packages::is_pre(l.version) { ("v" + l.version, "#fe7d37") } else { ("v" + l.version, "#007ec6") };
+    let label = "nabi";
+    let lw = text_px(label) + 10i64;
+    let vw = text_px(value) + 10i64;
+    let w = lw + vw;
+    let title = esc(f"{s.name}: {value} on packages.nabi-lang.org");
+    let lx = lw * 5i64;
+    let vx = lw * 10i64 + vw * 5i64;
+    let lt = (lw - 10i64) * 10i64;
+    let vt = (vw - 10i64) * 10i64;
+    let v = esc(value);
+    f"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"20\" role=\"img\" aria-label=\"{title}\"><title>{title}</title><linearGradient id=\"s\" x2=\"0\" y2=\"100%\"><stop offset=\"0\" stop-color=\"#bbb\" stop-opacity=\".1\"/><stop offset=\"1\" stop-opacity=\".1\"/></linearGradient><clipPath id=\"r\"><rect width=\"{w}\" height=\"20\" rx=\"3\" fill=\"#fff\"/></clipPath><g clip-path=\"url(#r)\"><rect width=\"{lw}\" height=\"20\" fill=\"#555\"/><rect x=\"{lw}\" width=\"{vw}\" height=\"20\" fill=\"{color}\"/><rect width=\"{w}\" height=\"20\" fill=\"url(#s)\"/></g><g fill=\"#fff\" text-anchor=\"middle\" font-family=\"Verdana,Geneva,DejaVu Sans,sans-serif\" text-rendering=\"geometricPrecision\" font-size=\"110\"><text aria-hidden=\"true\" x=\"{lx}\" y=\"150\" fill=\"#010101\" fill-opacity=\".3\" transform=\"scale(.1)\" textLength=\"{lt}\">{label}</text><text x=\"{lx}\" y=\"140\" transform=\"scale(.1)\" fill=\"#fff\" textLength=\"{lt}\">{label}</text><text aria-hidden=\"true\" x=\"{vx}\" y=\"150\" fill=\"#010101\" fill-opacity=\".3\" transform=\"scale(.1)\" textLength=\"{vt}\">{v}</text><text x=\"{vx}\" y=\"140\" transform=\"scale(.1)\" fill=\"#fff\" textLength=\"{vt}\">{v}</text></g></svg>\n"
+}
+
+/// The side panel's badge: the image and its Markdown to copy.
+fn badge_kv(site: Site, s: Package) -> str {
+    if !s.at.is_empty() && s.at != s.top { return ""; }
+    let page = site.base_url + url(package_out(s.name));
+    let src = url(badge_out(s.name));
+    let md = f"[![{s.name} on packages.nabi-lang.org]({site.base_url}{src})]({page})";
+    f"<dt>Badge</dt><dd class=\"badge\"><img src=\"{esc(src)}\" alt=\"{esc(s.name)} {esc(if s.latest.yanked { "yanked" } else { "v" + s.latest.version })}\" height=\"20\" loading=\"lazy\">{chrome::copy_button(md, false)}</dd>"
+}
+
+/// A count of downloads, grouped by thousands.
+fn count_text(n: i64) -> str { grouped(if n < 0i64 { 0usize } else { n as usize }) }
+
+/// The side panel's Downloads: every version's on the package's pages,
+/// the version's own on a version page; "" when none were counted.
+fn downloads_kv(s: Package) -> str {
+    let (total, recent) = if s.at.is_empty() {
+        let t = -1i64;
+        let r = 0i64;
+        for v in s.versions {
+            if v.downloads < 0i64 { continue; }
+            t = if t < 0i64 { v.downloads } else { t + v.downloads };
+            r += v.recent;
+        }
+        (t, r)
+    } else { (s.latest.downloads, s.latest.recent) };
+    if total < 0i64 { return ""; }
+    let what = if s.at.is_empty() { "Downloads of the source archive, every version" } else { "Downloads of this version's source archive" };
+    f"<dt>Downloads</dt><dd title=\"{what}\">{count_text(total)} <span class=\"muted\">· {count_text(recent)} in the last 90 days</span></dd>"
 }
 
 /// An address without `https://` and `.git`.
@@ -1005,6 +1279,10 @@ fn docs_cell(site: Site, s: Package, v: str) -> str {
 
 pub fn versions_page(site: Site, s: Package) -> str {
     let b = StrBuf::new();
+    let counted = false;
+    for v in s.versions {
+        if v.downloads >= 0i64 { counted = true; }
+    }
     for v in sorted_versions(s) {
         let tags = StrBuf::new();
         if v.version == s.latest.version && !v.yanked { tags.push_str("<span class=\"tag acc\">latest</span>"); }
@@ -1024,11 +1302,12 @@ pub fn versions_page(site: Site, s: Package) -> str {
         } else { none_yet };
         let sz = if let n: i64 = v.meta.size { size(n) } else { "<span class=\"muted\">unknown</span>" };
         let tc = if v.nabi_version.is_empty() { "<span class=\"muted\">any</span>" } else { esc(packages::admits(v.nabi_version)) };
-        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{if v.license.is_empty() { "<span class=\"muted\">none</span>" } else { esc(v.license) }}</td><td>{sz}</td><td>{tc}</td><td>{docs_cell(site, s, v.version)}</td><td class=\"mono\">{commit_link(v)}</td><td class=\"mono\"><code title=\"{esc(v.tree)}\">{short(v.tree)}</code></td></tr>");
+        let dl = if counted { f"<td title=\"{count_text(v.recent)} in the last 90 days\">{count_text(v.downloads)}</td>" } else { "" };
+        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{if v.license.is_empty() { "<span class=\"muted\">none</span>" } else { esc(v.license) }}</td><td>{sz}</td>{dl}<td>{tc}</td><td>{docs_cell(site, s, v.version)}</td><td class=\"mono\">{commit_link(v)}</td><td class=\"mono\"><code title=\"{esc(v.tree)}\">{short(v.tree)}</code></td></tr>");
     }
     let body = f"<h2 class=\"t-h3\">{plural(s.versions.len(), "version", "versions")}</h2>
-<p class=\"t-ui muted\">Newest first. Published is when the version's line was added to the index (UTC); size is the package as <code class=\"ic\">nabi publish</code> packed it. A yanked version stays in the index for the projects that pinned it; new resolves skip it.</p>
-<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">Version</th><th scope=\"col\">Published</th><th scope=\"col\">By</th><th scope=\"col\">License</th><th scope=\"col\">Size</th><th scope=\"col\">Requires</th><th scope=\"col\">Docs</th><th scope=\"col\">Commit</th><th scope=\"col\">Tree hash</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>
+<p class=\"t-ui muted\">Newest first. Published is when the version's line was added to the index (UTC); size is the package as <code class=\"ic\">nabi publish</code> packed it{if counted { "; downloads are of its source archive, all time (hover for the last 90 days)" } else { "" }}. A yanked version stays in the index for the projects that pinned it; new resolves skip it.</p>
+<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">Version</th><th scope=\"col\">Published</th><th scope=\"col\">By</th><th scope=\"col\">License</th><th scope=\"col\">Size</th>{if counted { "<th scope=\"col\">Downloads</th>" } else { "" }}<th scope=\"col\">Requires</th><th scope=\"col\">Docs</th><th scope=\"col\">Commit</th><th scope=\"col\">Tree hash</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>
 ";
     package_frame(site, s, "versions", body)
 }
@@ -1134,6 +1413,19 @@ fn searching() {
 }
 
 #[test]
+fn typos() {
+    let rows = [row("json", "JSON values", List::new(), 1i64), row("linalg", "Dense matrices", ["linear-algebra"], 2i64), row("nabi-syntax", "Highlighting", List::new(), 3i64), row("geom", "2D shapes", ["geometry"], 4i64)];
+    let fix = |q: str| corrected(rows, q) ?? "-";
+    assert(fix("jsn") == "json" && fix("lnalg") == "linalg" && fix("Jsno") == "json", fix("jsn"));
+    assert(fix("sytnax") == "syntax" && fix("geometyr") == "geometry" && fix("linera") == "linear", fix("sytnax"));
+    assert(fix("json") == "-" && fix("shapes") == "-" && fix("zzzzzz") == "-" && fix("jq") == "-", "nothing to correct");
+    assert(fix("jsn official:yes") == "json official:yes" && fix("dense lnalg") == "dense linalg", fix("dense lnalg"));
+    let (title, body) = list_page(rows, "lnalg", "");
+    assert(title == "Search: lnalg" && body.contains("No packages match <q>lnalg</q>. Showing results for <a class=\"fixed\" href=\"/packages?q=linalg\"><q>linalg</q></a>: 1 package") && body.contains("<b class=\"nm\"><mark>linalg</mark></b>"), body);
+    assert(list_page(rows, "zzzzzz", "").1.contains("No packages match <q>zzzzzz</q>. Try"), "no correction");
+}
+
+#[test]
 fn near_names() {
     let names = ["json", "json5", "toml", "http", "markdown"];
     assert(closest(names, "jsno").join(",") == "json,json5", closest(names, "jsno").join(","));
@@ -1174,4 +1466,40 @@ fn people() {
     let menu = signed_in(page, "a<b", 5i64, "c\"1");
     assert(!menu.contains("href=\"/login\"") && menu.contains("<details class=\"user\">") && menu.contains("a&lt;b") && menu.contains("value=\"c&quot;1\"") && menu.contains("action=\"/logout\"") && menu.contains("/u/5?s=40&v=4"), menu);
     assert(signed_in("<p>no header</p>", "a", 5i64, "c") == "<p>no header</p>", "nothing to swap");
+}
+
+#[test]
+fn browse_pages() {
+    assert(slug("Linear Algebra") == "linear-algebra" && slug("--c++--") == "c" && slug("2d") == "2d" && slug("한국어") == "" && slug("a__b") == "a-b", slug("--c++--"));
+    assert(topic_href(true, "Science") == "/categories/science" && topic_href(false, "한국어") == "/packages?q=%ED%95%9C%EA%B5%AD%EC%96%B4", topic_href(false, "한국어"));
+    assert(category_label("command-line-utilities") == "Command line utilities", category_label("command-line-utilities"));
+    let mk = |name: str, cats: List<str>, kws: List<str>, official: bool| {
+        let m = packages::no_meta();
+        m.categories = cats;
+        m.keywords = kws;
+        let v = Version { version: "1.0.0", deps: List::new(), url: "", rev: "", tree: "", yanked: false, features: List::new() };
+        Package { name: name, file: "", versions: [v], latest: v, time: 0i64, date: "", readme: "", desc: "", rdeps: List::new(), facts: none, api: List::new(), api_none: "", import: "", meta: m, official: official }
+    };
+    let all = [mk("b", ["science"], ["Math", "math"], false), mk("a", ["Science", "parsing"], List::new(), false), mk("c", ["science"], ["한국어"], true)];
+    let ts = topics(all, true);
+    assert(ts.len() == 2 && ts[1].slug == "science" && ts[1].label == "Science" && ts[1].packages.len() == 3 && ts[1].packages[0].name == "c" && ts[1].packages[1].name == "a", "categories");
+    let ks = topics(all, false);
+    assert(ks.len() == 1 && ks[0].slug == "math" && ks[0].packages.len() == 1, "keywords: once per package, none without a slug");
+    let (title, body) = topics_page(ts, true);
+    assert(title == "Categories" && body.contains("<a href=\"/categories/science\">Science</a><span class=\"ct\">3</span>") && body.contains("2 categories"), body);
+    let (tt, _about, tb) = topic_page(ts[1], true);
+    assert(tt == "Category: Science" && tb.contains("3 packages") && tb.contains("href=\"/packages/c\""), tb);
+}
+
+#[test]
+fn badges() {
+    let v = Version { version: "1.2.0", deps: List::new(), url: "", rev: "", tree: "", yanked: false, features: List::new() };
+    let s = Package { name: "json", file: "", versions: [v], latest: v, time: 0i64, date: "", readme: "", desc: "", rdeps: List::new(), facts: none, api: List::new(), api_none: "", import: "", meta: packages::no_meta() };
+    let b = badge(s);
+    assert(b.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"") && b.contains("role=\"img\" aria-label=\"json: v1.2.0 on packages.nabi-lang.org\"><title>json: v1.2.0 on packages.nabi-lang.org</title>") && b.contains("fill=\"#007ec6\"") && b.contains(">v1.2.0</text>"), b);
+    s.latest.version = "2.0.0-rc.1";
+    assert(badge(s).contains("fill=\"#fe7d37\""), "pre-release");
+    s.latest.yanked = true;
+    assert(badge(s).contains(">yanked</text>") && badge(s).contains("fill=\"#9f9f9f\""), "yanked");
+    assert(text_px("v1.2.0") > text_px("v1") && text_px("mmm") > text_px("iii"), "widths");
 }

@@ -1,7 +1,10 @@
 // The JSON GitHub answers with (OAuth, /user, /repos, OIDC discovery,
 // JWKS, OIDC token claims): members of an object and elements of an
-// array, as text. Not a validating parser. `quote` writes a string, for
-// the requests to Amazon SES.
+// array, as text. Not a validating parser. And the JSON the public API
+// answers with when asked: a NABION value written as JSON (write);
+// `quote` also writes the requests to Amazon SES.
+
+use std::nabion::Value;
 
 fn chars(s: str) -> List<char> {
     let cs: List<char> = List::new();
@@ -142,32 +145,80 @@ pub fn items(s: str) -> List<str> {
     out
 }
 
-/// `s` as a JSON string, quotes included.
+/// `s` as a JSON string: quotes, backslashes and control characters
+/// escaped, nothing lost.
 pub fn quote(s: str) -> str {
-    let digits = "0123456789abcdef";
-    let b = StrBuf::new();
-    b.push('"');
+    let out = StrBuf::new();
+    out.push('"');
     for c in s.chars() {
-        let n = c as u32;
-        if c == '"' {
-            b.push_str("\\\"");
-        } else if c == '\\' {
-            b.push_str("\\\\");
-        } else if c == '\n' {
-            b.push_str("\\n");
-        } else if c == '\r' {
-            b.push_str("\\r");
-        } else if c == '\t' {
-            b.push_str("\\t");
-        } else if n < 0x20u32 || n == 0x2028u32 || n == 0x2029u32 {
-            b.push_str("\\u");
-            for k in [12u32, 8u32, 4u32, 0u32] { b.push(digits.chars().nth(((n >> k) & 15u32) as usize) ?? '0'); }
-        } else {
-            b.push(c);
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            x => {
+                let u = x as u32;
+                if u < 0x20u32 || u == 0x2028u32 || u == 0x2029u32 {
+                    let h = "0123456789abcdef";
+                    out.push_str("\\u");
+                    for sh in [12u32, 8u32, 4u32, 0u32] {
+                        let k = ((u >> sh) & 15u32) as usize;
+                        out.push_str(h[k:k + 1]);
+                    }
+                } else {
+                    out.push(x);
+                }
+            },
         }
     }
-    b.push('"');
-    b.to_str()
+    out.push('"');
+    out.to_str()
+}
+
+/// `v` as JSON on one line. A struct is an object (its name dropped), a
+/// tuple an array, `none` null, a char a string; a dict's keys that are
+/// not strings are written as NABION. A variant without data is its
+/// path as a string, one with data an object of one member, the path,
+/// holding its fields (or its one value, or its values as an array).
+pub fn write(v: Value) -> str {
+    match v {
+        Value::None => "null",
+        Value::Bool(b) => if b { "true" } else { "false" },
+        Value::Int(i) => f"{i}",
+        Value::Float(x) => f"{x}",
+        Value::Char(c) => quote(f"{c}"),
+        Value::Str(s) => quote(s),
+        Value::List(xs) => array(xs),
+        Value::Tuple(xs) => array(xs),
+        Value::Dict(d) => {
+            let parts: List<str> = List::new();
+            for (k, x) in d.iter() {
+                let key = if let Value::Str(t) = k { t } else { (try? std::nabion::to_str_flat(k)) ?? "" };
+                parts.push(quote(key) + ":" + write(x));
+            }
+            "{" + parts.join(",") + "}"
+        },
+        Value::Struct { name: _, fields } => object(fields),
+        Value::Variant { path, args, named } => {
+            if args.is_empty() && named.is_empty() { return quote(path); }
+            let inner = if !named.is_empty() { object(named) } else if args.len() == 1 { write(args[0]) } else { array(args) };
+            "{" + quote(path) + ":" + inner + "}"
+        },
+        _ => "null",
+    }
+}
+
+fn array(xs: List<Value>) -> str {
+    let parts: List<str> = List::new();
+    for x in xs { parts.push(write(x)); }
+    "[" + parts.join(",") + "]"
+}
+
+fn object(fields: Dict<str, Value>) -> str {
+    let parts: List<str> = List::new();
+    for (k, x) in fields.iter() { parts.push(quote(k) + ":" + write(x)); }
+    "{" + parts.join(",") + "}"
 }
 
 #[cfg(test)]
@@ -190,4 +241,12 @@ fn github_json() {
     let q = quote("a\"b\\c\nd\u{1}é");
     expect(q == "\"a\\\"b\\\\c\\nd\\u0001é\"", q);
     expect(fields(f"{{\"k\": {quote("x\"\n\ty")}}}")["k"] == "x\"\n\ty", "round trip");
+}
+
+#[test]
+fn writing() {
+    let v = try std::nabion::parse("Package { name: \"a\\\"b\", n: 3, x: 1.5, ok: true, gone: none, vs: [Version { v: \"1\" }], t: (1, 'c'), d: { \"k\": 1 }, s: Dep::path(\"../x\"), u: Kind::Fn, w: Dep::git(\"u\", rev: \"r\") }") catch e { panic(f"{e}"); };
+    let j = write(v);
+    expect(j == "{\"name\":\"a\\\"b\",\"n\":3,\"x\":1.5,\"ok\":true,\"gone\":null,\"vs\":[{\"v\":\"1\"}],\"t\":[1,\"c\"],\"d\":{\"k\":1},\"s\":{\"Dep::path\":\"../x\"},\"u\":\"Kind::Fn\",\"w\":{\"Dep::git\":{\"rev\":\"r\"}}}", j);
+    expect(quote("tab\there\u{1}\u{2028}") == "\"tab\\there\\u0001\\u2028\"", quote("tab\there\u{1}"));
 }

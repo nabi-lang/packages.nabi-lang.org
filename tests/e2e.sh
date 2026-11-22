@@ -616,15 +616,51 @@ ok "yank"
 req GET /api/v1/packages/geom
 expect_code 200 "package api"
 expect_body 'Package { name: "geom", native: false, owners: \[{ id: 1001, login: "alice" }\]' "package api owners"
-expect_body 'Version { version: "0.1.0", yanked: false, yank_message: none, removed: none, deps: \[\], meta: { description: "Shapes", license: "MIT", authors: \["Ann <ann@example.org>"\], keywords: \["geometry"\], categories: \["mathematics"\], metadata: { docs: { all: true } } }, has_readme: false, archive: Archive { sha256: "[0-9a-f]\{64\}", size: [0-9]*, url: "https://packages.test/api/v1/packages/geom/0.1.0/download" }, downloads: 0, published_by: Actor { id: 1001, login: "alice", at: [0-9]*' "package api version"
+expect_body 'Version { version: "0.1.0", yanked: false, yank_message: none, removed: none, deps: \[\], meta: { description: "Shapes", license: "MIT", authors: \["Ann <ann@example.org>"\], keywords: \["geometry"\], categories: \["mathematics"\], metadata: { docs: { all: true } } }, has_readme: false, archive: Archive { sha256: "[0-9a-f]\{64\}", size: [0-9]*, url: "https://packages.test/api/v1/packages/geom/0.1.0/download" }, downloads: 0, recent_downloads: 0, published_by: Actor { id: 1001, login: "alice", at: [0-9]*' "package api version"
 expect_body 'Version { version: "0.1.2", yanked: false, yank_message: none, removed: none, deps: \[{ name: "shapes", req: "^0.1", kind: "normal", package: "ge-om", target: "cfg(unix)" }\], meta: { description: "Shapes", categories: \["mathematics"\], has_lib: true, bin_names: \["geom-cli"\], size: 4096, future_key: { a: 1 } }, has_readme: true, archive: Archive {' "package api new fields"
 expect_body 'yanked_by: Actor { id: 1001, login: "alice", at: [0-9]* }, unyanked_by: Actor { id: 1001, login: "alice"' "package api yank record"
 req GET /api/v1/packages/geom/0.1.2/readme
 expect_code 200 "readme api"
 [ "$(header content-type)" = "text/markdown; charset=utf-8" ] || fail "readme type: $(header content-type)"
 [ "$(cat "$T/b")" = "$(printf '# geom\n\nShapes, **fast**.')" ] || fail "readme text: $(cat "$T/b")"
+req GET /api/v1/packages/geom/0.1.2/readme -H 'Accept: application/json'
+expect_code 200 "readme json"
+[ "$(header content-type)" = "application/json" ] || fail "readme json type: $(header content-type)"
+expect_body '^{"name":"geom","version":"0.1.2","readme":"# geom\\n\\nShapes, \*\*fast\*\*.\\n"}$' "readme json body"
 req GET /api/v1/packages/geom/0.1.0/readme
 expect_code 404 "no readme"
+# JSON on request, NABION by default; any origin may read.
+req GET /api/v1/packages/geom -H 'Accept: application/json'
+expect_code 200 "package json"
+[ "$(header content-type)" = "application/json" ] || fail "package json type: $(header content-type)"
+expect_body '^{"name":"geom","native":false,"owners":\[{"id":1001,"login":"alice"}\],.*"versions":\[{"version":"0.1.0","yanked":false,"yank_message":null,' "package json body"
+[ "$(header access-control-allow-origin)" = "*" ] || fail "cors on a public read"
+header vary | grep -q 'Accept' || fail "vary: $(header vary)"
+req GET "/api/v1/packages/geom?format=json" -H 'Accept: application/nabion'
+expect_body '^{"name":"geom"' "format=json wins"
+req GET /api/v1/packages/geom -H 'Accept: text/html,*/*;q=0.8'
+expect_body '^Package { name: "geom"' "nabion by default"
+req GET "/api/v1/packages/geom?format=xml"
+expect_code 400 "bad format"
+expect_body '`format` is `json` or `nabion`' "bad format says what to send"
+req GET /api/v1/packages/nope -H 'Accept: application/json'
+expect_code 404 "json error"
+expect_body '^{"message":"package `nope` is not in the index"}$' "json error body"
+[ "$(header access-control-allow-origin)" = "*" ] || fail "cors on a public error"
+req GET "/api/v1/docs?format=json"
+expect_body '^\[{"name":' "docs index json"
+req GET /api/v1/me "${auth[@]}"
+[ -z "$(header access-control-allow-origin)" ] || fail "cors on an authenticated read"
+req POST /api/v1/yank "${auth[@]}" --data 'x'
+[ -z "$(header access-control-allow-origin)" ] || fail "cors on a write"
+req GET "/api/health?format=json"
+expect_body '^{"status":"ok","nabi":"[^"]*","packages":[0-9]*}$' "health json"
+req GET /api/v1
+expect_code 301 "api reference redirect"
+[ "$(header location)" = "/api" ] || fail "api redirect: $(header location)"
+req GET /api
+expect_code 200 "api reference"
+expect_body '<h1 class="t-h1">Registry API</h1>' "api reference title"
 req GET /api/v1/packages/geom/0.1.2/x
 expect_code 404 "unknown sub-route"
 # Source archives: the published commit's tree, kept at publish.
@@ -633,8 +669,16 @@ expect_code 200 "archive download"
 [ "$(header content-type)" = "application/gzip" ] || fail "archive type: $(header content-type)"
 tar -tzf "$T/b" | grep -qx 'geom-0.1.0/src/lib.nabi' || fail "archive paths: $(tar -tzf "$T/b" | head -3)"
 [ "$(shasum -a 256 "$T/b" | cut -d' ' -f1)" = "$(grep -o 'archive: "[0-9a-f]\{64\}"' "$T/data/db.nabion" | head -1 | cut -d'"' -f2)" ] || fail "archive digest"
+# Downloads: a GET sent whole counts; a HEAD, a 304 and a 404 do not.
+etag=$(header etag)
+code=$(curl -s -I -o /dev/null -w '%{http_code}' "$base/api/v1/packages/geom/0.1.0/download")
+[ "$code" = 200 ] || fail "HEAD download: $code"
+req GET /api/v1/packages/geom/0.1.0/download -H "If-None-Match: $etag"
+expect_code 304 "download revalidated"
 req GET /api/v1/packages/geom/9.9.9/download
 expect_code 404 "no archive"
+req GET /api/v1/packages/geom
+expect_body 'url: "https://packages.test/api/v1/packages/geom/0.1.0/download" }, downloads: 1, recent_downloads: 1, published_by' "one download counted"
 req GET /api/v1/native/zlib
 expect_code 200 "native api"
 expect_body 'meta: { license: "Zlib" }' "native api meta"
@@ -779,8 +823,8 @@ expect_code 200 "trusted yank"
 req POST /api/v1/yank "${auth[@]}" --data-binary 'Yank { name: "geom", version: "0.0.9", undo: true }'
 expect_code 200 "trusted unyank"
 req GET /api/v1/packages/geom
-expect_body 'version: "0.0.9", yanked: false, yank_message: none, removed: none, deps: \[\], meta: { description: "Shapes" }, has_readme: false, archive: Archive { sha256: "[0-9a-f]*", size: [0-9]*, url: "https://packages.test/api/v1/packages/geom/0.0.9/download" }, downloads: 0, published_by: Actor { id: 0, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom", workflow: "publish.yml", ref: "refs/tags/v1", run_id: "777", run_attempt: "1", owner_id: 4242 } }' "trusted publisher recorded"
-expect_body 'yanked_by: Actor { id: 0, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom"' "trusted yank recorded"
+expect_body 'version: "0.0.9", yanked: false, yank_message: none, removed: none, deps: \[\], meta: { description: "Shapes" }, has_readme: false, archive: Archive { sha256: "[0-9a-f]*", size: [0-9]*, url: "https://packages.test/api/v1/packages/geom/0.0.9/download" }, downloads: 0, recent_downloads: 0, published_by: Actor { id: 4242, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom", workflow: "publish.yml", ref: "refs/tags/v1", run_id: "777", run_attempt: "1", owner_id: 4242 } }' "trusted publisher recorded"
+expect_body 'yanked_by: Actor { id: 4242, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom"' "trusted yank recorded"
 # The owners' activity log on the account page: who did what to their
 # packages, a trusted publish by its workflow run.
 req GET /me -H "Cookie: __Host-pkg_session=$sess"
@@ -812,7 +856,7 @@ expect_code 200 "fill in metadata"
 expect_body 'seeded 0.2.0 was already in the index from this tree; its missing metadata is filled in' "fill in warning"
 [ "$(git -C "$T/remote.git" rev-parse HEAD)" = "$before" ] || fail "fill in committed"
 req GET /api/v1/packages/seeded
-expect_body 'meta: { description: "Seeded", license: "MIT" }, has_readme: true, archive: Archive { sha256: "[0-9a-f]*", size: [0-9]*, url: "https://packages.test/api/v1/packages/seeded/0.2.0/download" }, downloads: 0, published_by: Actor' "filled in metadata"
+expect_body 'meta: { description: "Seeded", license: "MIT" }, has_readme: true, archive: Archive { sha256: "[0-9a-f]*", size: [0-9]*, url: "https://packages.test/api/v1/packages/seeded/0.2.0/download" }, downloads: 0, recent_downloads: 0, published_by: Actor' "filled in metadata"
 echo '// changed' >> "$T/src/seeded/src/lib.nabi"
 git -C "$T/src/seeded" -c user.name=t -c user.email=t@t commit -q -am change
 srev2=$(git -C "$T/src/seeded" rev-parse HEAD)
@@ -866,11 +910,12 @@ for _ in $(seq 50); do
     sleep 0.2
 done
 expect_body '<td class="by"><span class="via" title="acme via GitHub Actions (acme/geom, publish.yml)"><a class="who" href="https://github.com/acme"><img class="av" src="https://avatars.githubusercontent.com/u/4242?s=32&v=4" width="16" height="16" alt="" loading="lazy" decoding="async"><span>acme</span></a></span></td>' "trusted publisher on the versions page"
-expect_body '<td>4.0 KiB</td><td>nabi 0.2.0 or a later 0.2.x</td>' "size and nabi_version on the versions page"
+expect_body '<td>4.0 KiB</td><td title="[0-9,]* in the last 90 days">[0-9,]*</td><td>nabi 0.2.0 or a later 0.2.x</td>' "size, downloads and nabi_version on the versions page"
+expect_body '<th scope="col">Downloads</th>' "downloads column"
 req GET /packages/geom/0.0.9
 expect_body '<dt>Published</dt><dd><time datetime="[0-9T:Z-]*">[0-9-]* [0-9:]* UTC</time> by <a class="who" href="https://github.com/acme"><img class="av" src="https://avatars.githubusercontent.com/u/4242?s=32&v=4" width="16" height="16" alt="" loading="lazy" decoding="async"><span>acme</span></a> via GitHub Actions (<a href="https://github.com/acme/geom">acme/geom</a>, <a href="https://github.com/acme/geom/actions/runs/777"' "trusted publisher on the version page"
 req GET /packages/geom
-expect_body '<dt>Category</dt><dd>mathematics</dd>' "categories on the page"
+expect_body '<dt>Category</dt><dd class="kws"><a href="/categories/mathematics">mathematics</a></dd>' "categories on the page"
 expect_body '<p>Shapes, <strong>fast</strong>.</p>' "published README rendered"
 req GET /packages/geom/dependencies
 expect_body 'href="/packages/ge-om">ge-om</a> <span class="muted">as</span> <span class="mono">shapes</span> <span class="tag" title="only for this target">cfg(unix)</span>' "rename and target on the page"
@@ -890,6 +935,31 @@ expect_body "<title>Search: geo - " "search title"
 expect_body '<option value="name" selected>' "search sort"
 req GET "/packages?q=nothing-like-it"
 expect_body "No packages match" "no results"
+req GET "/packages?q=gemo"
+expect_code 200 "typo search"
+expect_body 'Showing results for <a class="fixed" href="/packages?q=geom"><q>geom</q></a>' "typo corrected"
+expect_body '<b class="nm"><mark>geom</mark></b>' "typo results"
+req GET /packages/geom/badge.svg
+expect_code 200 "badge"
+[ "$(header content-type)" = "image/svg+xml" ] || fail "badge type: $(header content-type)"
+[ "$(header cache-control)" = "public, max-age=0, s-maxage=86400, stale-if-error=86400" ] || fail "badge cache: $(header cache-control)"
+expect_body '<title>geom: v[0-9.]* on packages.nabi-lang.org</title>' "badge title"
+req GET /packages/geom
+expect_body '<dt>Badge</dt><dd class="badge"><img src="/packages/geom/badge.svg"' "badge on the page"
+req GET /categories
+expect_code 200 "categories"
+expect_body '<a href="/categories/mathematics">Mathematics</a><span class="ct">' "category count"
+req GET /categories/mathematics
+expect_code 200 "category page"
+expect_body 'href="/packages/geom"' "category lists the package"
+req GET /categories/mathematics/
+expect_code 301 "category trailing slash"
+req GET /keywords
+expect_code 200 "keywords"
+expect_body '<h1 class="t-h2">Keywords</h1>' "keywords title"
+req GET /packages/geom/0.1.0
+expect_body '<a href="/packages?q=geometry">geometry</a>' "an old version's keyword searches"
+grep -q '<loc>https://packages.nabi-lang.org/categories/mathematics</loc>' "$T/site/public/sitemap.xml" || fail "category in the sitemap"
 # An executable alone: no Docs tab, `nabi install` in the box, a bin tag.
 req GET /packages/app
 expect_code 200 "executable page"
@@ -1010,7 +1080,8 @@ publish "$uline" '{ description: "Units of measure" }'
 expect_code 200 "publish from the organization"
 [ "$(git -C "$T/remote.git" show HEAD:un/it/units | sent)" = "${uline% \}}, official: true }" ] || fail "official line: $(git -C "$T/remote.git" show HEAD:un/it/units)"
 req GET /api/v1/packages/units
-expect_body 'unyanked_by: none, official: true }\], official: true }' "official in the api"
+expect_body 'unyanked_by: none, official: true }\], official: true, downloads: 0, recent_downloads: 0 }' "official in the api"
+expect_body 'published_by: Actor { id: 5151, login: "nabi-lang"' "an official version is the organization's"
 sed -n '/name: "units",/,/^        Release {/p' "$T/data/db.nabion" | grep -q 'official: true' || fail "official release record"
 # An admin's publish is not the organization's.
 auth=("${aauth[@]}")
@@ -1019,7 +1090,7 @@ expect_code 200 "admin publishes units"
 git -C "$T/remote.git" show HEAD:un/it/units | tail -1 | grep -q official && fail "a version from outside the organization marked official"
 git -C "$T/remote.git" show HEAD:un/it/units | head -1 | grep -q ', official: true }$' || fail "earlier version changed"
 req GET /api/v1/packages/units
-expect_body 'official: false }\], official: false }' "the latest version decides"
+expect_body 'official: false }\], official: false, downloads: 0, recent_downloads: 0 }' "the latest version decides"
 trusted_token nabi-lang/units 5151
 publish "$(entry units 0.1.2)"
 expect_code 200 "organization publishes again"

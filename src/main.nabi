@@ -271,6 +271,11 @@ fn main() throws {
             if x.version.is_empty() { removed.insert(x.name); }
         }
         for r in server::store::fill_owner_ids(db) { data.releases.insert(r.name + "@" + r.version, r); }
+        let counts = try server::downloads::read(data_dir) catch e {
+            eprintln(f"downloads: {e}; pages show none");
+            List::new()
+        };
+        data.downloads = server::downloads::sums(counts, server::downloads::today());
         for a in db.accounts {
             if !a.name.is_empty() { data.names.insert(a.id, a.name); }
         }
@@ -313,6 +318,9 @@ fn main() throws {
     guide.html = web::chrome::align_classes(guide.html);
     files.insert("index.html", layout::page(site, "index.html", site.title, layout::landing(all)));
     files.insert("publishing.html", layout::page_desc(site, "publishing.html", "Using and publishing packages", "How to add a package as a dependency, and how a version gets into the index.", layout::guide(guide)));
+    let api = markdown::render(try fs::read_to_str("pages/api.md"), layout::md(|h| h));
+    api.html = web::chrome::align_classes(api.html);
+    files.insert("api.html", layout::page_desc(site, "api.html", "Registry API", "The public API of the Nabi package registry: package info, READMEs, source archives and docs, in NABION or JSON.", layout::guide(api, "Registry API")));
     files.insert("404.html", layout::page(site, "404.html", "Not found", layout::not_found()));
     // The policies, in English at /<name> and Korean at /ko/<name>.
     let policies: List<(str, str, str, str)> = [
@@ -357,6 +365,19 @@ fn main() throws {
         }
     }
 
+    // Browsing by category and keyword.
+    for cats in [true, false] {
+        let ts = layout::topics(all, cats);
+        let index_out = if cats { "categories/index.html" } else { "keywords/index.html" };
+        let (title, body) = layout::topics_page(ts, cats);
+        files.insert(index_out, layout::page_desc(site, index_out, title, if cats { "Nabi packages by category." } else { "Nabi packages by keyword." }, body));
+        for t in ts {
+            let out = layout::topic_out(cats, t.slug);
+            let (tt, about, tb) = layout::topic_page(t, cats);
+            files.insert(out, layout::page_desc(site, out, tt, about, tb));
+        }
+    }
+
     // Search index: every package, its latest version, description and keywords.
     let sx = StrBuf::new();
     sx.push('[');
@@ -385,9 +406,16 @@ fn main() throws {
     try write(out_root, "sitemap.xml", map.to_str());
     try write(out_root, "robots.txt", f"User-agent: *\nDisallow: /me\nSitemap: {site.base_url}/sitemap.xml\n");
     try write(out_root, "search-index.json", sx.to_str());
+    for s in all {
+        if s.library { continue; }
+        try write(out_root, layout::badge_out(s.name), layout::badge(s));
+    }
     try write(out_root, ".packages.nabion", (try nabion::to_str(rows)) + "\n");
     let statics: Set<str> = Set::new();
     statics.insert("search-index.json");
+    for s in all {
+        if !s.library { statics.insert(layout::badge_out(s.name)); }
+    }
     // Served by `serve`, not files.
     statics.insert("login");
     statics.insert("me");

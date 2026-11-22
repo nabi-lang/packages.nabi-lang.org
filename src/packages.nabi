@@ -63,6 +63,10 @@ pub struct Version {
     pub date: str = "";
     /// Its line has `official: true`.
     pub official: bool = false;
+    /// Its archive's downloads, all and in the last downloads::RECENT
+    /// days; -1: not counted (a build without the server's data).
+    pub downloads: i64 = -1i64;
+    pub recent: i64 = 0i64;
 }
 
 /// What a commit's tree holds, counted at build time.
@@ -163,6 +167,8 @@ pub struct Data {
     pub owners: Dict<str, List<meta::Person>>;
     /// GitHub display names of accounts, by id.
     pub names: Dict<i64, str> = Dict::new();
+    /// Downloads by `<key>@<version>`: all and recent; none: not counted.
+    pub downloads: Dict<str, (i64, i64)> | none = none;
 }
 
 pub fn no_data() -> Data { Data { releases: Dict::new(), owners: Dict::new() } }
@@ -994,6 +1000,16 @@ pub fn load(dir: str, r: Readmes, data: Data) -> Index {
     for k in by_name.keys() { names.push(k); }
     names.sort();
 
+    if let dl: Dict<str, (i64, i64)> = data.downloads {
+        for k in names {
+            let vs = by_name[k];
+            for i in 0..vs.len() {
+                let (t, r) = dl.get(key_of(k) + "@" + vs[i].version) ?? (0i64, 0i64);
+                vs[i].downloads = t;
+                vs[i].recent = r;
+            }
+        }
+    }
     for k in names {
         let vs = by_name[k];
         for i in 0..vs.len() {

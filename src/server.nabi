@@ -22,6 +22,7 @@ pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod aws;
+pub mod downloads;
 pub mod github;
 pub mod limit;
 pub mod mail;
@@ -36,6 +37,7 @@ use pkg::index::ApiError;
 use pkg::layout;
 use pkg::secret;
 use pkg::server::auth::{Viewer, signed_in, viewer};
+use pkg::server::downloads;
 use pkg::server::routes::{read_page, route};
 use pkg::server::store::{load_db, save_db};
 use pkg::trust;
@@ -242,6 +244,9 @@ pub struct Resp {
     pub body: str;
     /// A static file sent as the body instead; `""`: none.
     pub file: str;
+    /// `<key>@<version>` of a source archive: counted as a download when
+    /// it is sent whole (a GET answered 200, not a HEAD or a 304).
+    pub count: str = "";
 }
 
 // Every page, generated or from public/: Cloudflare injects its Web
@@ -345,6 +350,10 @@ fn handle(s: TcpStream, cfg: Cfg, site: Site) {
         sent = respond(s, r, resp.status, resp.headers, resp.body.as_bytes().to_list());
     }
     try s.close() catch _ {};
+    if !resp.count.is_empty() && sent == 200 && r.method == "GET" {
+        let (k, v) = resp.count.split_once("@") ?? (resp.count, "");
+        downloads::count(k, v);
+    }
     // The path only: queries carry OAuth codes.
     eprintln(f"{r.method} {r.path} {sent} {t0.elapsed().as_ms()}ms");
 }
@@ -446,6 +455,7 @@ pub fn serve(site: Site) throws {
     let seeds = if cfg.trusted.is_empty() { List::<TrustedPublisher>::new() } else { try trust::read_seeds(cfg.trusted) };
     db.trusted = trust::merge_seeds(db.trusted, seeds);
     try save_db(cfg, db);
+    downloads::start(cfg.data);
     eprintln(f"trusted publishing: OIDC tokens from {cfg.issuer} for audience {cfg.audience}; {seeds.len()} publishers from PACKAGES_TRUSTED");
     if pkg::server::mail::on(cfg) {
         eprintln(f"mail: notices from {cfg.mail_from} through Amazon SES in {cfg.ses_region}");

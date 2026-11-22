@@ -1,0 +1,12 @@
+// Sample download counts for `--demo` (server::downloads): day 0 is
+// every day before the last 90; other days are days since 1970-01-01
+// (20770 is 2026-11-13), so they leave the last 90 days in time.
+[
+    Count { name: "geom", version: "0.1.0", day: 0, n: 1180 },
+    Count { name: "geom", version: "0.2.0", day: 0, n: 2304 },
+    Count { name: "geom", version: "0.3.1", day: 20760, n: 41 },
+    Count { name: "geom", version: "0.3.1", day: 20770, n: 57 },
+    Count { name: "json", version: "0.4.0", day: 0, n: 15210 },
+    Count { name: "json", version: "0.5.0", day: 20765, n: 312 },
+    Count { name: "linalg", version: "0.1.0", day: 20769, n: 96 },
+]

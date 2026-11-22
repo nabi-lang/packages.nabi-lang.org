@@ -59,6 +59,7 @@ button{font:inherit}
 .why{font-size:12px;line-height:16px;color:var(--ink-3);white-space:nowrap}
 .results .empty,.results .all{padding:8px 10px;font-size:13px;line-height:18px;color:var(--ink-2)}
 .results .all{border-top:1px solid var(--line);margin-top:4px}
+.results .fixed{padding:6px 10px 4px;font-size:12px;line-height:16px;color:var(--ink-3)}
 mark{background:none;color:var(--ink);font-weight:600;text-decoration:underline;text-decoration-color:var(--acc);text-underline-offset:3px}
 
 /* package rows */
@@ -136,6 +137,16 @@ pre.cmd{border:1px solid var(--line);border-radius:var(--r);background:var(--cod
 .list-form .field:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
 .list-form label.t-ui{color:var(--ink-2)}
 @media (max-width:767px){.list-form .field{font-size:16px}}
+.list-page .crumbs{display:block;padding-bottom:12px}
+.topic-switch{display:flex;flex-wrap:wrap;gap:4px 18px;padding-bottom:20px}
+.topic-switch a{color:var(--ink-2)}
+.topic-switch a[aria-current]{color:var(--ink);font-weight:600}
+.topics{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0 24px;border-top:1px solid var(--line)}
+.topics li{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);min-width:0}
+.topics a{overflow-wrap:anywhere}
+.topics .ct{font-family:var(--mono);font-size:12px;color:var(--ink-3)}
+.topics.compact{grid-template-columns:1fr;font-size:14px}
+.topics.compact li{padding:6px 0}
 
 /* package */
 .package-head{padding-top:36px;display:flex;flex-direction:column;gap:14px}
@@ -207,6 +218,7 @@ html:not(.js) .ipanel+.ipanel{border-top:1px solid var(--line)}
 .vers a.v[aria-current]{font-weight:600}
 .tbl a.v{font-family:var(--mono);color:var(--ink)}
 .kws a{margin-right:8px}
+.kv dd.badge{display:flex;align-items:center;gap:8px}
 .vers .tag{margin-left:0}
 .vers .c{margin-left:auto;font-size:13px;line-height:18px;color:var(--ink-3)}
 .vers>.t-small{color:var(--ink-3)}

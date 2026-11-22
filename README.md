@@ -31,7 +31,7 @@ nabi test                  # unit tests
 tests/e2e.sh              # end-to-end test of serve
 ```
 
-`fixtures/` holds a sample index (`--demo`) with more packages and edge cases than the real one, a sample `db.nabion` (`fixtures/data`), plus READMEs and source trees for some of them, for checking the site without git or network. Each package's latest commit is fetched into `.cache/git`: its README is rendered untrusted (HTML shown as text, non-http(s)/mailto links dropped), its tree is counted for the side panel (files, size, non-blank lines of `.nabi`). Each version's public items are its Docs tab (see Docs). Version dates are the commit dates of the index commits that added each version's line.
+`fixtures/` holds a sample index (`--demo`) with more packages and edge cases than the real one, a sample `db.nabion` and `downloads.nabion` (`fixtures/data`), plus READMEs and source trees for some of them, for checking the site without git or network. Each package's latest commit is fetched into `.cache/git`: its README is rendered untrusted (HTML shown as text, non-http(s)/mailto links dropped), its tree is counted for the side panel (files, size, non-blank lines of `.nabi`). Each version's public items are its Docs tab (see Docs). Version dates are the commit dates of the index commits that added each version's line.
 
 ## Scripts
 
@@ -55,9 +55,17 @@ Serve over HTTP (the search index is loaded with `fetch`). Links are root-relati
 python3 -m http.server -d public 8000
 ```
 
+## Search and browse
+
+`/packages?q=` (served by `serve`, works without JS) and the header's search box (`static/search.tsx`, over `/search-index.json`) match alike: every term must be in the name, the description or a keyword; exact name first, then name prefix, name, keyword, the rest, official packages first among equals. When nothing matches, each term found nowhere is replaced by the nearest name, part of a name (split at `-` / `_`) or keyword within a few edits (1 for 3 to 4 characters, 2 up to 8, 3 beyond; `names::edits`, which counts a swap of two neighbours as one), and the page shows those results under "Showing results for ..": `?q=jsn` shows `json`, `?q=lnalg` shows `linalg`.
+
+`/categories` and `/keywords` list every category and keyword the packages' latest versions name, with how many packages have each; `/categories/<slug>` and `/keywords/<slug>` list those packages, official first, then by name. The slug is the word in lowercase ASCII letters and digits, each run of anything else one `-` (`Linear Algebra` is `/keywords/linear-algebra`); a word with no letter or digit in ASCII has no page and its chip searches for it instead. The side panel's keyword and category chips link these pages; on an old version's page, whose words may have changed since, they search. They are in the sitemap like every page.
+
+Each package has a badge at `/packages/<name>/badge.svg` for its README: a flat, shields-style `nabi | v<latest>` (blue; orange for a pre-release, grey and `yanked` when every version is), with a `<title>` and `aria-label` naming the package and version. It is written with the site, so it changes with each build, and is served like a page (`web::http::FRESH`: checked on every load, kept a day by the CDN). The side panel shows it with its Markdown to copy.
+
 ## Server
 
-`nabi run -- serve` serves `public/` and the API over plain HTTP on `PACKAGES_ADDR` (TLS ends at a reverse proxy). Run it from this directory (reads `site.nabion` and `.env`). At start and after each index commit it rebuilds the site in the background. `GET /api/health` answers `ok`, `nabi <release>` (the toolchain the footer names) and `packages <count>`, one a line, or a 503 `failing` while the package list cannot be read.
+`nabi run -- serve` serves `public/` and the API over plain HTTP on `PACKAGES_ADDR` (TLS ends at a reverse proxy). Run it from this directory (reads `site.nabion` and `.env`). At start and after each index commit it rebuilds the site in the background. `GET /api/health` answers `ok`, `nabi <release>` (the toolchain the footer names) and `packages <count>`, one a line, or a 503 `failing` while the package list cannot be read (`{"status", "nabi", "packages"}` when JSON is asked for, as below).
 
 Settings live in `.env` (copy `.env.example`; process env wins over the file):
 
@@ -68,7 +76,7 @@ Settings live in `.env` (copy `.env.example`; process env wins over the file):
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | The GitHub OAuth app |
 | `PACKAGES_ADMINS` | Comma-separated numeric GitHub user ids (the `id` of `https://api.github.com/users/<login>`) that may create publish tokens, add trusted publishers, publish, yank and moderate. A login is refused: logins change hands, ids do not |
 | `PACKAGES_OPEN_PUBLISHING` | `1` lets every account do what the admins do with their own packages; unset (default), other accounts only log in and their tokens authorize nothing |
-| `PACKAGES_DATA` | Directory of `db.nabion` (accounts, tokens, owners, each version's metadata and publisher), `readme/<name>/<version>.md` (READMEs sent with a publish), `docs/<name>/<version>/` (docs made at publish) and `sources/` |
+| `PACKAGES_DATA` | Directory of `db.nabion` (accounts, tokens, owners, each version's metadata and publisher), `downloads.nabion` (download counts), `readme/<name>/<version>.md` (READMEs sent with a publish), `docs/<name>/<version>/` (docs made at publish) and `sources/` |
 | `PACKAGES_INDEX` | Index checkout the server commits to and pushes from |
 | `PACKAGES_TRUSTED` | Optional bootstrap file of trusted publishers (see Trusted publishing) |
 | `PACKAGES_AUDIENCE` | The `aud` an OIDC token must carry (default: the host of `PACKAGES_URL`) |
@@ -84,14 +92,16 @@ Settings live in `.env` (copy `.env.example`; process env wins over the file):
 
 Login is GitHub OAuth only (`read:user user:email`) and open to anyone: the header always offers it, and an account that may not act only logs in. It uses PKCE (S256): `/login` keeps a code verifier for its `state` in the server's memory for 10 minutes (at most 4096 logins at once) and sends GitHub only its challenge; the callback takes the verifier, once, and sends it with the code, so a stolen code is useless without it. A login cut short by a restart is started again. Unless `PACKAGES_REQUIRE_2FA=0`, the GitHub account must have two-factor authentication on: GitHub's `GET /user` reports `two_factor_authentication` to the user's own token, and a login without it (or where GitHub does not say) is refused before any account or session is stored, with the page linking GitHub's security settings and saying to log in again afterwards. The account keeps GitHub's id, login, display name and avatar address from the last login, and the primary verified email address from `GET /user/emails` (for notices; a login where GitHub does not answer keeps the one on record, and GitHub's noreply address counts as none); pages draw avatars from the id alone (`https://avatars.githubusercontent.com/u/<id>?s=<px>&v=4`). Pages are built logged out; for a request with a live session `serve` swaps the header's login button for an account menu (`<details>`, no script) and sends the page `no-store`. Sessions are a 32-byte cookie (`__Host-pkg_session`: this host only, https, every path) stored as SHA-256, at most 10 per account; a cookie that is not 64 hex digits is ignored before the data file is read. Each session keeps when it logged in, when a request last came with it (written at most once an hour) and a short name of the browser (`Firefox on Linux`; the User-Agent itself is not kept). It ends after 7 days without a request and 30 days after its login at the latest. The account page lists the account's sessions with a Log out button on each and Log out everywhere (`POST /me/sessions/<id>/logout`, `POST /me/sessions/logout-all`); every form carries the session's CSRF token. Publish tokens (`pkg_` + 64 hex) are admin-only until `PACKAGES_OPEN_PUBLISHING` is set, stored as SHA-256 and compared in constant time. Each lasts the days chosen when it is made (90 by default, at most 365) and may be limited to some packages; a limited token moderates nothing, even an admin's. A token also has scopes, ticked on the account page: `publish-update` (new versions of a package that exists) and `yank` (yank and unyank), the defaults; `publish-new` (a package's first version); `owners` (the owners and trusted publishers routes, invitations included); and, for an admin, `admin`, without which an admin's token has no admin powers (moderation, other accounts' packages, reserved names, the new-name cap). A refused call names the scope it lacked and where to make a token with it. Tokens made before scopes may do everything but `admin`, and the account page says so. Trusted publishing tokens may publish (new or not) and yank their packages. The NABION API takes `Authorization: Bearer pkg_..`:
 
+The public reads (`GET` and `HEAD` of `/api/v1/packages/..`, `/api/v1/native/..` and `/api/v1/docs`) answer JSON for `?format=json` or an `Accept` that ranks `application/json` above `application/nabion` (`api::wants_json`), NABION otherwise; the NABION answer is parsed and written as JSON (`json::write`: a struct is an object without its name, `none` is `null`, a variant with data an object keyed by its path), a README is `{ name, version, readme }`, and an archive stays an archive. Any other `format` is a 400. They carry `Access-Control-Allow-Origin: *` and `Vary: Accept`, errors included; routes that take a token and writes carry neither. `/api` is their reference for users (`pages/api.md`); `/api/v1` redirects there. Keep it in step with the routes.
+
 | Route | Purpose |
 |-------|---------|
 | `GET /api/v1/me` | account + publish flag |
 | `POST /api/v1/publish` | `Publish { entry: Package { .. }, meta: { .. } }`: the index entry `nabi publish` prints and the package's metadata; answers `Published { name, version, file, warnings }`. A version already in the index from the same tree that was not published through the API (written by a maintainer with `nabi publish --index-dir`) gets the metadata and README it lacks instead of a 409 |
 | `POST /api/v1/yank` | `Yank { name, version, undo, native, message }`; `message` (at most 512 bytes) is the reason, cleared by an unyank |
-| `GET /api/v1/packages/<name>` | no token: `owners` (accounts), `orgs` (organisations and teams on record), and each `Version { version, yanked, yank_message, deps, meta, has_readme, downloads, published_by, yanked_by, unyanked_by, official }`, and `official` (its latest version's); each actor is `Actor { id, login, at }`, plus `via` for trusted publishing; `deps` is as in the index line |
+| `GET /api/v1/packages/<name>` | no token: `owners` (accounts), `orgs` (organisations and teams on record), and each `Version { version, yanked, yank_message, deps, meta, has_readme, archive, downloads, recent_downloads, published_by, yanked_by, unyanked_by, official }`, then `official` (its latest version's) and the package's `downloads` and `recent_downloads` (every version's); each actor is `Actor { id, login, at }`, plus `via` for trusted publishing, where `id` and `login` are the repository owner's (the nabi-lang organization's for an official version), not the run's; `deps` is as in the index line |
 | `GET /api/v1/packages/<name>/<version>/readme` | no token: the README sent with that version, `text/markdown`; 404 when none was sent |
-| `GET /api/v1/packages/<name>/<version>/download` | no token: the source archive kept at publish (`application/gzip`, every path under `<name>-<version>/`); its SHA-256 and size are the version's `archive` |
+| `GET /api/v1/packages/<name>/<version>/download` | no token: the source archive kept at publish (`application/gzip`, every path under `<name>-<version>/`); its SHA-256 and size are the version's `archive`. Counted as a download (see Downloads) |
 | `GET /api/v1/native/<name>` | the same for a native package (and `/<version>/readme`) |
 | `POST /api/v1/trusted-publishing/token` | no token: `TrustedPublishing { jwt: ".." }` (or `{"jwt": ".."}`), a GitHub Actions OIDC token; answers `TrustedToken { token, expires, packages }` |
 | `GET /api/v1/trusted-publishers` | the trusted publishers of the packages the account owns (admins: all) |
@@ -137,7 +147,11 @@ The job sends its OIDC token to `POST /api/v1/trusted-publishing/token`. The ser
 
 A version is official exactly when a trusted publisher in a repository of the nabi-lang organization publishes it: the OIDC token's `repository_owner_id` is `PACKAGES_OFFICIAL_ORG`. The server then appends `official: true` to its index line and records `official` with the release; a publish that sends `official` itself is refused. A package is official when its latest version is: the pages show an **Official** mark (a word, not a colour alone) on the package, in lists and in the header search, the home page lists them, `official:yes` (or `official:no`) in a search filters on it, and official packages come first among results that match equally well. To make another package official, move its repository into the organization and add the organization's workflow as its trusted publisher; its next version is official, earlier ones keep their line, and its owners stay.
 
-A publish keeps the source: `git archive` of the published commit in `PACKAGES_DATA/archives/<key>/<version>.tar.gz` (at most 64 MiB), its SHA-256 in the version's record and written into the index line after `tree` (`archive`), served at `/download`. `nabi` downloads the archive and checks it against that line, so a version outlives its repository; it fetches the git source only for a version without `archive`. `downloads` stays 0: nothing counts the archive's downloads yet.
+A publish keeps the source: `git archive` of the published commit in `PACKAGES_DATA/archives/<key>/<version>.tar.gz` (at most 64 MiB), its SHA-256 in the version's record and written into the index line after `tree` (`archive`), served at `/download`. `nabi` downloads the archive and checks it against that line, so a version outlives its repository; it fetches the git source only for a version without `archive`.
+
+### Downloads
+
+Each `GET .../<version>/download` answered with the whole archive (a 200, not a HEAD, a 304 or an error) counts one download of that version on that day (UTC), in memory (`src/server/downloads.nabi`). Once a minute, when any changed, the counts are written whole to `PACKAGES_DATA/downloads.nabion` (`Count { name, version, day, n }`, `day` in days since 1970-01-01) in one rename, so a crash loses at most a minute of them; days before the last 90 are folded into one count per version (`day: 0`), so the file grows with the versions, not with time. A file that cannot be read at start is kept as `downloads.nabion.bad` and the counting starts over. The API answers the live counts: each version's `downloads` (all) and `recent_downloads` (the last 90 days, today included), and the package's sums. The pages show the counts of their last build (`--data` reads the file): the side panel every version's on a package page and the version's own on a version page, the Versions table a column; new downloads alone ask for a rebuild at most once an hour.
 
 The side panel's Repository is always the source the commit was fetched from, never the manifest's `repository` (shown apart as "Stated repository" when it differs). It is marked **verified** when GitHub Actions in that very repository published the version (trusted publishing), and **not verified** otherwise: the fetch shows only that the commit is on a branch or tag there. README links carry `rel="nofollow ugc"`, and README images load lazily with no referrer.
 
@@ -189,18 +203,20 @@ Edit `site.nabion` (NABION). Key fields: `title`, `tagline`, `description`, `ind
 | `src/server/limit.nabi` | Rate limits per address, account and token |
 | `src/server/mail.nabi` | Notices by mail: who gets which, the text, the queue and its sending thread, the hourly cap |
 | `src/server/aws.nabi` | Amazon SES v2 SendEmail, SigV4 signing, the instance role's credentials from IMDSv2 |
+| `src/server/downloads.nabi` | Download counts: counted in memory, written once a minute |
 | `src/server/names.nabi` | Reserved names and the look-alike check for new ones |
 | `src/index.nabi`  | API entry and metadata checks, index commits and pushes |
 | `src/meta.nabi`   | Per-version metadata and publisher records kept in `db.nabion` |
 | `src/secret.nabi` | SHA-256, random bytes, constant-time compare |
 | `src/trust.nabi`  | Trusted publishing: OIDC token (JWT) checks, JWKS keys, claim matching, exchanged tokens, the bootstrap file |
-| `src/json.nabi`   | The JSON GitHub answers with |
+| `src/json.nabi`   | The JSON GitHub answers with; NABION values written as JSON for the API |
 | `src/packages.nabi` | Reads the index, semver ordering, dependents, version dates, README and source tree fetching |
 | `src/apidoc.nabi` | Docs tab: public items and `///` docs scanned from a package's sources; the install box's `use` line |
 | `src/docs.nabi`   | Each version's docs: made at publish in a bounded process of its own, kept with the data, their status |
-| `src/layout.nabi` | Page frame, home, package list, publishing guide, package pages and their tabs (Readme, Docs, Versions, Dependencies, Dependents) |
+| `src/layout.nabi` | Page frame, home, package list and search, category and keyword pages, publishing guide, package pages and their tabs (Readme, Docs, Versions, Dependencies, Dependents) |
 | `tests/`         | `e2e.sh` and the fake GitHub it runs (OAuth with PKCE, `/user`, `/user/emails`, `/repos`, an OIDC issuer that signs test tokens, and AWS's IMDSv2 and SES SendEmail) |
 | `pages/publishing.md` | Publishing guide text |
+| `pages/api.md` | The public API's reference, at `/api` |
 | `pages/{terms,privacy,policy}.md`, `pages/ko/` | Terms of use, privacy notice and usage policy (drafts, not yet reviewed), at `/terms`, `/privacy`, `/policy` and in Korean under `/ko/` |
 | `pages/publish.yml` | The trusted publishing workflow for a package's repository |
 | `static/`        | `style.css`, `search.tsx` and its `ui/*.tsx` components, `og.png` |
