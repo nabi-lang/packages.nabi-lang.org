@@ -82,6 +82,46 @@ pub struct Token {
     /// `index::key`s it may publish and yank; empty: every package the
     /// account may.
     pub packages: List<str> = List::new();
+    /// What it may do (SCOPES); empty for a token made before scopes,
+    /// which may do all but moderate (token_scopes).
+    pub scopes: List<str> = List::new();
+}
+
+/// What a token may do, with how the account page and errors say it: a
+/// package's first version, later versions, yanks, owners and trusted
+/// publishers, and moderation (an admin's, unlimited token only).
+pub const SCOPE_NEW: str = "publish-new";
+pub const SCOPE_UPDATE: str = "publish-update";
+pub const SCOPE_YANK: str = "yank";
+pub const SCOPE_OWNERS: str = "owners";
+pub const SCOPE_ADMIN: str = "admin";
+
+pub fn scopes() -> List<(str, str)> {
+    [
+        (SCOPE_UPDATE, "publish new versions of a package"),
+        (SCOPE_NEW, "publish a new package (its first version)"),
+        (SCOPE_YANK, "yank and unyank versions"),
+        (SCOPE_OWNERS, "change owners and trusted publishers"),
+        (SCOPE_ADMIN, "moderate (admins only)"),
+    ]
+}
+
+/// What scope `name` lets a token do; "" for no scope.
+pub fn scope_says(name: str) -> str {
+    for (n, what) in scopes() {
+        if n == name { return what; }
+    }
+    ""
+}
+
+/// A new token's scopes when the form names none.
+pub fn default_scopes() -> List<str> { [SCOPE_UPDATE, SCOPE_YANK] }
+
+/// What token `t` may do. One made before scopes may do everything but
+/// moderate: moderation needs the admin scope given explicitly.
+pub fn token_scopes(t: Token) -> List<str> {
+    if !t.scopes.is_empty() { return t.scopes; }
+    [SCOPE_NEW, SCOPE_UPDATE, SCOPE_YANK, SCOPE_OWNERS]
 }
 
 /// Days a new publish token lasts, at most and by default.
@@ -419,6 +459,10 @@ fn ownership_and_tokens() {
     let back: Db = try nabion::from_str(try! nabion::to_str(db)) catch e { panic(f"{e}"); };
     assert(back.tokens.len() == 1 && back.tokens[0].hash == db.tokens[0].hash, "data file round trip");
     assert(token_at(db, t) == 0usize && token_at(db, "pkg_" + "AB".repeat(32)) is none, "token index");
+    // A token from before scopes: every operation but moderation.
+    assert(token_scopes(db.tokens[0]).join(" ") == "publish-new publish-update yank owners" && back.tokens[0].scopes.is_empty(), "old token scopes");
+    db.tokens[0].scopes = [SCOPE_YANK];
+    assert(token_scopes(db.tokens[0]).join(" ") == "yank" && scope_says(SCOPE_ADMIN) == "moderate (admins only)" && scope_says("x").is_empty(), "scopes");
     assert(is_hex("ab".repeat(32), 64) && !is_hex("ab".repeat(32) + "0", 64) && !is_hex("xy".repeat(32), 64), "hex");
 }
 

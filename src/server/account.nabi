@@ -9,7 +9,7 @@ use pkg::secret;
 use pkg::server::admin::{Audit, audit};
 use pkg::server::limit;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, may_manage, remove_owner, remove_trusted};
-use pkg::server::store::{Account, Db, SESSION_COOKIE, SESSION_IDLE, SESSION_SECS, Session, TOKEN_DAYS, TOKEN_DAYS_MAX, Token, account_of, invites_of, load_db, now_secs, save_db, seen_at, session_end, session_id, session_of};
+use pkg::server::store::{Account, Db, SCOPE_ADMIN, SESSION_COOKIE, SESSION_IDLE, SESSION_SECS, Session, TOKEN_DAYS, TOKEN_DAYS_MAX, Token, account_of, default_scopes, invites_of, load_db, now_secs, save_db, scopes, seen_at, session_end, session_id, session_of};
 use pkg::server::{Cfg, Resp, cookie, is_admin, LOCK, may_act, message, page, redirect};
 use pkg::trust;
 use pkg::trust::TrustedPublisher;
@@ -64,16 +64,28 @@ fn me_page(cfg: Cfg, site: Site, path: str, db: Db, s: Session, fresh: str) -> R
     if mine.is_empty() {
         b.push_str("<p>No tokens yet.</p>\n");
     } else {
-        b.push_str("<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Packages</th><th scope=\"col\">Created</th><th scope=\"col\">Expires</th><th scope=\"col\">Last used</th><th scope=\"col\"><span class=\"sr-only\">Revoke</span></th></tr></thead>\n<tbody>\n");
+        b.push_str("<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Packages</th><th scope=\"col\">May</th><th scope=\"col\">Created</th><th scope=\"col\">Expires</th><th scope=\"col\">Last used</th><th scope=\"col\"><span class=\"sr-only\">Revoke</span></th></tr></thead>\n<tbody>\n");
         let now = now_secs();
+        let old = false;
         for t in mine {
             let pk = if t.packages.is_empty() { "<span class=\"muted\">all yours</span>" } else { esc(t.packages.join(", ")) };
             let ex = if t.expires <= now { f"<span class=\"tag\">expired</span> {date(t.expires)}" } else { date(t.expires) };
-            b.push_str(f"<tr><td>{esc(t.name)}</td><td class=\"mono\">{pk}</td><td>{date(t.created)}</td><td>{ex}</td><td>{date(t.last_used)}</td><td><form method=\"post\" action=\"/me/tokens/{esc(t.id)}/revoke\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Revoke</button></form></td></tr>\n");
+            let may = if t.scopes.is_empty() { "all but moderation <span class=\"tag\">made before scopes</span>" } else { esc(t.scopes.join(", ")) };
+            if t.scopes.is_empty() { old = true; }
+            b.push_str(f"<tr><td>{esc(t.name)}</td><td class=\"mono\">{pk}</td><td class=\"mono\">{may}</td><td>{date(t.created)}</td><td>{ex}</td><td>{date(t.last_used)}</td><td><form method=\"post\" action=\"/me/tokens/{esc(t.id)}/revoke\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Revoke</button></form></td></tr>\n");
         }
         b.push_str("</tbody>\n</table></div>\n");
+        if old {
+            b.push_str(f"<p class=\"t-small\">A token made before scopes may publish new packages and new versions, yank, and change owners and trusted publishers, but not moderate{if admin { " (moderation takes a token with the admin scope)" } else { "" }}. To narrow it, create a token with only what it needs and revoke the old one.</p>\n");
+        }
     }
-    b.push_str(f"<form method=\"post\" action=\"/me/tokens\" class=\"token-form\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><label>Name <input name=\"name\" maxlength=\"64\" required></label> <label>Packages <input name=\"packages\" maxlength=\"512\" placeholder=\"all yours\" aria-describedby=\"token-help\"></label> <label>Days <input name=\"days\" type=\"number\" min=\"1\" max=\"{TOKEN_DAYS_MAX}\" value=\"{TOKEN_DAYS}\" required></label> <button class=\"btn btn-sm\" type=\"submit\">Create token</button></form>\n<p class=\"t-small muted\" id=\"token-help\">Packages: names separated by commas, to let the token publish and yank only those; empty, it acts for every package you own. A token works for the number of days given, at most {TOKEN_DAYS_MAX}.</p>\n");
+    let boxes = StrBuf::new();
+    for (name, what) in scopes() {
+        if name == SCOPE_ADMIN && !admin { continue; }
+        let on = if default_scopes().contains(name) { " checked" } else { "" };
+        boxes.push_str(f"<label><input type=\"checkbox\" name=\"scope-{name}\" value=\"on\"{on}> {esc(what)} <code class=\"ic\">{name}</code></label> ");
+    }
+    b.push_str(f"<form method=\"post\" action=\"/me/tokens\" class=\"token-form\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"scopes\" value=\"1\"><label>Name <input name=\"name\" maxlength=\"64\" required></label> <label>Packages <input name=\"packages\" maxlength=\"512\" placeholder=\"all yours\" aria-describedby=\"token-help\"></label> <label>Days <input name=\"days\" type=\"number\" min=\"1\" max=\"{TOKEN_DAYS_MAX}\" value=\"{TOKEN_DAYS}\" required></label> <fieldset class=\"scopes\"><legend>It may</legend>{boxes.to_str()}</fieldset> <button class=\"btn btn-sm\" type=\"submit\">Create token</button></form>\n<p class=\"t-small muted\" id=\"token-help\">Packages: names separated by commas, to let the token act only on those; empty, it acts for every package you own. Give a token only what its job needs: a release workflow publishes new versions and yanks; tick a new package or owners only for the token that does that. A token works for the number of days given, at most {TOKEN_DAYS_MAX}.</p>\n");
     trusted_section(b, csrf, trusted);
     owners_section(b, csrf, db, a.id, admin);
     if admin { moderation_section(b, db); }
@@ -287,6 +299,22 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
         let only = token_packages(f.get("packages") ?? "") ?? {
             return message(site, r.path, 400, "Bad package list", "Write package names separated by commas, such as `json, toml`, or leave it empty for all your packages.");
         };
+        // The page's form says it lists the scopes; without that (a
+        // script, an old page) a token gets the defaults.
+        let picked: List<str> = List::new();
+        for (name, _) in scopes() {
+            if (f.get("scope-" + name) ?? "") == "on" { picked.push(name); }
+        }
+        if picked.is_empty() && (f.get("scopes") ?? "").is_empty() { picked = default_scopes(); }
+        if picked.is_empty() {
+            return message(site, r.path, 400, "Nothing chosen", "Tick at least one thing the token may do, such as publishing new versions.");
+        }
+        if picked.contains(SCOPE_ADMIN) && !admin {
+            return message(site, r.path, 403, "Not an admin", "Only the registry admins give a token the admin scope; untick it.");
+        }
+        if picked.contains(SCOPE_ADMIN) && !only.is_empty() {
+            return message(site, r.path, 400, "Admin token limited to packages", "A token limited to some packages cannot moderate; leave Packages empty, or untick the admin scope.");
+        }
         let tok = "pkg_" + try secret::random_hex(32);
         let id = try secret::random_hex(8);
         let shown = db;
@@ -298,11 +326,11 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
             }
             if n >= MAX_TOKENS { return message(site, r.path, 400, "Too many tokens", f"Revoke one first (at most {MAX_TOKENS})."); }
             let now = now_secs();
-            d.tokens.push(Token { id: id, name: name, account: a.id, hash: secret::sha256_hex(tok), created: now, last_used: 0i64, expires: now + days * 86400i64, packages: only });
+            d.tokens.push(Token { id: id, name: name, account: a.id, hash: secret::sha256_hex(tok), created: now, last_used: 0i64, expires: now + days * 86400i64, packages: only, scopes: picked });
             try save_db(cfg, d);
             shown = d;
         }
-        audit(cfg, Audit { at: now_secs(), by: a.id, action: "token-create", target: f"{id} {name}" });
+        audit(cfg, Audit { at: now_secs(), by: a.id, action: "token-create", target: f"{id} {name} {picked.join(",")}" });
         return me_page(cfg, site, r.path, shown, s, tok);
     }
     // `/me/tokens/<id>/revoke`

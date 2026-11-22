@@ -302,7 +302,12 @@ req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "name=ci"
 expect_code 403 "token without csrf"
 req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$bob_csrf&name=ci"
 expect_code 403 "token with another session's csrf"
-req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&name=ci"
+# `ci` may do everything, moderation included.
+all_scopes="scopes=1&scope-publish-new=on&scope-publish-update=on&scope-yank=on&scope-owners=on&scope-admin=on"
+req GET /me -H "Cookie: __Host-pkg_session=$sess"
+expect_body '<input type="checkbox" name="scope-publish-update" value="on" checked>' "default scope ticked"
+expect_body '<input type="checkbox" name="scope-admin" value="on">' "admin scope offered to an admin"
+req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&name=ci&$all_scopes"
 expect_code 200 "create token"
 tok=$(grep -o 'pkg_[0-9a-f]\{64\}' "$T/b" | head -1)
 [ -n "$tok" ] || fail "token not shown"
@@ -395,6 +400,33 @@ expect_body 'warnings: \["meta: `future_key` is not known to this registry; kept
 [ "$(git -C "$T/remote.git" show HEAD:ge/om/geom | tail -1 | sent)" = "$line2" ] || fail "rename line"
 publish "${line2//cfg(unix)/cfg(unix}"
 expect_code 400 "bad target"
+
+# Token scopes: by default a token publishes new versions and yanks, and
+# nothing else; the API says which scope a refusal lacked.
+req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&name=narrow"
+expect_code 200 "default-scoped token"
+narrow=$(grep -o 'pkg_[0-9a-f]\{64\}' "$T/b" | head -1)
+expect_body '<td>narrow</td><td class="mono"><span class="muted">all yours</span></td><td class="mono">publish-update, yank</td>' "default scopes listed"
+nauth=(-H "Authorization: Bearer $narrow")
+req POST /api/v1/publish "${nauth[@]}" --data-binary "Publish { entry: ${line//\"geom\"/\"scoped\"} }"
+expect_code 403 "a new package without publish-new"
+expect_body 'may not publish a new package (its first version) (scope `publish-new`)' "publish-new refusal"
+req POST /api/v1/yank "${nauth[@]}" --data-binary 'Yank { name: "geom", version: "9.9.9" }'
+[ "$code" != 403 ] || fail "yank scope refused: $(cat "$T/b")"
+req POST /api/v1/owners "${nauth[@]}" --data-binary 'Owner { package: "geom", login: "acme" }'
+expect_code 403 "owners without the scope"
+expect_body 'scope `owners`' "owners refusal"
+req GET /api/v1/trusted-publishers "${nauth[@]}"
+expect_code 403 "trusted publishers without the scope"
+req GET /api/v1/admin "${nauth[@]}"
+expect_code 403 "moderation without the admin scope"
+expect_body 'moderation takes a token with the `admin` scope' "admin scope refusal"
+req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&name=none&scopes=1"
+expect_code 400 "a token that may do nothing"
+expect_body "Tick at least one" "no scope body"
+req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&name=adm&packages=geom&scopes=1&scope-admin=on"
+expect_code 400 "a limited admin token"
+ok "token scopes"
 publish "${line//0.1.0/0.1.3}" "{ readme_content: \"$(head -c 524289 /dev/zero | tr '\0' a)\" }"
 expect_code 400 "readme cap"
 req POST /api/v1/publish --data-binary "Publish { entry: $line }"

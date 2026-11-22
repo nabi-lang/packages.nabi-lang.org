@@ -18,7 +18,7 @@ use pkg::server::auth::exchange;
 use pkg::server::limit;
 use pkg::server::names;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, remove_owner, remove_trusted};
-use pkg::server::store::{Account, Db, Locked, Owner, Removal, account_of, fill_owner_ids, load_db, lock_of, may_publish, now_secs, owners_of, release_at, removal_of, save_db, token_at};
+use pkg::server::store::{Account, Db, Locked, Owner, Removal, SCOPE_ADMIN, SCOPE_NEW, SCOPE_OWNERS, SCOPE_UPDATE, SCOPE_YANK, account_of, fill_owner_ids, load_db, lock_of, may_publish, now_secs, owners_of, release_at, removal_of, save_db, scope_says, token_at, token_scopes};
 use pkg::server::{Cfg, Resp, api_error, INDEX, is_admin, LOCK, may_act, nabion_resp, STALE};
 use pkg::trust;
 use pkg::trust::{TrustedPublisher, TrustToken};
@@ -276,6 +276,14 @@ struct Auth {
     key: str;
     /// `index::key`s an account's token is limited to; empty: none.
     only: List<str> = List::new();
+    /// What the token may do (store::scopes).
+    scopes: List<str> = [SCOPE_NEW, SCOPE_UPDATE, SCOPE_YANK];
+}
+
+/// Refuse what `auth`'s token has no `scope` for, saying how to get it.
+fn need(cfg: Cfg, auth: Auth, scope: str) throws (ApiError) {
+    if auth.scopes.contains(scope) { return; }
+    throw index::err(403, f"this token may not {scope_says(scope)} (scope `{scope}`); create a token with that scope on your account page ({cfg.url}/me) and give it to `nabi login`");
 }
 
 pub fn nobody_did() -> Actor { Actor { id: 0i64, login: "", at: 0i64 } }
@@ -334,8 +342,10 @@ fn authenticate(cfg: Cfg, db: Db, r: Request) throws (ApiError) -> Auth {
             }
         }
     }
-    // A token limited to some packages moderates nothing.
-    Auth { account: a, admin: is_admin(cfg, a.id) && tok.packages.is_empty(), scope: none, login: a.login, who: f"{a.login} <{a.id}+{a.login}@users.noreply.github.com>", actor: Actor { id: a.id, login: a.login, at: 0i64 }, key: f"acct:{a.id}", only: tok.packages }
+    // An admin's powers need the admin scope, and a token limited to
+    // some packages has none of them.
+    let sc = token_scopes(tok);
+    Auth { account: a, admin: is_admin(cfg, a.id) && tok.packages.is_empty() && sc.contains(SCOPE_ADMIN), scope: none, login: a.login, who: f"{a.login} <{a.id}+{a.login}@users.noreply.github.com>", actor: Actor { id: a.id, login: a.login, at: 0i64 }, key: f"acct:{a.id}", only: tok.packages, scopes: sc }
 }
 
 /// New names account `id` took in the day before `now`: the packages
@@ -406,7 +416,9 @@ fn index_step(cfg: Cfg, auth: Auth, p: index::Publish, k: str, refused: ApiError
         return true;
     }
     // Again: someone may have taken the name meanwhile.
-    if !may(auth, db, k, try index::exists(cfg.index, e.native, e.name)) { throw refused; }
+    let ex = try index::exists(cfg.index, e.native, e.name);
+    try need(cfg, auth, if ex { SCOPE_UPDATE } else { SCOPE_NEW });
+    if !may(auth, db, k, ex) { throw refused; }
     try index::publish(cfg.index, e, auth.who);
     false
 }
@@ -439,6 +451,7 @@ fn publish(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
     if !e.native && (try index::is_library(cfg.index, e.name)) { throw index::library_refused(e.name); }
     let in_index = try index::exists(cfg.index, e.native, e.name);
     let refused = index::err(403, if trusted { f"this token publishes only the packages that trust its workflow, not `{e.name}`" } else { f"`{e.name}` belongs to other accounts" });
+    try need(cfg, auth, if in_index { SCOPE_UPDATE } else { SCOPE_NEW });
     if !may(auth, db, k, in_index) { throw refused; }
     if !in_index {
         try names::check_new(e.name, try index::names(cfg.index, e.native), db.approved, auth.admin, if e.native { List::new() } else { try names::protected(cfg.index) }, org);
@@ -533,6 +546,7 @@ fn yank(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
     if y.message.len() > YANK_MESSAGE_MAX { throw index::err(400, f"a yank message is at most {YANK_MESSAGE_MAX} bytes"); }
     if y.undo && !y.message.is_empty() { throw index::err(400, "an unyank takes no message"); }
     let k = (if y.native { "native/" } else { "" }) + index::key(y.name);
+    try need(cfg, auth, SCOPE_YANK);
     if !may(auth, db, k, true) { throw index::err(403, f"`{y.name}` belongs to other accounts"); }
     if y.undo { try gone(db, k, y.name, y.version); }
     let by = auth.actor;
@@ -615,11 +629,15 @@ fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
         return nabion_resp(200, "Me", [("login", Value::Str(auth.login)), ("publish", Value::Bool(trusted || may_act(cfg, auth.account.id)))]);
     }
     if r.path.starts_with("/api/v1/admin") {
+        if !trusted && !auth.admin && is_admin(cfg, auth.account.id) {
+            throw index::err(403, f"moderation takes a token with the `{SCOPE_ADMIN}` scope and no package limit; create one on your account page ({cfg.url}/me)");
+        }
         if trusted || !auth.admin { throw index::err(403, "only the registry admins moderate, with an account's token"); }
         return try admin_route(cfg, db, auth.account, r);
     }
     if r.path.starts_with("/api/v1/trusted-publishers") {
         if trusted { throw index::err(403, "trusted publishers are managed with an account's token, not a trusted publishing one"); }
+        try need(cfg, auth, SCOPE_OWNERS);
         let a = auth.account;
         if r.method == "GET" {
             let list: List<Value> = List::new();
@@ -642,6 +660,7 @@ fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
     }
     if r.path.starts_with("/api/v1/owners") {
         if trusted { throw index::err(403, "owners are managed with an account's token, not a trusted publishing one"); }
+        try need(cfg, auth, SCOPE_OWNERS);
         let want = index::err(400, "the body is `Owner { package: \"..\", login: \"user, org or org/team\" }`");
         let package = "";
         let who = "";
@@ -678,6 +697,16 @@ fn trusted_scope() {
     assert(may(owner, db, "geom", true) && !may(owner, db, "json", true), "account");
     let limited = Auth { account: Account { id: 5i64, login: "o", created: 0i64 }, admin: false, scope: none, login: "o", who: "", actor: nobody_did(), key: "", only: ["geo"] };
     assert(!may(limited, db, "geom", true), "a token limited to other packages");
+    let cfg = Cfg { url: "https://p", addr: "", client_id: "", client_secret: "", admins: ",", data: "", index: "", oauth: "", api: "" };
+    let st = [0, 0];
+    limited.scopes = ["yank"];
+    try need(cfg, limited, SCOPE_YANK) catch e { st[0] = e.status; };
+    let msg = "";
+    try need(cfg, limited, SCOPE_NEW) catch e {
+        st[1] = e.status;
+        msg = e.msg;
+    };
+    assert(st[0] == 0 && st[1] == 403 && msg.contains("scope `publish-new`") && msg.contains("https://p/me"), msg);
     assert(pkg::server::owners::may_manage(db, "geom", 5i64, false) && !pkg::server::owners::may_manage(db, "geom", 6i64, false), "owners manage");
     assert(!pkg::server::owners::may_manage(db, "markdown", 5i64, false) && pkg::server::owners::may_manage(db, "markdown", 6i64, true), "unowned names are the admins'");
 }
