@@ -950,6 +950,9 @@ pub fn login_link(login: str) -> str {
 
 /// A publish time `YYYY-MM-DDTHH:MMZ` as `<time>`: the date and the 24-hour
 /// UTC time, or the date alone when `short`.
+/// `2026-11-20 09:49 UTC` of an ISO time.
+fn when_text(iso: str) -> str { if iso.len() < 16 { iso } else { f"{iso[:10]} {iso[11:16]} UTC" } }
+
 fn when_tag(iso: str, class: str, short: bool) -> str {
     let c = if class.is_empty() { "" } else { f" class=\"{class}\"" };
     let text = if short || iso.len() < 16 { iso[:iso.len().min(10)] } else { f"{iso[:10]} {iso[11:16]} UTC" };
@@ -1301,7 +1304,8 @@ pub fn versions_page(site: Site, s: Package) -> str {
             tags.push_str(f"<span class=\"tag\"{by}>yanked</span>");
         }
         if packages::is_pre(v.version) { tags.push_str("<span class=\"tag\">pre-release</span>"); }
-        let when = if v.date.is_empty() { "<span class=\"muted\">unknown</span>" } else { when_tag(v.date, "", false) };
+        // The day; the time is in the title.
+        let when = if v.date.is_empty() { "<span class=\"muted\">unknown</span>" } else { when_tag(v.date, "", true).replace("<time ", f"<time title=\"{esc(when_text(v.date))}\" ") };
         let none_yet = "<span class=\"muted\">unknown</span>";
         let who = if let a: meta::Actor = v.by {
             let pb = by_link(a, v.by_name);
@@ -1311,11 +1315,11 @@ pub fn versions_page(site: Site, s: Package) -> str {
         let tc = if v.nabi_version.is_empty() { "<span class=\"muted\">any</span>" } else { f"<span title=\"{esc(packages::admits(v.nabi_version))}\">{esc(v.nabi_version)}+</span>" };
         let lic = if v.license.is_empty() { "<span class=\"muted\">none</span>" } else { license_short(v.license) };
         let dl = if counted { f"<td class=\"num\" title=\"{count_text(v.recent)} in the last 90 days\">{count_text(v.downloads)}</td>" } else { "" };
-        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td class=\"ver\"><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{lic}</td><td class=\"num\">{sz}</td>{dl}<td>{tc}</td><td>{docs_cell(site, s, v.version)}</td><td class=\"mono\">{commit_link(v)}</td></tr>");
+        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td class=\"ver\"><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{lic}</td><td class=\"num\">{sz}</td>{dl}<td>{tc}</td><td class=\"links\">{docs_cell(site, s, v.version)}<span class=\"sep\" aria-hidden=\"true\"> · </span>{commit_link(v)}</td></tr>");
     }
     let body = f"<h2 class=\"t-h3\">{plural(s.versions.len(), "version", "versions")}</h2>
 <details class=\"about t-ui\"><summary>Newest first, times in UTC. About these columns</summary><p class=\"muted\">Published is when the version's line was added to the index. Size is the package as <code class=\"ic\">nabi publish</code> packed it{if counted { "; downloads are of its source archive, all time (hover for the last 90 days)" } else { "" }}. Nabi is the oldest toolchain it builds with: <code class=\"ic\">0.1.0+</code> means 0.1.0 or a later 0.1.x. The commit's title holds its full hash; the version's page has its tree hash. A yanked version stays in the index for the projects that pinned it; new resolves skip it.</p></details>
-<div class=\"table-wrap\"><table class=\"tbl vtbl\"><thead><tr><th scope=\"col\">Version</th><th scope=\"col\">Published</th><th scope=\"col\">By</th><th scope=\"col\">License</th><th scope=\"col\" class=\"num\">Size</th>{if counted { "<th scope=\"col\" class=\"num\">Downloads</th>" } else { "" }}<th scope=\"col\">Nabi</th><th scope=\"col\">Docs</th><th scope=\"col\">Commit</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>
+<div class=\"table-wrap\"><table class=\"tbl vtbl\"><thead><tr><th scope=\"col\">Version</th><th scope=\"col\">Published</th><th scope=\"col\">By</th><th scope=\"col\">License</th><th scope=\"col\" class=\"num\">Size</th>{if counted { "<th scope=\"col\" class=\"num\">Downloads</th>" } else { "" }}<th scope=\"col\">Nabi</th><th scope=\"col\">Docs · commit</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>
 ";
     package_frame(site, s, "versions", body)
 }

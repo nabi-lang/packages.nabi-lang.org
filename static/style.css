@@ -44,10 +44,14 @@ button{font:inherit}
 .people{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px;font-size:14px;line-height:24px}
 .people li{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
 .tbl .by,.tbl time{white-space:nowrap}
-.vtbl td,.vtbl th{white-space:nowrap}
+.vtbl td,.vtbl th{white-space:nowrap;padding-left:6px;padding-right:6px}
+.vtbl td:first-child,.vtbl th:first-child{padding-left:0}
+.vtbl td:last-child,.vtbl th:last-child{padding-right:0}
+.vtbl .links .sep{color:var(--ink-3)}
+.vtbl .links code{font-size:13px}
 .vtbl td.num,.vtbl th.num{text-align:right;font-variant-numeric:tabular-nums}
 .vtbl .ver .tag{margin-left:6px}
-.vtbl .by .who{max-width:160px}
+.vtbl .by .who{max-width:130px}
 .about{margin:0 0 12px;color:var(--ink-3)}
 .about summary{cursor:pointer}
 .about p{margin:8px 0 0}
