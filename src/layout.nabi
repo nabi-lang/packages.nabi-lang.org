@@ -183,6 +183,7 @@ fn footer(site: Site, lg: Lang) -> str {
         sites: chrome::Sites { home: home, docs: site.docs + "/latest" + lang_root(lg), registry: lp(lg, "/"), playground: site.playground + lang_root(lg), current: "registry" },
         release: site.release,
         lang: lg,
+        repo: "packages.nabi-lang.org",
     })
 }
 
