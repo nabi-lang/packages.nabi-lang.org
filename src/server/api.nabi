@@ -16,6 +16,7 @@ use pkg::packages;
 use pkg::server::admin::admin_route;
 use pkg::server::auth::exchange;
 use pkg::server::limit;
+use pkg::server::mail;
 use pkg::server::names;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, remove_owner, remove_trusted};
 use pkg::server::store::{Account, Db, Locked, Owner, Removal, SCOPE_ADMIN, SCOPE_NEW, SCOPE_OWNERS, SCOPE_UPDATE, SCOPE_YANK, account_of, fill_owner_ids, load_db, lock_of, may_publish, now_secs, owners_of, release_at, removal_of, save_db, scope_says, token_at, token_scopes};
@@ -280,6 +281,14 @@ struct Auth {
     scopes: List<str> = [SCOPE_NEW, SCOPE_UPDATE, SCOPE_YANK];
 }
 
+/// Who did it, as a notice says: the account, or the workflow run.
+fn who_did(auth: Auth) -> str {
+    match auth.actor.via {
+        v: meta::Via => f"GitHub Actions in {v.repository} (workflow {v.workflow}, run started by {auth.actor.login})",
+        none => auth.login,
+    }
+}
+
 /// Refuse what `auth`'s token has no `scope` for, saying how to get it.
 fn need(cfg: Cfg, auth: Auth, scope: str) throws (ApiError) {
     if auth.scopes.contains(scope) { return; }
@@ -537,6 +546,7 @@ fn publish(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
         if st.state == "failed" { warnings.push(Value::Str(f"docs: {st.message}; {e.name} {e.version} is published, and its docs page says why")); }
     }
     STALE.store(1);
+    if !filled { mail::notify(cfg, "publish", k, e.name, f"{e.name} {e.version} published", f"{who_did(auth)} published {e.name} {e.version}.", List::new()); }
     nabion_resp(200, "Published", [("name", Value::Str(e.name)), ("version", Value::Str(e.version)), ("file", Value::Str(e.file)), ("warnings", Value::List(warnings))])
 }
 
@@ -551,9 +561,10 @@ fn yank(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
     if y.undo { try gone(db, k, y.name, y.version); }
     let by = auth.actor;
     by.at = now_secs();
+    let changed = false;
     using ix = INDEX.lock() {
         try index::sync(cfg.index);
-        let changed = try index::yank(cfg.index, y.name, y.version, !y.undo, y.native, auth.who);
+        changed = try index::yank(cfg.index, y.name, y.version, !y.undo, y.native, auth.who);
         // Yanking a yanked version again only replaces its message.
         if changed || (!y.undo && !y.message.is_empty()) {
             using g = LOCK.lock() {
@@ -567,6 +578,11 @@ fn yank(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
             }
             STALE.store(1);
         }
+    }
+    if changed {
+        let did = if y.undo { "unyanked" } else { "yanked" };
+        let why = if y.message.is_empty() { "" } else { f"\nReason: {y.message}" };
+        mail::notify(cfg, "yank", k, y.name, f"{y.name} {y.version} {did}", f"{who_did(auth)} {did} {y.name} {y.version}.{why}", List::new());
     }
     nabion_resp(200, "Yanked", [("name", Value::Str(y.name)), ("version", Value::Str(y.version)), ("yanked", Value::Bool(!y.undo))])
 }

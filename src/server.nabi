@@ -14,14 +14,17 @@
 // loop and the rebuild. `routes` picks the answer to a request; `api`,
 // `auth`, `account`, `owners` and `admin` are the routes behind it;
 // `store` is the data file, `github` the calls to GitHub, `limit` the
-// rate limits and `names` which new names are taken.
+// rate limits, `names` which new names are taken, and `mail` the
+// notices sent through Amazon SES (`aws`) by a thread of their own.
 
 pub mod account;
 pub mod admin;
 pub mod api;
 pub mod auth;
+pub mod aws;
 pub mod github;
 pub mod limit;
+pub mod mail;
 pub mod names;
 pub mod owners;
 pub mod routes;
@@ -97,6 +100,17 @@ pub struct Cfg {
     /// PACKAGES_REQUIRE_2FA: refuse a login whose GitHub account has no
     /// two-factor authentication. On unless set to 0.
     pub require_2fa: bool = true;
+    /// PACKAGES_MAIL_FROM and PACKAGES_SES_REGION: notices go through
+    /// Amazon SES from this address in this region; either "", mail is
+    /// off and each notice is logged.
+    pub mail_from: str = "";
+    pub ses_region: str = "";
+    /// PACKAGES_SES_URL: SES's endpoint, no trailing `/`; default
+    /// `https://email.<region>.amazonaws.com`. Tests point it at a fake.
+    pub ses_url: str = "";
+    /// AWS_EC2_METADATA_SERVICE_ENDPOINT: the instance metadata service
+    /// (IMDSv2) the role's credentials come from.
+    pub imds_url: str = "http://169.254.169.254";
 }
 
 /// `KEY=value` lines; `#` comments, blank lines, `export ` and one pair
@@ -153,6 +167,12 @@ pub fn load_cfg(path: str) throws -> Cfg {
     let rate = optional(f, "PACKAGES_RATE_LIMIT").trim();
     let org = optional(f, "PACKAGES_OFFICIAL_ORG").trim();
     if issuer.is_empty() { issuer = trust::GITHUB_ISSUER; }
+    let region = optional(f, "PACKAGES_SES_REGION").trim();
+    for c in region.chars() {
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') { throw ApiError { status: 0, msg: f"PACKAGES_SES_REGION is an AWS region such as us-east-1, not `{region}`" }; }
+    }
+    let ses = optional(f, "PACKAGES_SES_URL").trim();
+    let imds = optional(f, "AWS_EC2_METADATA_SERVICE_ENDPOINT").trim();
     Cfg {
         url: url.strip_suffix("/") ?? url,
         addr: try setting(f, "PACKAGES_ADDR", "127.0.0.1:8080"),
@@ -170,9 +190,23 @@ pub fn load_cfg(path: str) throws -> Cfg {
         client_header: optional(f, "PACKAGES_CLIENT_HEADER").trim().to_lowercase(),
         api_token: optional(f, "GITHUB_API_TOKEN").trim(),
         require_2fa: try switch("PACKAGES_REQUIRE_2FA", optional(f, "PACKAGES_REQUIRE_2FA"), true),
+        mail_from: try mail_from(optional(f, "PACKAGES_MAIL_FROM").trim()),
+        ses_region: region,
+        ses_url: if ses.is_empty() { f"https://email.{region}.amazonaws.com" } else { ses.strip_suffix("/") ?? ses },
+        imds_url: if imds.is_empty() { "http://169.254.169.254" } else { imds.strip_suffix("/") ?? imds },
         official_org: if org.is_empty() { 0i64 } else { try org.parse::<i64>() catch _ { throw ApiError { status: 0, msg: f"PACKAGES_OFFICIAL_ORG is the numeric GitHub id of the organization (the `id` of https://api.github.com/orgs/<org>), not `{org}`" }; } },
         rate: try (if rate.is_empty() { "30" } else { rate }).parse::<i64>() catch _ { throw ApiError { status: 0, msg: f"PACKAGES_RATE_LIMIT is a number of changes a minute, not `{rate}`" }; },
     }
+}
+
+/// PACKAGES_MAIL_FROM checked: an address, optionally with a name
+/// (`Nabi packages <noreply@nabi-lang.org>`); "" for none.
+pub fn mail_from(v: str) throws (ApiError) -> str {
+    if v.is_empty() { return v; }
+    let addr = v;
+    if let k: usize = v.find("<") { addr = (v[k + 1:].strip_suffix(">") ?? ""); }
+    if !pkg::server::github::is_email(addr) { throw ApiError { status: 0, msg: f"PACKAGES_MAIL_FROM is an address SES may send from, such as noreply@nabi-lang.org, not `{v}`" }; }
+    v
 }
 
 /// PACKAGES_ADMINS (`1001, 1002`) as `,1001,1002,`. A login is refused:
@@ -413,6 +447,16 @@ pub fn serve(site: Site) throws {
     db.trusted = trust::merge_seeds(db.trusted, seeds);
     try save_db(cfg, db);
     eprintln(f"trusted publishing: OIDC tokens from {cfg.issuer} for audience {cfg.audience}; {seeds.len()} publishers from PACKAGES_TRUSTED");
+    if pkg::server::mail::on(cfg) {
+        eprintln(f"mail: notices from {cfg.mail_from} through Amazon SES in {cfg.ses_region}");
+        let mt = thread::spawn(|| {
+            pkg::server::mail::run(cfg);
+            0
+        });
+        mt.detach();
+    } else {
+        eprintln("mail: off (PACKAGES_MAIL_FROM or PACKAGES_SES_REGION unset); notices are logged, not sent");
+    }
     using l = try net::tcp_listen(cfg.addr) {
         eprintln(f"serving {site.out}/ and the API on http://{cfg.addr} for {cfg.url}");
         STALE.store(1);
@@ -478,6 +522,9 @@ fn env_files() {
     let off = try switch("X", " Off ", true) catch _ { true };
     let bad = try switch("X", "maybe", true) catch e { e.msg == "X is 1 (on) or 0 (off), not `maybe`" };
     assert(on && !off && bad, "switches");
+    let named = try mail_from("Nabi packages <noreply@nabi-lang.org>") catch _ { "" };
+    let wrong = try mail_from("noreply") catch _ { "refused" };
+    assert(named.starts_with("Nabi") && wrong == "refused" && (try mail_from("") catch _ { "x" }).is_empty(), "mail from");
 }
 
 #[test]

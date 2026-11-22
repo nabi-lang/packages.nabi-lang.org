@@ -1,0 +1,213 @@
+// Notices by mail: what happened to a package or an account, sent to
+// its owners. A change queues its mails and returns; one thread sends
+// them through Amazon SES (aws.nabi), so a publish never waits on SES.
+// With PACKAGES_MAIL_FROM or PACKAGES_SES_REGION unset, mail is off and
+// each mail is logged instead.
+
+use pkg::server::account::date;
+use pkg::server::aws;
+use pkg::server::aws::Creds;
+use pkg::server::store::{Account, Locked, account_of, load_db, lock_of, now_secs, owners_of};
+use pkg::server::{Cfg, host_of};
+use std::thread;
+
+/// The kinds of notice, each turned off on its own on the account page,
+/// with what the page says of it.
+pub fn kinds() -> List<(str, str)> {
+    [
+        ("publish", "a version of a package you own is published"),
+        ("yank", "a version of a package you own is yanked or unyanked"),
+        ("owners", "owners of a package you own are invited, added or removed"),
+        ("trusted", "trusted publishers of a package you own are added or removed"),
+        ("token", "a publish token is created on your account"),
+    ]
+}
+
+/// One mail to send.
+pub struct Mail {
+    /// The account it is for, named in the log in place of the address.
+    pub account: i64;
+    pub to: str;
+    pub subject: str;
+    pub text: str;
+}
+
+/// Mails an address gets an hour at most; past it they are dropped (and
+/// logged), so a burst of publishes cannot flood anyone.
+pub const PER_HOUR: i64 = 20i64;
+
+/// Mails waiting at most; past it new ones are dropped.
+const QUEUE_MAX: usize = 1000;
+
+static QUEUE: Mutex<List<Mail>> = Mutex::new(List::new());
+
+struct Window {
+    start: i64;
+    count: i64;
+}
+
+static SENT: Mutex<Dict<str, Window>> = Mutex::new(Dict::new());
+
+/// Whether mail is on: both settings given.
+pub fn on(cfg: Cfg) -> bool { !cfg.mail_from.is_empty() && !cfg.ses_region.is_empty() }
+
+/// Count one mail to `to`; whether it is within PER_HOUR.
+fn allow(to: str, now: i64) -> bool {
+    using g = SENT.lock() {
+        let d = g.get();
+        if d.len() > 4096 {
+            let keep: Dict<str, Window> = Dict::new();
+            for (k, w) in d.iter() {
+                if now - w.start < 3600i64 { keep.insert(k, w); }
+            }
+            d = keep;
+            g.set(d);
+        }
+        let k = to.to_lowercase();
+        let w = d.get(k) ?? Window { start: now, count: 0i64 };
+        if now - w.start >= 3600i64 { w = Window { start: now, count: 0i64 }; }
+        w.count += 1i64;
+        d.insert(k, w);
+        w.count <= PER_HOUR
+    }
+}
+
+/// Queue `m`, or log it when mail is off. Never blocks on SES.
+pub fn queue(cfg: Cfg, m: Mail) {
+    if !allow(m.to, now_secs()) {
+        eprintln(f"mail: dropped for account {m.account}, over {PER_HOUR} an hour: {m.subject}");
+        return;
+    }
+    if !on(cfg) {
+        eprintln(f"mail (off; set PACKAGES_MAIL_FROM and PACKAGES_SES_REGION to send) to account {m.account}: {m.subject}\n  {m.text.replace("\n", "\n  ")}");
+        return;
+    }
+    using g = QUEUE.lock() {
+        let q = g.get();
+        if q.len() >= QUEUE_MAX {
+            eprintln(f"mail: queue full, dropped for account {m.account}: {m.subject}");
+            return;
+        }
+        q.push(m);
+    }
+}
+
+fn take() -> List<Mail> {
+    using g = QUEUE.lock() {
+        let q = g.get();
+        let out: List<Mail> = List::new();
+        for m in q { out.push(m); }
+        g.set(List::new());
+        return out;
+    }
+}
+
+/// The sending thread: forever, the queued mails through SES, the role's
+/// credentials kept until shortly before they expire.
+pub fn run(cfg: Cfg) {
+    let creds: Creds | none = none;
+    loop {
+        let batch = take();
+        for m in batch { creds = deliver(cfg, creds, m); }
+        if batch.is_empty() { thread::sleep(Duration::secs(1)); }
+    }
+}
+
+/// Send `m` with `creds`, fetched again when they are close to expiry or
+/// SES refuses them; the credentials to keep.
+fn deliver(cfg: Cfg, creds: Creds | none, m: Mail) -> Creds | none {
+    let c = creds;
+    for attempt in 0..2 {
+        let now = now_secs();
+        let have: Creds | none = none;
+        if let x: Creds = c {
+            if x.expires - now > aws::REFRESH_SECS { have = x; }
+        }
+        if have is none {
+            have = try aws::instance_creds(cfg) catch e {
+                eprintln(f"mail: not sent to account {m.account}: {e.msg}");
+                return none;
+            };
+        }
+        let k = have ?? { return none; };
+        let failed = 0;
+        try aws::send_email(cfg, k, m.to, m.subject, m.text, settings_url(cfg), now) catch e {
+            failed = e.status;
+            // Rotated or revoked credentials: once more with new ones.
+            if (e.status == 403 || e.status == 401) && attempt == 0 {
+                c = none;
+                continue;
+            }
+            eprintln(f"mail: not sent to account {m.account}: {e.msg}");
+        };
+        if failed == 0 { eprintln(f"mail: sent to account {m.account}: {m.subject}"); }
+        return k;
+    }
+    c
+}
+
+/// The account page's notice settings.
+pub fn settings_url(cfg: Cfg) -> str { cfg.url + "/me#notices" }
+
+/// `yyyy-mm-dd hh:mm UTC`.
+fn stamp(t: i64) -> str {
+    let p2 = |x: i64| if x < 10i64 { f"0{x}" } else { f"{x}" };
+    let s = t % 86400i64;
+    f"{date(t)} {p2(s / 3600i64)}:{p2((s / 60i64) % 60i64)} UTC"
+}
+
+/// The text of a notice: what happened, the link, what to do if it was
+/// not the reader, and why they get it.
+pub fn compose(cfg: Cfg, what: str, link: str, why: str) -> str {
+    let b = StrBuf::new();
+    b.push_str(what + "\n\n");
+    if !link.is_empty() { b.push_str(link + "\n\n"); }
+    b.push_str(f"If this wasn't you: revoke your publish tokens at {cfg.url}/me and\nlog out sessions you do not know there, then write to\nsecurity@nabi-lang.org.\n\n");
+    b.push_str(f"--\nYou get this because {why}. Choose which notices you get:\n{settings_url(cfg)}\n");
+    b.to_str()
+}
+
+/// Whether account `a` takes notices of `kind`.
+pub fn wants(a: Account, kind: str) -> bool { a.notify && !a.email.is_empty() && !a.notify_off.contains(kind) }
+
+/// Queue a notice of `kind` to the owners of package `key` (none for
+/// "") and to the accounts `also`: subject `subject`, `what` happened,
+/// `name` the package as written ("" for an account's notice).
+pub fn notify(cfg: Cfg, kind: str, key: str, name: str, subject: str, what: str, also: List<i64>) {
+    let db = (try? load_db(cfg)) ?? {
+        eprintln(f"mail: cannot read the data file; not sent: {subject}");
+        return;
+    };
+    let ids: List<i64> = List::new();
+    if !key.is_empty() {
+        for id in owners_of(db, key) ?? List::new() { ids.push(id); }
+    }
+    for id in also {
+        if !ids.contains(id) { ids.push(id); }
+    }
+    let link = if name.is_empty() { "" } else if key.starts_with("native/") { f"{cfg.url}/api/v1/native/{name}" } else { f"{cfg.url}/packages/{name}" };
+    for id in ids {
+        let a = account_of(db, id) ?? { continue; };
+        if !wants(a, kind) || lock_of(db, id) is Locked { continue; }
+        let owns = (owners_of(db, key) ?? List::new()).contains(id);
+        let why = if owns { f"you own {name} on {host_of(cfg.url)}" } else if name.is_empty() { f"it concerns your account on {host_of(cfg.url)}" } else { f"it concerns you and {name} on {host_of(cfg.url)}" };
+        queue(cfg, Mail { account: id, to: a.email, subject: f"[{host_of(cfg.url)}] {subject}", text: compose(cfg, what + f"\nWhen: {stamp(now_secs())}", link, why) });
+    }
+}
+
+#[test]
+fn notices() {
+    let cfg = Cfg { url: "https://p.test", addr: "", client_id: "", client_secret: "", admins: ",", data: "", index: "", oauth: "", api: "" };
+    let t = compose(cfg, "alice published geom 0.1.0.", "https://p.test/packages/geom", "you own geom on p.test");
+    assert(t.starts_with("alice published geom 0.1.0.\n\nhttps://p.test/packages/geom\n\nIf this wasn't you: revoke your publish tokens at https://p.test/me") && t.contains("security@nabi-lang.org") && t.ends_with("https://p.test/me#notices\n"), t);
+    assert(stamp(1440938160i64) == "2015-08-30 12:36 UTC" && !on(cfg), "stamp, off");
+    let a = Account { id: 1i64, login: "a", created: 0i64, email: "a@example.com" };
+    assert(wants(a, "publish"), "on by default");
+    a.notify_off = ["publish"];
+    assert(!wants(a, "publish") && wants(a, "yank"), "one kind off");
+    a.notify = false;
+    assert(!wants(a, "yank"), "all off");
+    let who = f"rate-{now_secs()}@example.com";
+    for _ in 0..PER_HOUR { assert(allow(who, 100i64), "within"); }
+    assert(!allow(who.to_uppercase(), 200i64) && allow(who, 3800i64), "per address, an hour");
+}

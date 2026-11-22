@@ -82,6 +82,10 @@ start_server() {
         GIT_ALLOW_PROTOCOL=https:file:http \
         PACKAGES_RATE_LIMIT=1000 \
         PACKAGES_OFFICIAL_ORG=5151 \
+        PACKAGES_MAIL_FROM="Nabi packages <noreply@packages.test>" \
+        PACKAGES_SES_REGION=us-east-1 \
+        PACKAGES_SES_URL="http://127.0.0.1:$gh_port" \
+        AWS_EC2_METADATA_SERVICE_ENDPOINT="http://127.0.0.1:$gh_port" \
         "${extra_env[@]}" \
         GIT_CONFIG_COUNT=2 \
         GIT_CONFIG_KEY_0="url.file://$T/src/.insteadOf" \
@@ -104,6 +108,16 @@ req() {
     shift 2
     code=$(curl -s -X "$m" -D "$T/h" -o "$T/b" -w '%{http_code}' "$@" "$base$p")
 }
+# mail_to ADDR TEXT: waits for a mail the fake SES took for ADDR with
+# TEXT in it (each mail one line of SES JSON).
+mails() { curl -s "http://127.0.0.1:$gh_port/_mails"; }
+mail_to() {
+    for _ in $(seq 50); do
+        mails | grep -F "\"ToAddresses\":[\"$1\"]" | grep -qF -- "$2" && return 0
+        sleep 0.1
+    done
+    fail "no mail to $1 with $2: $(mails | tail -3)"
+}
 header() { grep -i "^$1:" "$T/h" | head -1 | sed -e 's/^[^:]*: *//' -e 's/\r$//'; }
 cookie_of() { grep -i "^set-cookie: $1=" "$T/h" | head -1 | sed -e "s/^[^=]*=//" -e 's/;.*//'; }
 expect_code() { [ "$code" = "$1" ] || fail "$2: HTTP $code, want $1: $(head -c 300 "$T/b")"; }
@@ -118,7 +132,7 @@ authorize() {
     loc=$(header location)
     state=$(cookie_of __Host-pkg_state)
     case "$loc" in
-        "http://127.0.0.1:$gh_port/login/oauth/authorize?client_id=test-client&"*"&state=$state&code_challenge="*"&code_challenge_method=S256&scope=read:user") ;;
+        "http://127.0.0.1:$gh_port/login/oauth/authorize?client_id=test-client&"*"&state=$state&code_challenge="*"&code_challenge_method=S256&scope=read:user%20user:email") ;;
         *) fail "authorize url: $loc" ;;
     esac
     header set-cookie | grep -q "^__Host-pkg_state=[0-9a-f]*; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax" || fail "state cookie flags: $(header set-cookie)"
@@ -326,6 +340,24 @@ expect_body '<td class="mono">ge_om</td>' "limited token listed"
 grep -q '"token-create"' "$T/data/audit.nabion" || fail "token creation audited"
 ok "admin token"
 
+# Notices go to the primary verified address GitHub gave at login,
+# through SES with the instance role's credentials (the fake's IMDSv2).
+grep -q 'email: "alice@example.com"' "$T/data/db.nabion" || fail "primary verified email stored"
+mail_to alice@example.com 'publish token ci created'
+mail_to alice@example.com 'It may: publish-update, publish-new, yank, owners, admin'
+mail_to alice@example.com 'publish token one created'
+m=$(mails | grep -F 'publish token one created')
+for want in '"FromEmailAddress":"Nabi packages <noreply@packages.test>"' '"Subject":{"Data":"[packages.test] publish token one created"' "If this wasn't you: revoke your publish tokens at https://packages.test/me" 'security@nabi-lang.org' '{"Name":"List-Unsubscribe","Value":"<https://packages.test/me#notices>"}' 'Packages: ge_om'; do
+    case "$m" in *"$want"*) ;; *) fail "token mail lacks $want: $m" ;; esac
+done
+grep -q 'mail: credentials of role e2e-role until 20990101T000000Z' "$T/server.log" || fail "imds credentials"
+[ "$(grep -c 'mail: credentials of role' "$T/server.log")" = 1 ] || fail "credentials fetched again"
+grep -q 'alice@example.com' "$T/server.log" && fail "address in the log"
+req GET /me -H "Cookie: __Host-pkg_session=$sess"
+expect_body 'Sent to <strong>alice@example.com</strong>' "address on the account page"
+expect_body '<input type="checkbox" name="kind-publish" value="on" checked>' "publish notices on"
+ok "notices"
+
 auth=(-H "Authorization: Bearer $tok")
 req GET /api/v1/me "${auth[@]}"
 expect_code 200 "api me"
@@ -362,6 +394,14 @@ publish() {
 publish "$line" "$meta"
 expect_code 200 "publish"
 expect_body 'Published { name: "geom", version: "0.1.0", file: "ge/om/geom", warnings: \[\] }' "publish body"
+mail_to alice@example.com 'alice published geom 0.1.0.'
+mail_to alice@example.com 'https://packages.test/packages/geom'
+# Publish notices off from here on: the later publishes would pass the
+# hourly cap.
+req POST /me/notices -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&notify=on&kind-yank=on&kind-owners=on&kind-trusted=on&kind-token=on"
+expect_code 303 "notice settings"
+[ "$(header location)" = "/me#notices" ] || fail "notice settings location: $(header location)"
+grep -q 'notify_off: \["publish"\]' "$T/data/db.nabion" || fail "publish notices off"
 [ "$(git -C "$T/remote.git" log -1 --format=%s)" = "Publish geom 0.1.0" ] || fail "pushed commit"
 [ "$(git -C "$T/remote.git" log -1 --format='%an <%ae>')" = "alice <1001+alice@users.noreply.github.com>" ] || fail "commit author"
 # The server adds the archive's SHA-256 after `tree`.
@@ -375,6 +415,7 @@ publish "$line"
 expect_code 409 "republish"
 publish "${line//\"geom\"/\"ge-om\"}"
 expect_code 200 "second name"
+grep -q 'mail (off' "$T/server.log" && fail "mail logged while on"
 publish "${line//\"geom\"/\"ge_om\"}"
 expect_code 409 "spelling conflict"
 publish "${line//https:/http:}"
@@ -554,6 +595,7 @@ ok "docs"
 req POST /api/v1/yank "${auth[@]}" --data-binary 'Yank { name: "geom", version: "0.1.0", message: "wrong areas" }'
 expect_code 200 "yank"
 expect_body 'Yanked { name: "geom", version: "0.1.0", yanked: true }' "yank body"
+mail_to alice@example.com 'alice yanked geom 0.1.0.\nReason: wrong areas'
 [ "$(git -C "$T/remote.git" log -1 --format=%s)" = "Yank geom 0.1.0" ] || fail "yank commit"
 git -C "$T/remote.git" show HEAD:ge/om/geom | grep -q 'yanked: true' || fail "yanked line"
 req GET /api/v1/packages/geom
@@ -619,6 +661,9 @@ expect_code 403 "owner form with another session's csrf"
 req POST /api/v1/owners "${auth[@]}" --data-binary 'Owner { package: "geom", login: "bob" }'
 expect_code 200 "api invite a user owner"
 expect_body 'Invited { package: "geom", login: "Bob" }' "api invite body"
+mail_to bob@example.com 'alice invited Bob to own geom.'
+mail_to alice@example.com 'alice invited Bob to own geom.'
+mail_to alice@example.com 'alice listed acme as an owner of geom.'
 req POST /api/v1/owners "${auth[@]}" --data-binary 'Owner { package: "geom", login: "bob" }'
 expect_code 409 "invited twice"
 req GET /api/v1/packages/geom
@@ -629,6 +674,8 @@ req POST /me/invites/accept -H "Cookie: __Host-pkg_session=$bob_sess" --data "cs
 expect_code 403 "accept with another session's csrf"
 req POST /me/invites/accept -H "Cookie: __Host-pkg_session=$bob_sess" --data "csrf=$bob_csrf&package=geom"
 expect_code 303 "accept an invitation"
+mail_to bob@example.com 'Bob accepted the invitation and now owns geom'
+mail_to alice@example.com 'Bob accepted the invitation and now owns geom'
 req POST /me/invites/accept -H "Cookie: __Host-pkg_session=$bob_sess" --data "csrf=$bob_csrf&package=geom"
 expect_code 404 "accept twice"
 req POST /api/v1/owners "${auth[@]}" --data-binary 'Owner { package: "geom", login: "acme/release" }'
@@ -674,6 +721,7 @@ expect_code 403 "not an owner"
 expect_body "not open yet" "not an owner body"
 req GET /me -H "Cookie: __Host-pkg_session=$sess"
 expect_body '<td>geom</td><td>acme/geom</td><td>publish.yml</td>' "trusted publisher listed"
+mail_to alice@example.com 'alice added a trusted publisher to geom: GitHub Actions in acme/geom, workflow publish.yml.'
 expect_body '<td>seeded</td><td>acme/seeded</td><td>publish.yml</td><td><span class="muted">any</span></td><td><span class="muted">server config</span>' "seeded publisher listed"
 req GET /api/v1/trusted-publishers "${auth[@]}"
 expect_code 200 "trusted publishers api"
@@ -919,7 +967,7 @@ req GET /api/v1/packages/ge-om
 expect_code 200 "restored api"
 grep -q 'action: "takedown", target: "ge_om", reason: "malware"' "$T/data/audit.nabion" || fail "audit: $(cat "$T/data/audit.nabion")"
 # Five moderation steps; the accounts' own changes are logged beside them.
-[ "$(grep '^Audit' "$T/data/audit.nabion" | grep -cvE 'action: "(login|logout|token-[a-z]+|owner-[a-z]+|invite-[a-z]+|trusted-[a-z]+)"')" = 5 ] || fail "audit lines: $(cat "$T/data/audit.nabion")"
+[ "$(grep '^Audit' "$T/data/audit.nabion" | grep -cvE 'action: "(login|logout|logout-all|notices|token-[a-z]+|owner-[a-z]+|invite-[a-z]+|trusted-[a-z]+)"')" = 5 ] || fail "audit lines: $(cat "$T/data/audit.nabion")"
 ls "$T/data/backup/" | grep -q '^db-[0-9]\{10\}\.nabion$' || fail "db snapshot"
 ok "moderation"
 
@@ -1046,11 +1094,24 @@ expect_code 403 "a non-admin's trusted publisher"
 exchange "$(mint "$(claims acme/seeded publish.yml)")"
 expect_code 200 "seeded publisher while closed"
 kill "$server"; wait "$server" 2>/dev/null || true
-extra_env=(PACKAGES_REQUIRE_2FA=0)
+# Mail off as well: notices go to the log.
+extra_env=(PACKAGES_REQUIRE_2FA=0 PACKAGES_MAIL_FROM=)
 start_server 1001
 login no2fa
 expect_body 'Logged in with GitHub as <a href="https://github.com/dave"><strong>dave</strong></a>' "login without 2fa when not required"
+expect_body "GitHub gave no verified primary email address" "no verified address"
+expect_body 'This server sends no mail' "mail off on the account page"
 login admin
+req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&name=offline"
+expect_code 200 "token while mail is off"
+for _ in $(seq 20); do grep -q 'publish token offline created' "$T/server.log" && break; sleep 0.1; done
+grep -q 'mail (off; set PACKAGES_MAIL_FROM and PACKAGES_SES_REGION to send) to account 1001: \[packages.test\] publish token offline created' "$T/server.log" || fail "mail logged while off"
+mails | grep -qF 'publish token offline created' && fail "mail sent while off"
+# The hourly cap, and publish notices stayed off.
+[ "$(mails | grep -cF '"ToAddresses":["alice@example.com"]')" -le 20 ] || fail "more than 20 mails an hour"
+mails | grep -F '"ToAddresses":["alice@example.com"]' | grep -qF 'published ge-om' && fail "publish notice while off"
+grep 'mail: not sent' "$T/server.log" && fail "a mail was not sent"
+grep -q 'mail: sent to account 1002: \[packages.test\] Bob invited to own geom' "$T/server.log" || fail "sent mails logged by account"
 
 # A token limited to other packages publishes nothing else.
 req POST /api/v1/publish -H "Authorization: Bearer $one" --data-binary "Publish { entry: ${line//0.1.0/0.4.0} }"

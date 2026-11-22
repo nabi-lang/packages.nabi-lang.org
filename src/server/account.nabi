@@ -8,6 +8,7 @@ use pkg::meta;
 use pkg::secret;
 use pkg::server::admin::{Audit, audit};
 use pkg::server::limit;
+use pkg::server::mail;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, may_manage, remove_owner, remove_trusted};
 use pkg::server::store::{Account, Db, SCOPE_ADMIN, SESSION_COOKIE, SESSION_IDLE, SESSION_SECS, Session, TOKEN_DAYS, TOKEN_DAYS_MAX, Token, account_of, default_scopes, invites_of, load_db, now_secs, save_db, scopes, seen_at, session_end, session_id, session_of};
 use pkg::server::{Cfg, Resp, cookie, is_admin, LOCK, may_act, message, page, redirect};
@@ -47,6 +48,7 @@ fn me_page(cfg: Cfg, site: Site, path: str, db: Db, s: Session, fresh: str) -> R
     b.push_str(f"<form method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Log out</button></form>\n");
     invites_section(b, csrf, db, a.id);
     sessions_section(b, csrf, db, s);
+    notices_section(cfg, b, csrf, a);
     b.push_str("<h2 class=\"t-h3\">Publish tokens</h2>\n");
     let admin = is_admin(cfg, a.id);
     if !may_act(cfg, a.id) {
@@ -109,6 +111,25 @@ fn sessions_section(b: StrBuf, csrf: str, db: Db, cur: Session) {
     }
     b.push_str("</tbody>\n</table></div>\n");
     b.push_str(f"<form method=\"post\" action=\"/me/sessions/logout-all\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Log out everywhere</button></form>\n");
+}
+
+/// Where notices go and which kinds the account takes, with the form
+/// that changes them.
+fn notices_section(cfg: Cfg, b: StrBuf, csrf: str, a: Account) {
+    b.push_str("<h2 class=\"t-h3\" id=\"notices\">Notices by mail</h2>\n");
+    if a.email.is_empty() {
+        b.push_str("<p>GitHub gave no verified primary email address for this account, so no notices are sent. Add one in <a href=\"https://github.com/settings/emails\">GitHub's email settings</a>, verify it and make it primary, then log in again.</p>\n");
+    } else {
+        b.push_str(f"<p>Sent to <strong>{esc(a.email)}</strong>, your primary email address on GitHub at your last login. To use another, change it on GitHub and log in again.</p>\n");
+    }
+    if !mail::on(cfg) { b.push_str("<p class=\"t-small muted\">This server sends no mail: its notices are written to its log.</p>\n"); }
+    let boxes = StrBuf::new();
+    for (k, what) in mail::kinds() {
+        let on = if a.notify_off.contains(k) { "" } else { " checked" };
+        boxes.push_str(f"<label><input type=\"checkbox\" name=\"kind-{k}\" value=\"on\"{on}> {esc(what)}</label> ");
+    }
+    let all = if a.notify { " checked" } else { "" };
+    b.push_str(f"<form method=\"post\" action=\"/me/notices\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><label><input type=\"checkbox\" name=\"notify\" value=\"on\"{all}> Send me notices</label> <fieldset><legend>Mail me when</legend>{boxes.to_str()}</fieldset> <button class=\"btn-2 btn-sm\" type=\"submit\">Save</button></form>\n");
 }
 
 /// The account's open invitations to own a package, each with Accept and
@@ -256,6 +277,25 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
         return if this_one { redirect("/", [cookie(SESSION_COOKIE, "", 0i64)]) } else { redirect("/me#sessions", []) };
     }
     let a = account_of(db, s.account) ?? Account { id: 0i64, login: "", created: 0i64 };
+    if r.path == "/me/notices" {
+        let off: List<str> = List::new();
+        for (k, _) in mail::kinds() {
+            if (f.get("kind-" + k) ?? "") != "on" { off.push(k); }
+        }
+        let all = (f.get("notify") ?? "") == "on";
+        using g = LOCK.lock() {
+            let d = try load_db(cfg);
+            for i in 0..d.accounts.len() {
+                if d.accounts[i].id == a.id {
+                    d.accounts[i].notify = all;
+                    d.accounts[i].notify_off = off;
+                }
+            }
+            try save_db(cfg, d);
+        }
+        audit(cfg, Audit { at: now_secs(), by: a.id, action: "notices", target: if all { f"on, off: {off.join(",")}" } else { "off" } });
+        return redirect("/me#notices", []);
+    }
     if r.path == "/me/invites/accept" || r.path == "/me/invites/decline" {
         let package = (f.get("package") ?? "").trim();
         let yes = r.path == "/me/invites/accept";
@@ -331,6 +371,8 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
             shown = d;
         }
         audit(cfg, Audit { at: now_secs(), by: a.id, action: "token-create", target: f"{id} {name} {picked.join(",")}" });
+        let pk = if only.is_empty() { "all your packages" } else { only.join(", ") };
+        mail::notify(cfg, "token", "", "", f"publish token {name} created", f"{a.login} created the publish token \"{name}\".\nIt may: {picked.join(", ")}\nPackages: {pk}\nExpires: {date(now_secs() + days * 86400i64)}", [a.id]);
         return me_page(cfg, site, r.path, shown, s, tok);
     }
     // `/me/tokens/<id>/revoke`

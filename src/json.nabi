@@ -1,6 +1,7 @@
 // The JSON GitHub answers with (OAuth, /user, /repos, OIDC discovery,
 // JWKS, OIDC token claims): members of an object and elements of an
-// array, as text. Not a validating parser.
+// array, as text. Not a validating parser. `quote` writes a string, for
+// the requests to Amazon SES.
 
 fn chars(s: str) -> List<char> {
     let cs: List<char> = List::new();
@@ -141,6 +142,34 @@ pub fn items(s: str) -> List<str> {
     out
 }
 
+/// `s` as a JSON string, quotes included.
+pub fn quote(s: str) -> str {
+    let digits = "0123456789abcdef";
+    let b = StrBuf::new();
+    b.push('"');
+    for c in s.chars() {
+        let n = c as u32;
+        if c == '"' {
+            b.push_str("\\\"");
+        } else if c == '\\' {
+            b.push_str("\\\\");
+        } else if c == '\n' {
+            b.push_str("\\n");
+        } else if c == '\r' {
+            b.push_str("\\r");
+        } else if c == '\t' {
+            b.push_str("\\t");
+        } else if n < 0x20u32 || n == 0x2028u32 || n == 0x2029u32 {
+            b.push_str("\\u");
+            for k in [12u32, 8u32, 4u32, 0u32] { b.push(digits.chars().nth(((n >> k) & 15u32) as usize) ?? '0'); }
+        } else {
+            b.push(c);
+        }
+    }
+    b.push('"');
+    b.to_str()
+}
+
 #[cfg(test)]
 fn expect(ok: bool, what: str) {
     if !ok { panic(what); }
@@ -158,4 +187,7 @@ fn github_json() {
     let keys = items(member("{\"keys\":[{\"kid\":\"a\"},{\"kid\":\"b,]\"}]}", "keys") ?? "");
     expect(keys.len() == 2 && fields(keys[1])["kid"] == "b,]", f"{keys:?}");
     expect(items("[]").len() == 0 && items("[1, \"x\" ,true]").len() == 3 && items("{}").len() == 0, "items");
+    let q = quote("a\"b\\c\nd\u{1}é");
+    expect(q == "\"a\\\"b\\\\c\\nd\\u0001é\"", q);
+    expect(fields(f"{{\"k\": {quote("x\"\n\ty")}}}")["k"] == "x\"\n\ty", "round trip");
 }

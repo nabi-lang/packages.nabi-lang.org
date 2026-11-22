@@ -95,7 +95,7 @@ pub fn login(cfg: Cfg, site: Site, path: str) throws -> Resp {
         m.headers.push("Retry-After: 60");
         return m;
     }
-    let to = f"{cfg.oauth}/login/oauth/authorize?client_id={http::pct_encode(cfg.client_id)}&redirect_uri={http::pct_encode(cfg.url + "/auth/github/callback")}&state={state}&code_challenge={pkce_challenge(verifier)}&code_challenge_method=S256&scope=read:user";
+    let to = f"{cfg.oauth}/login/oauth/authorize?client_id={http::pct_encode(cfg.client_id)}&redirect_uri={http::pct_encode(cfg.url + "/auth/github/callback")}&state={state}&code_challenge={pkce_challenge(verifier)}&code_challenge_method=S256&scope=read:user%20user:email";
     redirect(to, [cookie(STATE_COOKIE, state, STATE_SECS)])
 }
 
@@ -135,10 +135,11 @@ pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
                 db.accounts[i].login = gh.login;
                 db.accounts[i].name = gh.name;
                 db.accounts[i].avatar_url = gh.avatar_url;
+                if let e: str = u.email { db.accounts[i].email = e; }
                 seen = true;
             }
         }
-        if !seen { db.accounts.push(Account { id: id, login: gh.login, created: now, name: gh.name, avatar_url: gh.avatar_url }); }
+        if !seen { db.accounts.push(Account { id: id, login: gh.login, created: now, name: gh.name, avatar_url: gh.avatar_url, email: u.email ?? "" }); }
         // Past MAX_SESSIONS the oldest of this account's sessions ends.
         let mine = 0usize;
         for x in db.sessions {

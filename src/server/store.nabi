@@ -25,6 +25,13 @@ pub struct Account {
     /// when unset. Pages build the avatar from `id` (meta::avatar_url).
     pub name: str = "";
     pub avatar_url: str = "";
+    /// The primary verified address GitHub gave at the last login that
+    /// sent one; "" when it has none.
+    pub email: str = "";
+    /// Notices by mail (mail::kinds): on unless turned off, and the kinds
+    /// turned off one by one.
+    pub notify: bool = true;
+    pub notify_off: List<str> = List::new();
 }
 
 #[derive(Nabion)]

@@ -1,5 +1,7 @@
-// GitHub over curl: the OAuth login's user, a repository and a user or
-// organisation by name. Secrets go to curl on stdin, never in argv.
+// GitHub over curl: the OAuth login's user and email address, a
+// repository and a user or organisation by name. Secrets go to curl on
+// stdin, never in argv; `curl_from` and `curl_status` serve the other
+// HTTPS calls (Amazon SES) too.
 
 use pkg::index;
 use pkg::index::ApiError;
@@ -16,12 +18,13 @@ pub fn cq(s: str) -> str {
     "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 }
 
-/// Run `curl` with `config` on stdin (secrets never reach argv); its stdout.
-pub fn curl(config: str) throws (ApiError) -> str {
+/// Run `curl` with `config` on stdin (secrets never reach argv): whether
+/// it succeeded, and its stdout.
+fn run_curl(config: str) throws (ApiError) -> (bool, str) {
     let c = try Command::new("curl").args(["--config", "-"]).stdin(Stdio::Piped).stdout(Stdio::Piped).stderr(Stdio::Null).spawn() catch e {
         throw index::err(502, f"cannot run curl: {e}");
     };
-    let full = config + "silent\nshow-error\nfail\nmax-time = 20\n";
+    let full = config + "silent\nshow-error\nmax-time = 20\n";
     if let w: ChildStdin = c.take_stdin() {
         try w.write_all(full) catch _ {};
         try w.close() catch _ {};
@@ -31,9 +34,30 @@ pub fn curl(config: str) throws (ApiError) -> str {
         out = try str::from_utf8(try rd.read_to_end() catch _ { List::<u8>::new() }) catch _ { "" };
         try rd.close() catch _ {};
     }
-    let st = try c.wait() catch _ { throw index::err(502, "GitHub did not answer"); };
-    if !st.success() { throw index::err(502, "GitHub did not answer"); }
+    let st = try c.wait() catch _ { return (false, out); };
+    (st.success(), out)
+}
+
+/// The body of a request to GitHub; an error past a 2xx.
+pub fn curl(config: str) throws (ApiError) -> str { try curl_from(config, "GitHub") }
+
+/// The body of a request to `who`; an error past a 2xx.
+pub fn curl_from(config: str, who: str) throws (ApiError) -> str {
+    let (ok, out) = try run_curl(config + "fail\n");
+    if !ok { throw index::err(502, f"{who} did not answer"); }
     out
+}
+
+/// The status and body of a request, whatever the status; an error when
+/// there was no answer.
+pub fn curl_status(config: str, who: str) throws (ApiError) -> (i32, str) {
+    let (ok, out) = try run_curl(config + "write-out = \"\\n%{http_code}\"\n");
+    let k = out.rfind("\n") ?? 0usize;
+    let body = out[:k];
+    let code = if out.contains("\n") { out[k + 1:] } else { out };
+    let status = try code.trim().parse::<i32>() catch _ { 0 };
+    if !ok || status == 0 { throw index::err(502, f"{who} did not answer"); }
+    (status, body)
 }
 
 fn safe_token(t: str) -> bool {
@@ -73,6 +97,34 @@ pub fn display_name(raw: str) -> str {
 pub struct GitHubUser {
     pub account: Account;
     pub two_factor: bool;
+    /// The primary verified address; "" when there is none, none when
+    /// GitHub did not answer.
+    pub email: str | none;
+}
+
+/// Whether `s` is an address mail may go to: one line, one `@`, no
+/// spaces, quotes or angle brackets, at most 254 bytes, and not GitHub's
+/// noreply address (which takes no mail).
+pub fn is_email(s: str) -> bool {
+    if s.is_empty() || s.len() > 254 || s.to_lowercase().ends_with("@users.noreply.github.com") { return false; }
+    let at = 0usize;
+    for c in s.chars() {
+        if c == '@' { at += 1; }
+        if (c as u32) <= 0x20u32 || c == '"' || c == '<' || c == '>' || c == ',' || c == '\\' { return false; }
+    }
+    let (local, domain) = s.split_once("@") ?? ("", "");
+    at == 1 && !local.is_empty() && domain.contains(".") && !domain.starts_with(".") && !domain.ends_with(".")
+}
+
+/// The primary verified address in GitHub's `GET /user/emails` answer;
+/// "" when there is none.
+pub fn primary_email(text: str) -> str {
+    for item in json::items(text) {
+        let f = json::fields(item);
+        let e = (f.get("email") ?? "").trim();
+        if (f.get("primary") ?? "") == "true" && (f.get("verified") ?? "") == "true" && is_email(e) { return e; }
+    }
+    ""
 }
 
 /// The GitHub account behind an OAuth `code`, its PKCE `verifier` sent
@@ -90,8 +142,16 @@ pub fn github_user(cfg: Cfg, code: str, verifier: str) throws (ApiError) -> GitH
     if id <= 0i64 || !is_login(login) { throw index::err(502, "GitHub sent a malformed user"); }
     let av = user.get("avatar_url") ?? "";
     let a = Account { id: id, login: login, created: 0i64, name: display_name(user.get("name") ?? ""), avatar_url: if av.starts_with("https://") && av.len() <= 512 { av } else { "" } };
+    // The address takes the `user:email` scope; without an answer the
+    // one on record stays.
+    let email: str | none = none;
+    let list = try curl(f"url = {cq(cfg.api + "/user/emails")}\n{ua}header = {cq("Accept: application/vnd.github+json")}\nheader = {cq("Authorization: Bearer " + access)}\n") catch e {
+        eprintln(f"github: /user/emails: {e.msg}");
+        ""
+    };
+    if list.trim().starts_with("[") { email = primary_email(list); }
     // GitHub sends `two_factor_authentication` only to the user's own token.
-    GitHubUser { account: a, two_factor: (user.get("two_factor_authentication") ?? "") == "true" }
+    GitHubUser { account: a, two_factor: (user.get("two_factor_authentication") ?? "") == "true", email: email }
 }
 
 /// The User-Agent and, with GITHUB_API_TOKEN, the Authorization header
@@ -127,6 +187,14 @@ pub fn github_owner(cfg: Cfg, name: str) throws (ApiError) -> (str, i64, bool) {
     let id = try (f.get("id") ?? "").parse::<i64>() catch _ { 0i64 };
     if !is_login(login) || id <= 0i64 { throw index::err(502, "GitHub sent a malformed user"); }
     (login, id, (f.get("type") ?? "") == "Organization")
+}
+
+#[test]
+fn emails() {
+    let list = "[{\"email\":\"old@example.com\",\"primary\":false,\"verified\":true},{\"email\":\"ann@example.com\",\"primary\":true,\"verified\":true,\"visibility\":\"private\"}]";
+    assert(primary_email(list) == "ann@example.com", "primary verified");
+    assert(primary_email("[{\"email\":\"ann@example.com\",\"primary\":true,\"verified\":false}]").is_empty() && primary_email("[]").is_empty(), "unverified");
+    assert(is_email("a.b+c@mail.example.org") && !is_email("a@b@c.d") && !is_email("a b@c.d") && !is_email("a@localhost") && !is_email("1+x@users.noreply.github.com") && !is_email("<a@b.c>"), "addresses");
 }
 
 #[test]

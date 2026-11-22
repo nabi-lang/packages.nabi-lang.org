@@ -1,0 +1,169 @@
+// Amazon SES v2 with the instance role's credentials: IMDSv2 for the
+// credentials, Signature Version 4 for the request, curl for HTTPS (as
+// github.nabi calls GitHub). No access keys are configured anywhere.
+
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::json;
+use pkg::secret;
+use pkg::server::Cfg;
+use pkg::server::account::date;
+use pkg::server::github::{cq, curl_from, curl_status};
+use core::crypto::HashAlgorithm;
+use core::crypto::Hmac;
+
+/// Temporary credentials of the instance role.
+pub struct Creds {
+    pub key: str;
+    pub secret: str;
+    pub token: str;
+    /// When they stop working (unix seconds).
+    pub expires: i64;
+}
+
+/// Credentials are fetched again this long before they expire; AWS has
+/// the next ones ready at least five minutes before.
+pub const REFRESH_SECS: i64 = 300i64;
+
+/// Seconds the IMDSv2 session token asks for (its maximum, six hours).
+const IMDS_TTL: str = "21600";
+
+fn hmac(key: List<u8>, data: str) -> List<u8> { Hmac::mac(HashAlgorithm::Sha256, key, data) }
+
+/// SigV4's signing key: the secret, then the date (`yyyymmdd`), region,
+/// service and `aws4_request`, each HMAC-SHA256'd in.
+pub fn signing_key(secret_key: str, day: str, region: str, service: str) -> List<u8> {
+    let k = hmac(("AWS4" + secret_key).as_bytes().to_list(), day);
+    k = hmac(k, region);
+    k = hmac(k, service);
+    hmac(k, "aws4_request")
+}
+
+/// The canonical request of SigV4. `headers` are lowercase names with
+/// their values, sorted by name; all of them are signed.
+pub fn canonical_request(method: str, path: str, query: str, headers: List<(str, str)>, payload: str) -> str {
+    let b = StrBuf::new();
+    b.push_str(f"{method}\n{path}\n{query}\n");
+    let names: List<str> = List::new();
+    for (n, v) in headers {
+        b.push_str(f"{n}:{v.trim()}\n");
+        names.push(n);
+    }
+    b.push_str(f"\n{names.join(";")}\n{secret::sha256_hex(payload)}");
+    b.to_str()
+}
+
+/// The string SigV4 signs for a request made at `amz_date`
+/// (`yyyymmddThhmmssZ`).
+pub fn string_to_sign(amz_date: str, region: str, service: str, canonical: str) -> str {
+    f"AWS4-HMAC-SHA256\n{amz_date}\n{amz_date[:8]}/{region}/{service}/aws4_request\n{secret::sha256_hex(canonical)}"
+}
+
+/// The Authorization header's value for the request.
+pub fn authorization(key: str, secret_key: str, amz_date: str, region: str, service: str, method: str, path: str, query: str, headers: List<(str, str)>, payload: str) -> str {
+    let cr = canonical_request(method, path, query, headers, payload);
+    let sts = string_to_sign(amz_date, region, service, cr);
+    let sig = secret::hex(hmac(signing_key(secret_key, amz_date[:8], region, service), sts)[0:32]);
+    let names: List<str> = List::new();
+    for (n, _) in headers { names.push(n); }
+    f"AWS4-HMAC-SHA256 Credential={key}/{amz_date[:8]}/{region}/{service}/aws4_request, SignedHeaders={names.join(";")}, Signature={sig}"
+}
+
+/// `yyyymmddThhmmssZ` of a unix time.
+pub fn amz_date(t: i64) -> str {
+    let p2 = |x: i64| if x < 10i64 { f"0{x}" } else { f"{x}" };
+    let s = t % 86400i64;
+    f"{date(t).replace("-", "")}T{p2(s / 3600i64)}{p2((s / 60i64) % 60i64)}{p2(s % 60i64)}Z"
+}
+
+/// Unix seconds of `yyyy-mm-ddThh:mm:ssZ`; none for anything else.
+pub fn iso_secs(s: str) -> i64 | none {
+    if s.len() != 20 || s.byte(4) != 45u8 || s.byte(7) != 45u8 || s.byte(10) != 84u8 || s.byte(13) != 58u8 || s.byte(16) != 58u8 || s.byte(19) != 90u8 { return none; }
+    let n = |a: usize, b: usize| try s[a:b].parse::<i64>() catch _ { -1i64 };
+    let y = n(0usize, 4usize);
+    let m = n(5usize, 7usize);
+    let d = n(8usize, 10usize);
+    let hh = n(11usize, 13usize);
+    let mm = n(14usize, 16usize);
+    let ss = n(17usize, 19usize);
+    if y < 1970i64 || m < 1i64 || m > 12i64 || d < 1i64 || d > 31i64 || hh < 0i64 || hh > 23i64 || mm < 0i64 || mm > 59i64 || ss < 0i64 || ss > 60i64 { return none; }
+    // Days from the civil date (H. Hinnant's algorithm, as date() inverts).
+    let yy = if m <= 2i64 { y - 1i64 } else { y };
+    let era = yy / 400i64;
+    let yoe = yy - era * 400i64;
+    let mp = if m > 2i64 { m - 3i64 } else { m + 9i64 };
+    let doy = (153i64 * mp + 2i64) / 5i64 + d - 1i64;
+    let doe = yoe * 365i64 + yoe / 4i64 - yoe / 100i64 + doy;
+    let days = era * 146097i64 + doe - 719468i64;
+    days * 86400i64 + hh * 3600i64 + mm * 60i64 + ss
+}
+
+fn imds_line(base: str, path: str, tok: str) -> str {
+    f"url = {cq(base + path)}\nheader = {cq("X-aws-ec2-metadata-token: " + tok)}\nnoproxy = \"*\"\n"
+}
+
+/// The instance role's credentials from IMDSv2: a session token, the
+/// role's name, then its credentials.
+pub fn instance_creds(cfg: Cfg) throws (ApiError) -> Creds {
+    let base = cfg.imds_url;
+    let tok = (try curl_from(f"url = {cq(base + "/latest/api/token")}\nrequest = \"PUT\"\nheader = {cq("X-aws-ec2-metadata-token-ttl-seconds: " + IMDS_TTL)}\nnoproxy = \"*\"\n", "the instance metadata service")).trim();
+    if tok.is_empty() || tok.contains("\n") || tok.contains("\"") { throw index::err(502, "the instance metadata service sent no token"); }
+    let roles = try curl_from(imds_line(base, "/latest/meta-data/iam/security-credentials/", tok), "the instance metadata service");
+    let role = (roles.split_once("\n") ?? (roles, "")).0.trim();
+    if role.is_empty() || role.contains("/") || role.contains("\"") { throw index::err(502, "the instance has no IAM role; attach one that may call ses:SendEmail"); }
+    let text = try curl_from(imds_line(base, "/latest/meta-data/iam/security-credentials/" + role, tok), "the instance metadata service");
+    let f = json::fields(text);
+    let c = Creds { key: f.get("AccessKeyId") ?? "", secret: f.get("SecretAccessKey") ?? "", token: f.get("Token") ?? "", expires: iso_secs(f.get("Expiration") ?? "") ?? 0i64 };
+    if (f.get("Code") ?? "Success") != "Success" || c.key.is_empty() || c.secret.is_empty() || c.token.is_empty() || c.expires <= 0i64 {
+        throw index::err(502, f"the instance metadata service sent no credentials for role {role}");
+    }
+    eprintln(f"mail: credentials of role {role} until {amz_date(c.expires)}");
+    c
+}
+
+/// The host (and port, when given) of `url`, as curl sends it in Host.
+pub fn host_port(url: str) -> str {
+    let rest = (url.split_once("://") ?? ("", url)).1;
+    (rest.split_once("/") ?? (rest, "")).0
+}
+
+/// Send one plain-text mail through SES v2 (`SendEmail`), with
+/// `unsubscribe` as its List-Unsubscribe header. Throws with SES's
+/// answer when it refuses.
+pub fn send_email(cfg: Cfg, c: Creds, to: str, subject: str, text: str, unsubscribe: str, now: i64) throws (ApiError) {
+    let q = json::quote;
+    let body = f"{{\"FromEmailAddress\":{q(cfg.mail_from)},\"Destination\":{{\"ToAddresses\":[{q(to)}]}},\"Content\":{{\"Simple\":{{\"Subject\":{{\"Data\":{q(subject)},\"Charset\":\"UTF-8\"}},\"Body\":{{\"Text\":{{\"Data\":{q(text)},\"Charset\":\"UTF-8\"}}}},\"Headers\":[{{\"Name\":\"List-Unsubscribe\",\"Value\":{q("<" + unsubscribe + ">")}}}]}}}}}}";
+    let path = "/v2/email/outbound-emails";
+    let at = amz_date(now);
+    let headers: List<(str, str)> = [("host", host_port(cfg.ses_url)), ("x-amz-date", at), ("x-amz-security-token", c.token)];
+    let auth = authorization(c.key, c.secret, at, cfg.ses_region, "ses", "POST", path, "", headers, body);
+    let conf = f"url = {cq(cfg.ses_url + path)}\nheader = {cq("Content-Type: application/json")}\nheader = {cq("X-Amz-Date: " + at)}\nheader = {cq("X-Amz-Security-Token: " + c.token)}\nheader = {cq("Authorization: " + auth)}\nheader = {cq("Expect:")}\ndata-binary = {cq(body)}\n";
+    let (status, answer) = try curl_status(conf, "Amazon SES");
+    if status < 200 || status > 299 {
+        let said = json::fields(answer).get("message") ?? json::fields(answer).get("Message") ?? answer;
+        throw index::err(status, f"Amazon SES answered {status}: {if said.len() > 300 { said[:300] } else { said }}");
+    }
+}
+
+#[test]
+fn sigv4() {
+    // AWS's signing key example (secret wJalr.., 20120215, us-east-1, iam).
+    let ex = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    assert(secret::hex(signing_key(ex, "20120215", "us-east-1", "iam")[0:32]) == "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d", "signing key");
+    // The SigV4 test suite's get-vanilla.
+    let h: List<(str, str)> = [("host", "example.amazonaws.com"), ("x-amz-date", "20150830T123600Z")];
+    let cr = canonical_request("GET", "/", "", h, "");
+    assert(cr == "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\nhost;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", cr);
+    assert(secret::sha256_hex(cr) == "bb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63", "canonical request hash");
+    assert(string_to_sign("20150830T123600Z", "us-east-1", "service", cr) == "AWS4-HMAC-SHA256\n20150830T123600Z\n20150830/us-east-1/service/aws4_request\nbb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63", "string to sign");
+    let a = authorization("AKIDEXAMPLE", ex, "20150830T123600Z", "us-east-1", "service", "GET", "/", "", h, "");
+    assert(a == "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31", a);
+}
+
+#[test]
+fn times() {
+    assert(amz_date(1440938160i64) == "20150830T123600Z", amz_date(1440938160i64));
+    assert((iso_secs("2015-08-30T12:36:00Z") ?? 0i64) == 1440938160i64 && (iso_secs("2000-02-29T00:00:00Z") ?? 0i64) == 951782400i64, "iso");
+    assert(iso_secs("2015-08-30 12:36:00Z") is none && iso_secs("2015-13-30T12:36:00Z") is none && iso_secs("") is none, "bad iso");
+    assert(host_port("https://email.us-east-1.amazonaws.com") == "email.us-east-1.amazonaws.com" && host_port("http://127.0.0.1:9/x") == "127.0.0.1:9", "hosts");
+}

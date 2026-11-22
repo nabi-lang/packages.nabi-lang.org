@@ -7,7 +7,13 @@
 // that code and redirects back with it; the token exchange then wants the
 // matching code_verifier. Code `admin` logs in as `alice` (id 1001),
 // `user` as `Bob` (id 1002), both with two-factor authentication, and
-// `no2fa` as `dave` (id 1004), without.
+// `no2fa` as `dave` (id 1004), without. `/user/emails` gives alice and
+// Bob a primary verified address, dave only an unverified one.
+//
+// It also stands in for AWS: the instance metadata service (IMDSv2, a
+// role `e2e-role`) and SES v2's SendEmail, which wants the role's session
+// token and a SigV4 Authorization for region us-east-1; `GET /_mails`
+// lists the mail bodies it took, one a line.
 // Repositories of `acme` exist, owned by id 4242, and of `nabi-lang`,
 // owned by id 5151; `/users/` knows the organisations `acme` and
 // `nabi-lang` and the user `carol` (id 3003). The issuer is
@@ -75,7 +81,7 @@ fn param(q: str, key: str) -> str {
     ""
 }
 
-fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>) throws {
+fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>, mails: List<str>) throws {
     let data: List<u8> = List::new();
     let buf: List<u8> = List::with_capacity(4096);
     for _ in 0..4096 { buf.push(0u8); }
@@ -120,6 +126,44 @@ fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>) throws {
             if body.contains("code=user&") { out = "{\"access_token\":\"gho_bob\",\"token_type\":\"bearer\",\"scope\":\"read:user\"}"; }
             if body.contains("code=no2fa&") { out = "{\"access_token\":\"gho_dave\",\"token_type\":\"bearer\",\"scope\":\"read:user\"}"; }
         }
+    } else if line.0.starts_with("GET /user/emails ") {
+        status = "401 Unauthorized";
+        if text.contains("\r\nAuthorization: Bearer gho_alice\r\n") {
+            status = "200 OK";
+            out = "[{\"email\":\"old@example.com\",\"primary\":false,\"verified\":true,\"visibility\":null},{\"email\":\"alice@example.com\",\"primary\":true,\"verified\":true,\"visibility\":\"private\"}]";
+        }
+        if text.contains("\r\nAuthorization: Bearer gho_bob\r\n") {
+            status = "200 OK";
+            out = "[{\"email\":\"bob@example.com\",\"primary\":true,\"verified\":true,\"visibility\":\"public\"}]";
+        }
+        if text.contains("\r\nAuthorization: Bearer gho_dave\r\n") {
+            status = "200 OK";
+            out = "[{\"email\":\"dave@example.com\",\"primary\":true,\"verified\":false,\"visibility\":\"public\"}]";
+        }
+    } else if line.0.starts_with("PUT /latest/api/token ") {
+        status = "400 Bad Request";
+        if text.contains("\r\nX-aws-ec2-metadata-token-ttl-seconds: 21600\r\n") {
+            status = "200 OK";
+            out = "e2e-imds-token";
+        }
+    } else if let rest: str = line.0.strip_prefix("GET /latest/meta-data/iam/security-credentials/") {
+        status = "401 Unauthorized";
+        if text.contains("\r\nX-aws-ec2-metadata-token: e2e-imds-token\r\n") {
+            status = "200 OK";
+            out = if rest.starts_with(" ") { "e2e-role" } else { "{\"Code\":\"Success\",\"Type\":\"AWS-HMAC\",\"AccessKeyId\":\"ASIAE2E\",\"SecretAccessKey\":\"e2e-secret\",\"Token\":\"e2e-session-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}" };
+        }
+    } else if line.0.starts_with("POST /v2/email/outbound-emails ") {
+        status = "403 Forbidden";
+        out = "{\"message\":\"The security token included in the request is invalid.\"}";
+        let signed = text.contains("\r\nAuthorization: AWS4-HMAC-SHA256 Credential=ASIAE2E/") && text.contains("/us-east-1/ses/aws4_request, SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=");
+        if signed && text.contains("\r\nX-Amz-Security-Token: e2e-session-token\r\n") && text.contains("\r\nX-Amz-Date: ") {
+            status = "200 OK";
+            mails.push(body);
+            out = f"{{\"MessageId\":\"e2e-{mails.len()}\"}}";
+        }
+    } else if line.0.starts_with("GET /_mails ") {
+        status = "200 OK";
+        out = mails.join("\n") + "\n";
     } else if line.0.starts_with("GET /oidc/.well-known/openid-configuration ") {
         status = "200 OK";
         out = f"{{\"issuer\":\"http://{addr}/oidc\",\"jwks_uri\":\"http://{addr}/oidc/jwks\"}}";
@@ -176,9 +220,10 @@ fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>) throws {
 fn main() throws {
     let args = env::args();
     let pkce: Dict<str, str> = Dict::new();
+    let mails: List<str> = List::new();
     using l = try net::tcp_listen(args[1]) {
         try for s in l.incoming() {
-            try answer(s, args[2], args[1], pkce) catch e { eprintln(f"fake github: {e}"); };
+            try answer(s, args[2], args[1], pkce, mails) catch e { eprintln(f"fake github: {e}"); };
             try s.close() catch _ {};
         }
     }

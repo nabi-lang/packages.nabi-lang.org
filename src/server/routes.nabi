@@ -122,7 +122,7 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     }
     if p == "/login" && get { return try login(cfg, site, p); }
     if p == "/auth/github/callback" && get { return try callback(cfg, site, r); }
-    if (p == "/me" && get) || (post && (p == "/logout" || p == "/me/tokens" || (p.starts_with("/me/tokens/") && p.ends_with("/revoke")) || p == "/me/trusted" || (p.starts_with("/me/trusted/") && p.ends_with("/remove")) || p == "/me/owners" || p == "/me/owners/remove" || p == "/me/invites/accept" || p == "/me/invites/decline" || p == "/me/sessions/logout-all" || (p.starts_with("/me/sessions/") && p.ends_with("/logout")))) {
+    if (p == "/me" && get) || (post && (p == "/logout" || p == "/me/tokens" || (p.starts_with("/me/tokens/") && p.ends_with("/revoke")) || p == "/me/trusted" || (p.starts_with("/me/trusted/") && p.ends_with("/remove")) || p == "/me/owners" || p == "/me/owners/remove" || p == "/me/invites/accept" || p == "/me/invites/decline" || p == "/me/notices" || p == "/me/sessions/logout-all" || (p.starts_with("/me/sessions/") && p.ends_with("/logout")))) {
         return try account_route(cfg, site, r, client);
     }
     if !get { return message(site, p, 405, "Method not allowed", "Only GET here."); }

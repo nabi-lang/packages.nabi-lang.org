@@ -10,6 +10,7 @@ use pkg::packages;
 use pkg::secret;
 use pkg::server::admin::{Audit, audit};
 use pkg::server::github::{github_owner, github_repo, is_login};
+use pkg::server::mail;
 use pkg::server::store::{Account, Db, Invite, OrgOwner, Owner, account_of, invites_of, load_db, now_secs, owners_of, save_db};
 use pkg::server::{Cfg, LOCK, STALE};
 use pkg::trust;
@@ -70,11 +71,14 @@ pub fn add_trusted(cfg: Cfg, a: Account, admin: bool, p: TrustedPublisher) throw
     // A trusted publisher's repository owner is shown as an owner.
     STALE.store(1);
     audit(cfg, Audit { at: now_secs(), by: a.id, action: "trusted-add", target: f"{out.package} {out.repository} {out.workflow} {out.environment}".trim() });
+    let env = if out.environment.is_empty() { "" } else { f", environment {out.environment}" };
+    mail::notify(cfg, "trusted", k, out.package, f"trusted publisher added to {out.package}", f"{a.login} added a trusted publisher to {out.package}: GitHub Actions in {out.repository}, workflow {out.workflow}{env}. That workflow may now publish and yank {out.package}.", List::new());
     out
 }
 
 /// Remove trusted publisher `id` for account `a`.
 pub fn remove_trusted(cfg: Cfg, a: Account, admin: bool, id: str) throws (ApiError) {
+    let was = TrustedPublisher { package: "", repository: "", workflow: "" };
     using g = LOCK.lock() {
         let db = try data(cfg);
         let keep: List<TrustedPublisher> = List::new();
@@ -87,6 +91,7 @@ pub fn remove_trusted(cfg: Cfg, a: Account, admin: bool, id: str) throws (ApiErr
             if !may_manage(db, index::key(p.package), a.id, admin) { throw index::err(404, "no such trusted publisher"); }
             if p.seeded { throw index::err(400, "this trusted publisher is in the server's PACKAGES_TRUSTED file; remove it there"); }
             gone = true;
+            was = p;
         }
         if !gone { throw index::err(404, "no such trusted publisher"); }
         db.trusted = keep;
@@ -94,6 +99,7 @@ pub fn remove_trusted(cfg: Cfg, a: Account, admin: bool, id: str) throws (ApiErr
     }
     STALE.store(1);
     audit(cfg, Audit { at: now_secs(), by: a.id, action: "trusted-remove", target: id });
+    mail::notify(cfg, "trusted", index::key(was.package), was.package, f"trusted publisher removed from {was.package}", f"{a.login} removed a trusted publisher from {was.package}: GitHub Actions in {was.repository}, workflow {was.workflow}.", List::new());
 }
 
 /// Whether `who` may be written as an owner: a login, or `org/team`.
@@ -180,6 +186,11 @@ pub fn add_owner(cfg: Cfg, a: Account, admin: bool, package: str, who: str) thro
     }
     STALE.store(1);
     audit(cfg, Audit { at: now_secs(), by: a.id, action: "owner-add", target: f"{package} {who}" });
+    if out.org {
+        mail::notify(cfg, "owners", k, package, f"{out.login} added as an owner of {package}", f"{a.login} listed {out.login} as an owner of {package}.", List::new());
+    } else {
+        mail::notify(cfg, "owners", k, package, f"{out.login} invited to own {package}", f"{a.login} invited {out.login} to own {package}. They own it once they accept on their account page ({cfg.url}/me).", [out.id]);
+    }
     out
 }
 
@@ -206,6 +217,7 @@ pub fn accept_invite(cfg: Cfg, a: Account, package: str, accept: bool) throws (A
     }
     STALE.store(1);
     audit(cfg, Audit { at: now_secs(), by: a.id, action: if accept { "invite-accept" } else { "invite-decline" }, target: package });
+    if accept { mail::notify(cfg, "owners", k, package, f"{a.login} now owns {package}", f"{a.login} accepted the invitation and now owns {package}: they may publish and yank it and change its owners.", List::new()); }
 }
 
 /// Remove `who` (a login, an organisation or `org/team`; or the account
@@ -254,6 +266,8 @@ pub fn remove_owner(cfg: Cfg, a: Account, admin: bool, package: str, who: str, i
     STALE.store(1);
     let whom = if who.is_empty() { f"{id}" } else { who };
     audit(cfg, Audit { at: now_secs(), by: a.id, action: "owner-remove", target: f"{package} {whom}" });
+    // The account removed hears of it too.
+    mail::notify(cfg, "owners", k, package, f"{whom} removed from the owners of {package}", f"{a.login} removed {whom} from the owners of {package}, or withdrew their invitation.", if team.is_empty() { [target] } else { List::new() });
 }
 
 #[test]
