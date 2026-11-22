@@ -1010,6 +1010,9 @@ expect_body '<h1 class="t-h2">Keywords</h1>' "keywords title"
 req GET /packages/geom/0.1.0
 expect_body '<a href="/packages?q=geometry">geometry</a>' "an old version's keyword searches"
 grep -q '<loc>https://packages.nabi-lang.org/categories/mathematics</loc>' "$T/site/public/sitemap.xml" || fail "category in the sitemap"
+grep -Eq '<loc>https://packages.nabi-lang.org/packages/geom</loc><lastmod>20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z</lastmod>' "$T/site/public/sitemap.xml" || fail "lastmod in the sitemap"
+grep -q '<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareSourceCode","name":"geom","url":"https://packages.nabi-lang.org/packages/geom"' "$T/site/public/packages/geom.html" || fail "SoftwareSourceCode"
+grep -q '"@type":"BreadcrumbList","itemListElement":\[{"@type":"ListItem","position":1,"name":"Packages"' "$T/site/public/packages/geom/versions.html" || fail "BreadcrumbList"
 # An executable alone: no Docs tab, `nabi install` in the box, a bin tag.
 req GET /packages/app
 expect_code 200 "executable page"

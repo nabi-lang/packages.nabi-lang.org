@@ -173,7 +173,7 @@ pub fn page(site: Site, out: str, title: str, body: str) -> str { page_desc(site
 
 /// `img` and `alt` are a package's card; the home card by default. Every
 /// card is drawn at the home card's size (og/render.ts).
-pub fn page_desc(site: Site, out: str, title: str, about: str, body: str, img: str = "", alt: str = "", lang: str = "en") -> str {
+pub fn page_desc(site: Site, out: str, title: str, about: str, body: str, img: str = "", alt: str = "", lang: str = "en", ld: str = "") -> str {
     let home = out == "index.html";
     let full = if home { site.title + " - " + site.tagline } else { title + " - " + site.title };
     let desc = esc(if about.is_empty() { site.description } else { build::clip(about, 160) });
@@ -187,7 +187,7 @@ pub fn page_desc(site: Site, out: str, title: str, about: str, body: str, img: s
     f"<!doctype html>
 <html lang=\"{lang}\" class=\"nb lt\">
 <head>
-{chrome::head(chrome::Head { title: full, site: site.title, desc: desc, url: canon, img: ogimg, img_w: site.og_w, img_h: site.og_h, alt: ogalt, asset: |n| asset(site, n) })}</head>
+{chrome::head(chrome::Head { title: full, site: site.title, desc: desc, url: canon, img: ogimg, img_w: site.og_w, img_h: site.og_h, alt: ogalt, asset: |n| asset(site, n) })}{ld}</head>
 <body>
 <a class=\"skip\" href=\"#content\">Skip to content</a>
 <header class=\"hdr\">
@@ -1075,6 +1075,73 @@ fn side(site: Site, s: Package) -> str {
 "
 }
 
+// Structured data (schema.org, JSON-LD) for search engines: a package
+// page's SoftwareSourceCode, and the breadcrumbs of the pages that show
+// them.
+
+/// `json` as a `<script type="application/ld+json">`; `</` escaped so
+/// no text in it ends the script.
+fn ld_script(json: str) -> str { f"<script type=\"application/ld+json\">{json.replace("</", "<\\/")}</script>\n" }
+
+fn js(s: str) -> str { build::json_str(s) }
+
+/// A BreadcrumbList of `items`: each a name and a root-relative path.
+pub fn breadcrumb_ld(site: Site, items: List<(str, str)>) -> str {
+    let b: List<str> = List::new();
+    for k in 0..items.len() {
+        let (name, path) = items[k];
+        b.push(f"{{\"@type\":\"ListItem\",\"position\":{k + 1},\"name\":{js(name)},\"item\":{js(site.base_url + path)}}}");
+    }
+    ld_script(f"{{\"@context\":\"https://schema.org\",\"@type\":\"BreadcrumbList\",\"itemListElement\":[{b.join(",")}]}}")
+}
+
+/// The JSON-LD of a package's page or tab `tab` (`readme`, `versions`,
+/// ..): the package as SoftwareSourceCode (the version a version page
+/// shows), and the page's breadcrumbs.
+pub fn package_ld(site: Site, s: Package, tab: str) -> str {
+    let l = s.latest;
+    let m = s.meta;
+    let page = url(readme_out(s));
+    let f: List<str> = ["\"@context\":\"https://schema.org\"", "\"@type\":\"SoftwareSourceCode\"", f"\"name\":{js(s.name)}", f"\"url\":{js(site.base_url + page)}", f"\"version\":{js(l.version)}", "\"programmingLanguage\":{\"@type\":\"ComputerLanguage\",\"name\":\"Nabi\",\"url\":\"https://nabi-lang.org\"}"];
+    if !s.desc.is_empty() { f.push(f"\"description\":{js(s.desc)}"); }
+    let repo = packages::web_of(l.url);
+    if !repo.is_empty() { f.push(f"\"codeRepository\":{js(repo)}"); }
+    if !m.license.is_empty() { f.push(f"\"license\":{js(m.license)}"); }
+    if !m.keywords.is_empty() {
+        let ks: List<str> = List::new();
+        for k in m.keywords { ks.push(k); }
+        f.push(f"\"keywords\":{js(ks.join(", "))}");
+    }
+    if !m.authors.is_empty() {
+        let au: List<str> = List::new();
+        for a in m.authors {
+            // `Ann <ann@example.org>`: the name only.
+            let name = (a.split_once(" <") ?? (a, "")).0.trim();
+            if !name.is_empty() { au.push(f"{{\"@type\":\"Person\",\"name\":{js(name)}}}"); }
+        }
+        if !au.is_empty() { f.push(f"\"author\":[{au.join(",")}]"); }
+    }
+    if !l.date.is_empty() { f.push(f"\"dateModified\":{js(l.date)}"); }
+    let first = "";
+    for v in s.versions {
+        if !v.date.is_empty() && (first.is_empty() || v.date < first) { first = v.date; }
+    }
+    if !first.is_empty() { f.push(f"\"datePublished\":{js(first)}"); }
+    let crumbs: List<(str, str)> = [("Packages", "/packages"), (s.name, url(package_out(s.name)))];
+    if !s.at.is_empty() { crumbs.push((s.at, url(ver_out(s.name, s.at)))); }
+    if tab != "readme" { crumbs.push((tab_title(tab), url(tab_out(s.name, tab)))); }
+    ld_script("{" + f.join(",") + "}") + breadcrumb_ld(site, crumbs)
+}
+
+fn tab_title(tab: str) -> str {
+    match tab {
+        "versions" => "Versions",
+        "dependencies" => "Dependencies",
+        "dependents" => "Dependents",
+        _ => tab,
+    }
+}
+
 // Badges: `/packages/<name>/badge.svg`, the latest version as a flat
 // shields-style badge for READMEs.
 
@@ -1501,6 +1568,20 @@ fn browse_pages() {
     assert(title == "Categories" && body.contains("<a href=\"/categories/science\">Science</a><span class=\"ct\">3</span>") && body.contains("2 categories"), body);
     let (tt, _about, tb) = topic_page(ts[1], true);
     assert(tt == "Category: Science" && tb.contains("3 packages") && tb.contains("href=\"/packages/c\""), tb);
+}
+
+#[test]
+fn structured_data() {
+    let v = Version { version: "1.2.0", deps: List::new(), url: "https://github.com/acme/json", rev: "", tree: "", yanked: false, features: List::new(), date: "2026-11-20T09:49Z" };
+    let m = packages::no_meta();
+    m.license = "MIT";
+    m.authors = ["Ann Lee <ann@example.org>"];
+    let s = Package { name: "json", file: "", versions: [v], latest: v, time: 0i64, date: "", readme: "", desc: "JSON </script> values", rdeps: List::new(), facts: none, api: List::new(), api_none: "", import: "", meta: m };
+    let site = Site { title: "", tagline: "", index_repo: "", base_url: "https://p.test" };
+    let ld = package_ld(site, s, "versions");
+    assert(ld.contains("\"@type\":\"SoftwareSourceCode\",\"name\":\"json\",\"url\":\"https://p.test/packages/json\",\"version\":\"1.2.0\"") && ld.contains("\"codeRepository\":\"https://github.com/acme/json\"") && ld.contains("\"author\":[{\"@type\":\"Person\",\"name\":\"Ann Lee\"}]") && ld.contains("\"datePublished\":\"2026-11-20T09:49Z\""), ld);
+    assert(ld.contains("JSON <\\/script> values") && !ld.contains("</script> values"), "script end escaped");
+    assert(ld.contains("{\"@type\":\"ListItem\",\"position\":3,\"name\":\"Versions\",\"item\":\"https://p.test/packages/json/versions\"}"), ld);
 }
 
 #[test]

@@ -315,6 +315,13 @@ fn main() throws {
     try fs::write("og/manifest.tsv", mani.to_str());
 
     let files: Dict<str, str> = Dict::new();
+    // The sitemap's <lastmod> of a page: when what it shows was last
+    // published (a version's index commit), by output file.
+    let lastmod: Dict<str, str> = Dict::new();
+    let newest = "";
+    for s in all {
+        if s.latest.date > newest { newest = s.latest.date; }
+    }
     let guide = markdown::render(try fs::read_to_str("pages/publishing.md"), layout::md(|h| h));
     guide.html = web::chrome::align_classes(guide.html);
     files.insert("index.html", layout::page(site, "index.html", site.title, layout::landing(all)));
@@ -352,17 +359,19 @@ fn main() throws {
         let (og, alt) = if drawn(site, "og/" + s.name + ".png", og_v[s.name]) {
             (site.base_url + "/og/" + s.name + ".png?v=" + og_v[s.name], f"{s.name} {s.latest.version}: {about}")
         } else { ("", "") };
-        files.insert(out, layout::page_desc(site, out, s.name, about, layout::package_page(site, s), og, alt));
+        files.insert(out, layout::page_desc(site, out, s.name, about, layout::package_page(site, s), og, alt, "en", layout::package_ld(site, s, "readme")));
         let vo = layout::tab_out(s.name, "versions");
-        files.insert(vo, layout::page_desc(site, vo, f"Versions of {s.name}", about, layout::versions_page(site, s), og, alt));
+        files.insert(vo, layout::page_desc(site, vo, f"Versions of {s.name}", about, layout::versions_page(site, s), og, alt, "en", layout::package_ld(site, s, "versions")));
         let dpo = layout::tab_out(s.name, "dependencies");
-        files.insert(dpo, layout::page_desc(site, dpo, f"Dependencies of {s.name}", about, layout::deps_page(site, s, have), og, alt));
+        files.insert(dpo, layout::page_desc(site, dpo, f"Dependencies of {s.name}", about, layout::deps_page(site, s, have), og, alt, "en", layout::package_ld(site, s, "dependencies")));
         let rdo = layout::tab_out(s.name, "dependents");
-        files.insert(rdo, layout::page_desc(site, rdo, f"Dependents of {s.name}", about, layout::dependents_page(site, s), og, alt));
+        files.insert(rdo, layout::page_desc(site, rdo, f"Dependents of {s.name}", about, layout::dependents_page(site, s), og, alt, "en", layout::package_ld(site, s, "dependents")));
+        for o in [out, vo, dpo, rdo] { lastmod.insert(o, s.latest.date); }
         for v in s.views {
             let vabout = if v.desc.is_empty() { f"{s.name} {v.at}, a Nabi package" } else { v.desc };
             let po = layout::ver_out(s.name, v.at);
-            files.insert(po, layout::page_desc(site, po, f"{s.name} {v.at}", vabout, layout::package_page(site, v), og, alt));
+            files.insert(po, layout::page_desc(site, po, f"{s.name} {v.at}", vabout, layout::package_page(site, v), og, alt, "en", layout::package_ld(site, v, "readme")));
+            lastmod.insert(po, v.latest.date);
         }
     }
 
@@ -372,10 +381,17 @@ fn main() throws {
         let index_out = if cats { "categories/index.html" } else { "keywords/index.html" };
         let (title, body) = layout::topics_page(ts, cats);
         files.insert(index_out, layout::page_desc(site, index_out, title, if cats { "Nabi packages by category." } else { "Nabi packages by keyword." }, body));
+        let index_crumb = if cats { ("Categories", "/categories") } else { ("Keywords", "/keywords") };
+        lastmod.insert(index_out, newest);
         for t in ts {
             let out = layout::topic_out(cats, t.slug);
             let (tt, about, tb) = layout::topic_page(t, cats);
-            files.insert(out, layout::page_desc(site, out, tt, about, tb));
+            files.insert(out, layout::page_desc(site, out, tt, about, tb, "", "", "en", layout::breadcrumb_ld(site, [index_crumb, (t.label, layout::url(out))])));
+            let last = "";
+            for p in t.packages {
+                if p.latest.date > last { last = p.latest.date; }
+            }
+            lastmod.insert(out, last);
         }
     }
 
@@ -395,14 +411,20 @@ fn main() throws {
     let out_root = site.out + ".new";
     if fs::exists(out_root) { try fs::remove_dir_all(out_root); }
     for out in files.keys() { try write(out_root, out, files[out]); }
-    let urls: List<str> = List::new();
+    lastmod.insert("index.html", newest);
+    lastmod.insert("packages/index.html", newest);
+    let outs: List<str> = List::new();
     for out in files.keys() {
-        if out != "404.html" { urls.push(site.base_url + layout::url(out)); }
+        if out != "404.html" { outs.push(out); }
     }
-    urls.sort();
+    outs.sort_by(|a: str, b: str| layout::url(a).cmp(layout::url(b)));
     let map = StrBuf::new();
     map.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
-    for u in urls { map.push_str(f"<url><loc>{markdown::esc(u)}</loc></url>\n"); }
+    for out in outs {
+        let at = lastmod.get(out) ?? "";
+        let lm = if at.is_empty() { "" } else { f"<lastmod>{markdown::esc(at)}</lastmod>" };
+        map.push_str(f"<url><loc>{markdown::esc(site.base_url + layout::url(out))}</loc>{lm}</url>\n");
+    }
     map.push_str("</urlset>\n");
     try write(out_root, "sitemap.xml", map.to_str());
     try write(out_root, "robots.txt", f"User-agent: *\nDisallow: /me\nSitemap: {site.base_url}/sitemap.xml\n");
