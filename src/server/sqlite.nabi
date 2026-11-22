@@ -1,0 +1,388 @@
+// SQLite through the system's libsqlite3, loaded at run time
+// (bare::ffi::Library): connections, prepared statements, transactions
+// and the online backup. Only what the store needs; no callbacks.
+//
+// The library is libsqlite3.so.0 on Linux and /usr/lib/libsqlite3.dylib
+// on macOS; PACKAGES_SQLITE names another. A connection is used by one
+// thread at a time (store's pool); SQLite is opened in its serialized
+// mode all the same.
+//
+// Every value reaches SQL through a bind: text with SQLITE_TRANSIENT,
+// so SQLite copies it before the call returns.
+
+use bare::ffi::{CStr, CString, Library};
+use bare::ffi::types::c_void;
+use bare::gc::pin;
+use bare::mem::transmute_unchecked;
+use bare::ptr::{CPtr, ConstPtr};
+use std::env;
+
+/// A failed call: SQLite's result code and message.
+pub struct SqlError {
+    pub code: i32;
+    pub msg: str;
+}
+
+impl Display for SqlError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"sqlite: {self.msg} (code {self.code})") }
+}
+
+impl Debug for SqlError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"SqlError({self.code}, {self.msg})") }
+}
+
+impl Error for SqlError {}
+
+const OK: i32 = 0;
+const ROW: i32 = 100;
+const DONE: i32 = 101;
+const NULL: i32 = 5;
+
+const OPEN_READWRITE: i32 = 2;
+const OPEN_CREATE: i32 = 4;
+const OPEN_FULLMUTEX: i32 = 65536;
+
+type OpenFn = extern "C" fn(ConstPtr<c_char>, CPtr<usize>, c_int, CPtr<c_char>) -> c_int;
+type CloseFn = extern "C" fn(CPtr<c_void>) -> c_int;
+type ExecFn = extern "C" fn(CPtr<c_void>, ConstPtr<c_char>, CPtr<c_void>, CPtr<c_void>, CPtr<c_void>) -> c_int;
+type PrepareFn = extern "C" fn(CPtr<c_void>, ConstPtr<u8>, c_int, CPtr<usize>, CPtr<c_void>) -> c_int;
+type BindTextFn = extern "C" fn(CPtr<c_void>, c_int, ConstPtr<u8>, c_int, CPtr<c_void>) -> c_int;
+type BindIntFn = extern "C" fn(CPtr<c_void>, c_int, i64) -> c_int;
+type BindNullFn = extern "C" fn(CPtr<c_void>, c_int) -> c_int;
+type StmtFn = extern "C" fn(CPtr<c_void>) -> c_int;
+type ColTextFn = extern "C" fn(CPtr<c_void>, c_int) -> CPtr<u8>;
+type ColIntFn = extern "C" fn(CPtr<c_void>, c_int) -> c_int;
+type ColInt64Fn = extern "C" fn(CPtr<c_void>, c_int) -> i64;
+type ErrmsgFn = extern "C" fn(CPtr<c_void>) -> CPtr<c_char>;
+type BusyFn = extern "C" fn(CPtr<c_void>, c_int) -> c_int;
+type BackupInitFn = extern "C" fn(CPtr<c_void>, ConstPtr<c_char>, CPtr<c_void>, ConstPtr<c_char>) -> CPtr<c_void>;
+type BackupStepFn = extern "C" fn(CPtr<c_void>, c_int) -> c_int;
+type VersionFn = extern "C" fn() -> CPtr<c_char>;
+type MemcpyFn = extern "C" fn(CPtr<u8>, CPtr<u8>, usize) -> CPtr<u8>;
+
+fn names() -> List<str> {
+    [
+    "sqlite3_open_v2", "sqlite3_close_v2", "sqlite3_exec", "sqlite3_prepare_v2",
+    "sqlite3_bind_text", "sqlite3_bind_int64", "sqlite3_bind_null", "sqlite3_step",
+    "sqlite3_column_text", "sqlite3_column_bytes", "sqlite3_column_int64", "sqlite3_column_type",
+    "sqlite3_reset", "sqlite3_finalize", "sqlite3_errmsg", "sqlite3_busy_timeout",
+    "sqlite3_backup_init", "sqlite3_backup_step", "sqlite3_backup_finish", "sqlite3_changes",
+        "sqlite3_libversion",
+    ]
+}
+
+const F_OPEN: usize = 0;
+const F_CLOSE: usize = 1;
+const F_EXEC: usize = 2;
+const F_PREPARE: usize = 3;
+const F_BIND_TEXT: usize = 4;
+const F_BIND_INT: usize = 5;
+const F_BIND_NULL: usize = 6;
+const F_STEP: usize = 7;
+const F_COL_TEXT: usize = 8;
+const F_COL_BYTES: usize = 9;
+const F_COL_INT: usize = 10;
+const F_COL_TYPE: usize = 11;
+const F_RESET: usize = 12;
+const F_FINALIZE: usize = 13;
+const F_ERRMSG: usize = 14;
+const F_BUSY: usize = 15;
+const F_BACKUP_INIT: usize = 16;
+const F_BACKUP_STEP: usize = 17;
+const F_BACKUP_FINISH: usize = 18;
+const F_CHANGES: usize = 19;
+const F_VERSION: usize = 20;
+const F_MEMCPY: usize = 21;
+
+/// The symbols' addresses, loaded once; empty until then.
+static SYMS: Mutex<List<usize>> = Mutex::new(List::new());
+
+#[cfg(target_os = "macos")]
+const LIB: str = "/usr/lib/libsqlite3.dylib";
+#[cfg(target_os = "windows")]
+const LIB: str = "sqlite3.dll";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const LIB: str = "libsqlite3.so.0";
+
+/// The library PACKAGES_SQLITE names, else the system's.
+pub fn lib_path() -> str {
+    let p = (try env::var("PACKAGES_SQLITE") catch _ { "" }).trim();
+    if p.is_empty() { LIB } else { p }
+}
+
+fn syms() throws (SqlError) -> List<usize> {
+    let out: List<usize> = List::new();
+    using g = SYMS.lock() {
+        let l = g.get();
+        if l.is_empty() {
+            let path = lib_path();
+            let lib = try Library::open(path) catch e {
+                throw SqlError { code: -1, msg: f"{e}; install SQLite 3 (apt install libsqlite3-0) or set PACKAGES_SQLITE to the path of libsqlite3" };
+            };
+            let got: List<usize> = List::new();
+            for n in names() {
+                got.push((try lib.raw_symbol(n) catch e { throw SqlError { code: -1, msg: f"{path}: {e}; it is too old or not SQLite 3" }; }).addr());
+            }
+            got.push((try Library::this().raw_symbol("memcpy") catch e { throw SqlError { code: -1, msg: f"{e}" }; }).addr());
+            for x in got { l.push(x); }
+        }
+        for x in l { out.push(x); }
+    }
+    out
+}
+
+fn f<F>(x: usize) -> F { unsafe { transmute_unchecked(x) } }
+
+fn void(p: usize) -> CPtr<c_void> { CPtr::<c_void>::from_addr(p) }
+
+fn cstr(s: str) throws (SqlError) -> CString {
+    try CString::new(s) catch e { throw SqlError { code: -1, msg: f"{e}" }; }
+}
+
+fn text_at(p: CPtr<c_char>) -> str {
+    let q = p.as_const() ?? { return ""; };
+    let c = unsafe { CStr::from_ptr(q) } ?? { return ""; };
+    str::from_utf8_lossy(c.as_bytes())
+}
+
+/// SQLite's version, `3.45.1`.
+pub fn version() throws (SqlError) -> str {
+    let fs = try syms();
+    let v: VersionFn = f(fs[F_VERSION]);
+    text_at(unsafe { v() })
+}
+
+/// An open database.
+pub struct Conn {
+    /// The `sqlite3*`.
+    pub p: usize;
+    fs: List<usize>;
+}
+
+/// A prepared statement on `Conn`.
+pub struct Stmt {
+    p: usize;
+    db: usize;
+    fs: List<usize>;
+    sql: str;
+}
+
+/// Open `path`, created when `create`; with a busy timeout of
+/// `busy_ms`.
+pub fn open(path: str, create: bool, busy_ms: i32) throws (SqlError) -> Conn {
+    let fs = try syms();
+    let slot: List<usize> = [0usize];
+    let held = pin(slot);
+    let name = try cstr(path);
+    let flags = OPEN_READWRITE | OPEN_FULLMUTEX | (if create { OPEN_CREATE } else { 0 });
+    let o: OpenFn = f(fs[F_OPEN]);
+    let rc = unsafe { o(name.as_ptr(), CPtr::<usize>::from_addr(held.as_data_ptr().addr()), flags, CPtr::null()) };
+    let c = Conn { p: slot[0], fs: fs };
+    if rc != OK {
+        let msg = if c.p == 0usize { "out of memory" } else { errmsg(c) };
+        close(c);
+        throw SqlError { code: rc, msg: f"cannot open {path}: {msg}" };
+    }
+    let b: BusyFn = f(fs[F_BUSY]);
+    unsafe { b(void(c.p), busy_ms) };
+    c
+}
+
+/// The connection at `p`, from Conn::p: for a pool that keeps
+/// addresses.
+pub fn adopt(p: usize) throws (SqlError) -> Conn { Conn { p: p, fs: try syms() } }
+
+/// Close `c`; statements still open keep it until they are finalized.
+pub fn close(c: Conn) {
+    if c.p == 0usize { return; }
+    let x: CloseFn = f(c.fs[F_CLOSE]);
+    unsafe { x(void(c.p)) };
+}
+
+pub fn errmsg(c: Conn) -> str {
+    let e: ErrmsgFn = f(c.fs[F_ERRMSG]);
+    text_at(unsafe { e(void(c.p)) })
+}
+
+fn check(c: Conn, rc: i32, what: str) throws (SqlError) {
+    if rc != OK { throw SqlError { code: rc, msg: f"{what}: {errmsg(c)}" }; }
+}
+
+/// Run `sql`, one or more statements without parameters: schema and
+/// pragmas only, never text from a request.
+pub fn exec(c: Conn, sql: str) throws (SqlError) {
+    let q = try cstr(sql);
+    let e: ExecFn = f(c.fs[F_EXEC]);
+    try check(c, unsafe { e(void(c.p), q.as_ptr(), CPtr::null(), CPtr::null(), CPtr::null()) }, sql);
+}
+
+/// The rows changed by the last INSERT, UPDATE or DELETE.
+pub fn changes(c: Conn) -> i64 {
+    let x: StmtFn = f(c.fs[F_CHANGES]);
+    unsafe { x(void(c.p)) } as i64
+}
+
+pub fn prepare(c: Conn, sql: str) throws (SqlError) -> Stmt {
+    let slot: List<usize> = [0usize];
+    let held = pin(slot);
+    let p: PrepareFn = f(c.fs[F_PREPARE]);
+    let rc = unsafe { p(void(c.p), sql.as_ptr(), sql.len() as c_int, CPtr::<usize>::from_addr(held.as_data_ptr().addr()), CPtr::null()) };
+    try check(c, rc, sql);
+    if slot[0] == 0usize { throw SqlError { code: -1, msg: f"no statement in `{sql}`" }; }
+    Stmt { p: slot[0], db: c.p, fs: c.fs, sql: sql }
+}
+
+impl Stmt {
+    fn fail(self, rc: i32) -> SqlError {
+        let e: ErrmsgFn = f(self.fs[F_ERRMSG]);
+        SqlError { code: rc, msg: f"{self.sql}: {text_at(unsafe { e(void(self.db)) })}" }
+    }
+
+    /// Bind parameter `i` (from 1) to text `s`.
+    pub fn text(self, i: i32, s: str) throws (SqlError) -> Stmt {
+        let b: BindTextFn = f(self.fs[F_BIND_TEXT]);
+        // SQLITE_TRANSIENT: copied before the call returns.
+        let rc = unsafe { b(void(self.p), i, s.as_ptr(), s.len() as c_int, void(usize::MAX)) };
+        if rc != OK { throw self.fail(rc); }
+        self
+    }
+
+    pub fn num(self, i: i32, n: i64) throws (SqlError) -> Stmt {
+        let b: BindIntFn = f(self.fs[F_BIND_INT]);
+        let rc = unsafe { b(void(self.p), i, n) };
+        if rc != OK { throw self.fail(rc); }
+        self
+    }
+
+    pub fn null(self, i: i32) throws (SqlError) -> Stmt {
+        let b: BindNullFn = f(self.fs[F_BIND_NULL]);
+        let rc = unsafe { b(void(self.p), i) };
+        if rc != OK { throw self.fail(rc); }
+        self
+    }
+
+    /// The next row: true when there is one, false when done.
+    pub fn step(self) throws (SqlError) -> bool {
+        let s: StmtFn = f(self.fs[F_STEP]);
+        let rc = unsafe { s(void(self.p)) };
+        if rc == ROW { return true; }
+        if rc == DONE { return false; }
+        throw self.fail(rc);
+    }
+
+    /// Step to the end: for statements that return no rows.
+    pub fn run(self) throws (SqlError) {
+        while try self.step() {}
+    }
+
+    /// Column `i` (from 0) of the current row as text; "" for NULL.
+    pub fn col(self, i: i32) -> str {
+        let t: ColTextFn = f(self.fs[F_COL_TEXT]);
+        let p = unsafe { t(void(self.p), i) };
+        if p.is_null() { return ""; }
+        let b: ColIntFn = f(self.fs[F_COL_BYTES]);
+        let n = unsafe { b(void(self.p), i) } as usize;
+        if n == 0usize { return ""; }
+        let buf = List::filled(n, 0u8);
+        let held = pin(buf);
+        let m: MemcpyFn = f(self.fs[F_MEMCPY]);
+        unsafe { m(CPtr::<u8>::from_addr(held.as_data_ptr().addr()), p, n) };
+        str::from_utf8_lossy(buf)
+    }
+
+    pub fn col_int(self, i: i32) -> i64 {
+        let x: ColInt64Fn = f(self.fs[F_COL_INT]);
+        unsafe { x(void(self.p), i) }
+    }
+
+    pub fn is_null(self, i: i32) -> bool {
+        let x: ColIntFn = f(self.fs[F_COL_TYPE]);
+        unsafe { x(void(self.p), i) } == NULL
+    }
+
+    /// Ready to run again, with the same bindings.
+    pub fn reset(self) {
+        let x: StmtFn = f(self.fs[F_RESET]);
+        unsafe { x(void(self.p)) };
+    }
+
+    pub fn finalize(self) {
+        let x: StmtFn = f(self.fs[F_FINALIZE]);
+        unsafe { x(void(self.p)) };
+    }
+}
+
+/// `BEGIN IMMEDIATE` for a writer (it waits for the write lock up to the
+/// busy timeout), plain `BEGIN` for a reader's snapshot.
+pub fn begin(c: Conn, write: bool) throws (SqlError) { try exec(c, if write { "BEGIN IMMEDIATE" } else { "BEGIN" }); }
+
+pub fn commit(c: Conn) throws (SqlError) { try exec(c, "COMMIT"); }
+
+/// Undo an open transaction; nothing when there is none.
+pub fn rollback(c: Conn) { try exec(c, "ROLLBACK") catch _ {}; }
+
+/// Copy the whole database of `c` to a new file `dest` with the online
+/// backup API: a consistent copy while others read and write.
+pub fn backup(c: Conn, dest: str) throws (SqlError) {
+    let to = try open(dest, true, 5000);
+    let main = try cstr("main");
+    let init: BackupInitFn = f(c.fs[F_BACKUP_INIT]);
+    let b = unsafe { init(void(to.p), main.as_ptr(), void(c.p), main.as_ptr()) };
+    if b.is_null() {
+        let msg = errmsg(to);
+        close(to);
+        throw SqlError { code: -1, msg: f"backup to {dest}: {msg}" };
+    }
+    let step: BackupStepFn = f(c.fs[F_BACKUP_STEP]);
+    let rc = unsafe { step(b, -1) };
+    let fin: CloseFn = f(c.fs[F_BACKUP_FINISH]);
+    let rc2 = unsafe { fin(b) };
+    let msg = errmsg(to);
+    close(to);
+    if rc != DONE || rc2 != OK { throw SqlError { code: if rc != DONE { rc } else { rc2 }, msg: f"backup to {dest}: {msg}" }; }
+}
+
+#[test]
+fn binding() {
+    let dir = std::env::temp_dir().as_str() + f"/packages-sqlite-{std::process::id()}";
+    try std::fs::remove_dir_all(dir) catch _ {};
+    try! std::fs::create_dir_all(dir);
+    let c = try open(dir + "/t.sqlite3", true, 1000) catch e { panic(f"{e}"); };
+    assert((try version() catch e { panic(f"{e}"); }).starts_with("3."), "version");
+    try exec(c, "PRAGMA journal_mode=WAL; CREATE TABLE t(k TEXT PRIMARY KEY, n INTEGER, v TEXT)") catch e { panic(f"{e}"); };
+    try begin(c, true) catch e { panic(f"{e}"); };
+    let ins = try prepare(c, "INSERT INTO t(k, n, v) VALUES (?1, ?2, ?3)") catch e { panic(f"{e}"); };
+    // Quotes and SQL in the data stay data.
+    let odd = "x'); DROP TABLE t; -- \"ü\" ☃";
+    for (k, n) in [("a", 1i64), ("b", -7i64), (odd, 9007199254740993i64)] {
+        try ins.text(1, k).num(2, n).text(3, k.repeat(3)).run() catch e { panic(f"{e}"); };
+        ins.reset();
+    }
+    try ins.text(1, "").null(2).text(3, "").run() catch e { panic(f"{e}"); };
+    ins.finalize();
+    try commit(c) catch e { panic(f"{e}"); };
+    let q = try prepare(c, "SELECT k, n, v FROM t WHERE n > ?1 OR n IS NULL ORDER BY rowid") catch e { panic(f"{e}"); };
+    try q.num(1, 0i64) catch e { panic(f"{e}"); };
+    let got: List<str> = List::new();
+    while try! q.step() {
+        got.push(f"{q.col(0)}|{if q.is_null(1) { "null" } else { f"{q.col_int(1)}" }}|{q.col(2).len()}");
+    }
+    q.finalize();
+    assert(got.join(",") == f"a|1|3,{odd}|9007199254740993|{odd.len() * 3},|null|0", got.join(","));
+    // A unique key twice is refused, with the reason.
+    let dup = try prepare(c, "INSERT INTO t(k) VALUES (?1)") catch e { panic(f"{e}"); };
+    let refused = "";
+    try dup.text(1, "a").run() catch e { refused = e.msg; };
+    dup.finalize();
+    assert(refused.contains("UNIQUE"), refused);
+    try backup(c, dir + "/copy.sqlite3") catch e { panic(f"{e}"); };
+    close(c);
+    let d = try open(dir + "/copy.sqlite3", false, 1000) catch e { panic(f"{e}"); };
+    let n = try prepare(d, "SELECT count(*) FROM t") catch e { panic(f"{e}"); };
+    assert((try n.step() catch _ { false }) && n.col_int(0) == 4i64, "backup has every row");
+    n.finalize();
+    close(d);
+    let missing = try open(dir + "/missing.sqlite3", false, 1000) catch _ { Conn { p: 0usize, fs: List::new() } };
+    assert(missing.p == 0usize && !std::fs::exists(dir + "/missing.sqlite3"), "not created when create is false");
+    try std::fs::remove_dir_all(dir) catch _ {};
+}

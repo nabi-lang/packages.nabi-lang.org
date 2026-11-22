@@ -29,6 +29,7 @@ pub mod mail;
 pub mod names;
 pub mod owners;
 pub mod routes;
+pub mod sqlite;
 pub mod store;
 
 use pkg::Site;
