@@ -31,13 +31,15 @@ pub fn tab_out(name: str, tab: str) -> str { f"packages/{name}/{tab}.html" }
 pub fn ver_out(name: str, v: str) -> str { f"packages/{name}/{v}.html" }
 
 /// The docs of version `v` (docs.nabi), or of the latest one for
-/// `latest`: the root module's page, `/packages/<name>/<v>/docs`, a
-/// stable address. The other public modules' pages are beside it
-/// (apidoc::page): `/packages/<name>/<v>/docs/read` for `read`.
+/// `latest`: the root module's page, `/docs/<name>/<v>`, a stable
+/// address. The other public modules' pages are beside it
+/// (apidoc::page): `/docs/<name>/<v>/read` for `read`. The docs live
+/// under a prefix of their own, apart from the package pages, so that
+/// no package or module name meets a route of the site.
 pub fn docs_out(name: str, v: str) -> str { docs_dir(name, v) + "/index.html" }
 
 /// The directory of version `v`'s docs pages.
-pub fn docs_dir(name: str, v: str) -> str { f"packages/{name}/{v}/docs" }
+pub fn docs_dir(name: str, v: str) -> str { f"docs/{name}/{v}" }
 
 /// The readme page of `s`: the package's own, or the version's it shows.
 fn readme_out(s: Package) -> str { if s.at.is_empty() { package_out(s.name) } else { ver_out(s.name, s.at) } }
@@ -1010,7 +1012,7 @@ fn docs_note(s: Package) -> str {
     f"<p class=\"t-ui muted\">The public items of {esc(s.name)} {esc(l.version)} and their doc comments, read from its source at {commit_link(l)}{when}. Signatures are shown as written; an item re-exported from a private module is shown where it is re-exported.</p>"
 }
 
-/// The Docs tab (`/packages/<name>/<version>/docs`, `/packages/<name>/latest/docs`):
+/// The Docs tab (`/docs/<name>/<version>`, `/docs/<name>/latest`):
 /// the page of public module `m` of the version (the root's when none),
 /// as made when it was published (docs.nabi), with the docs' navigation
 /// (apidoc::side) in place of the side panel's details; else why there

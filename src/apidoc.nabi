@@ -109,7 +109,7 @@ fn sig_html(sig: str) -> str {
 }
 
 /// The page of module `m` among docs whose root page is
-/// `dir/index.html` (`packages/<name>/<version>/docs`): one page per
+/// `dir/index.html` (`docs/<name>/<version>`): one page per
 /// public module, as `nabi doc` lays them out (web::apidoc::page_of).
 pub fn page(dir: str, m: Module) -> str {
     let rel: List<str> = List::new();
@@ -368,7 +368,7 @@ fn inline_reexports() {
     assert(html.contains("<section class=\"api-item\" id=\"struct.Event\"><h3><a href=\"#struct.Event\">Event</a></h3>") && html.contains("id=\"Event.len\"") && html.contains("One event.") && !html.contains("<li id=\"Event.at\"><div class=\"m-h\"><pre><code><span class=\"k\">pub</span> at: <span class=\"t\">usize</span></code></pre></div><div"), html);
     assert(html.contains("id=\"fn.read_all\"") && !html.contains("parse"), "renamed");
     assert(html.contains("<a id=\"struct.Sink\" href=\"/d/write#struct.Sink\">") && html.contains("<a href=\"/d/write\"><code>write</code></a>"), "a public module's item stays a link");
-    let nv = side(mods, mods[0], "d", "1.0.0", [nav::Package { name: "dep", version: "^0.2", href: "/packages/dep/latest/docs" }]);
-    assert(nv.contains("href=\"#struct.Event\"") && nv.contains("href=\"#fn.read_all\"") && nv.contains("<h2 class=\"t-label\">Modules</h2><ul class=\"api-tree\"><li><a href=\"/d/write\">write</a></li></ul>") && nv.contains("<p class=\"api-pkg\"><a href=\"/d\" aria-current=\"page\"><span>j</span><small>1.0.0</small></a></p>") && nv.contains("<a href=\"/packages/dep/latest/docs\">dep<small>^0.2</small></a>"), nv);
+    let nv = side(mods, mods[0], "d", "1.0.0", [nav::Package { name: "dep", version: "^0.2", href: "/docs/dep/latest" }]);
+    assert(nv.contains("href=\"#struct.Event\"") && nv.contains("href=\"#fn.read_all\"") && nv.contains("<h2 class=\"t-label\">Modules</h2><ul class=\"api-tree\"><li><a href=\"/d/write\">write</a></li></ul>") && nv.contains("<p class=\"api-pkg\"><a href=\"/d\" aria-current=\"page\"><span>j</span><small>1.0.0</small></a></p>") && nv.contains("<a href=\"/docs/dep/latest\">dep<small>^0.2</small></a>"), nv);
     assert(count(mods[0]) == 2 && count(mods[1]) == 1 && import_line("j", mods, "") == "use j;", f"{count(mods[0])}");
 }

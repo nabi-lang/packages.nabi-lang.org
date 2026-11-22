@@ -359,7 +359,7 @@ ok "publish"
 
 # Docs: `nabi publish` against this server makes the version's docs from
 # its source (scanned, never built), kept in the data and served at
-# /packages/<name>/<version>/docs and /packages/<name>/latest/docs, one
+# /docs/<name>/<version> and /docs/<name>/latest, one
 # page per public module (`docs/units`) as `nabi doc` lays them out.
 git clone -q "$T/remote.git" "$T/index2" 2>/dev/null
 echo "Config { api: \"$base\" }" > "$T/index2/config.nabion"
@@ -415,8 +415,8 @@ grep -q "Published shapes 0.2.0" "$T/client.log" || fail "nabi publish output: $
 grep -q "docs:" "$T/client.log" && fail "docs warning on a good publish: $(cat "$T/client.log")"
 grep -q 'Status { state: "ok"' "$T/data/docs/shapes/0.2.0/status.nabion" || fail "docs status: $(cat "$T/data/docs/shapes/0.2.0/status.nabion")"
 grep -q 'Circle' "$T/data/docs/shapes/0.2.0/api.nabion" || fail "docs kept"
-for _ in $(seq 100); do [ -f "$T/site/public/packages/shapes/0.2.0/docs/index.html" ] && break; sleep 0.1; done
-req GET /packages/shapes/0.2.0/docs
+for _ in $(seq 100); do [ -f "$T/site/public/docs/shapes/0.2.0/index.html" ] && break; sleep 0.1; done
+req GET /docs/shapes/0.2.0
 expect_code 200 "version docs"
 # Inline: the private module's items as the root's own, renamed, with
 # their members; the public module's item a link to its page.
@@ -424,23 +424,28 @@ expect_body '<div class="md"><p>Plane shapes.</p>' "module doc"
 expect_body '<section class="api-item" id="struct.Circle"><h3><a href="#struct.Circle">Circle</a></h3>' "inline re-export"
 expect_body 'id="Circle.new"' "inline re-export's methods"
 expect_body 'id="fn.area_of"' "renamed re-export"
-expect_body '<a id="struct.Meter" href="/packages/shapes/0.2.0/docs/units#struct.Meter">' "public re-export stays a link"
-expect_body '<a href="/packages/shapes/0.2.0/docs/units"><code>units</code></a>' "child module listed"
+expect_body '<a id="struct.Meter" href="/docs/shapes/0.2.0/units#struct.Meter">' "public re-export stays a link"
+expect_body '<a href="/docs/shapes/0.2.0/units"><code>units</code></a>' "child module listed"
 expect_body '<div class="api-sec"><h2 class="t-label">In <code>shapes</code></h2><h3 class="api-k">Structs <span class="ct">1</span></h3><ul class="api-items"><li><a href="#struct.Circle">Circle</a></li>' "items in the navigation"
-expect_body '<p class="api-pkg"><a href="/packages/shapes/0.2.0/docs" aria-current="page"><span>shapes</span><small>0.2.0</small></a></p><div class="api-sec"><h2 class="t-label">Modules</h2><ul class="api-tree"><li><a href="/packages/shapes/0.2.0/docs/units">units</a></li></ul></div>' "module tree"
-req GET /packages/shapes/0.2.0/docs/units
+expect_body '<p class="api-pkg"><a href="/docs/shapes/0.2.0" aria-current="page"><span>shapes</span><small>0.2.0</small></a></p><div class="api-sec"><h2 class="t-label">Modules</h2><ul class="api-tree"><li><a href="/docs/shapes/0.2.0/units">units</a></li></ul></div>' "module tree"
+req GET /docs/shapes/0.2.0/units
 expect_code 200 "module page"
 expect_body '<section class="api-item" id="struct.Meter">' "module page body"
-expect_body '<span class="api-kind">Module</span><a href="/packages/shapes/0.2.0/docs">shapes</a><span class="sep" aria-hidden="true">' "breadcrumb links up"
-req GET /packages/shapes/0.2.0/docs/shapes
+expect_body '<span class="api-kind">Module</span><a href="/docs/shapes/0.2.0">shapes</a><span class="sep" aria-hidden="true">' "breadcrumb links up"
+req GET /docs/shapes/0.2.0/shapes
 expect_code 404 "a private module has no page"
-req GET /packages/shapes/latest/docs
+req GET /docs/shapes/latest
 expect_code 200 "latest docs"
 expect_body 'id="struct.Circle"' "latest docs body"
+req GET /packages/shapes/0.2.0/docs/units
+expect_code 301 "old docs address"
+[ "$(header Location)" = /docs/shapes/0.2.0/units ] || fail "old docs address moved: $(header Location)"
+req GET /docs/std
+expect_code 301 "std docs"
 req GET /packages/shapes
-expect_body 'href="/packages/shapes/latest/docs">Docs' "docs tab on the package page"
+expect_body 'href="/docs/shapes/latest">Docs' "docs tab on the package page"
 req GET /packages/shapes/versions
-expect_body 'href="/packages/shapes/0.2.0/docs">docs</a>' "docs in the versions table"
+expect_body 'href="/docs/shapes/0.2.0">docs</a>' "docs in the versions table"
 # A scan that fails does not stop the publish; the page says why.
 cp "$T/src/shapes/src/lib.nabi" "$T/lib.keep"
 head -c 9000000 /dev/zero | tr '\0' ' ' >> "$T/src/shapes/src/lib.nabi"
@@ -448,12 +453,12 @@ sed -i.bak -e 's/0.2.0/0.2.1/' "$T/src/shapes/nabi.nabion" && rm "$T/src/shapes/
 git -C "$T/src/shapes" -c user.name=t -c user.email=t@t commit -q -am big
 nabi_client publish --registry "file://$T/remote.git" >"$T/client.log" 2>&1 || fail "nabi publish of a big package: $(cat "$T/client.log")"
 grep -q "docs: src/ has [0-9]* bytes of .nabi; docs are made for at most 8388608" "$T/client.log" || fail "docs warning: $(cat "$T/client.log")"
-for _ in $(seq 100); do [ -f "$T/site/public/packages/shapes/0.2.1/docs/index.html" ] && break; sleep 0.1; done
-req GET /packages/shapes/0.2.1/docs
+for _ in $(seq 100); do [ -f "$T/site/public/docs/shapes/0.2.1/index.html" ] && break; sleep 0.1; done
+req GET /docs/shapes/0.2.1
 expect_code 200 "failed docs page"
 expect_body '<span class="lab">docs failed</span><span>The docs of shapes 0.2.1 could not be made: src/ has' "failed docs status"
 req GET /packages/shapes/versions
-expect_body 'href="/packages/shapes/0.2.1/docs" class="tag" title="src/ has' "failed docs in the versions table"
+expect_body 'href="/docs/shapes/0.2.1" class="tag" title="src/ has' "failed docs in the versions table"
 ok "docs"
 
 req POST /api/v1/yank "${auth[@]}" --data-binary 'Yank { name: "geom", version: "0.1.0", message: "wrong areas" }'
@@ -745,7 +750,7 @@ expect_body '<span class="p" aria-hidden="true">$ </span>nabi install app</code>
 grep -o 'aria-label="Package sections">.*</nav>' "$T/b" | grep -q '>Docs<' && fail "Docs tab of an executable"
 grep -q 'nabi add app' "$T/b" && fail "nabi add of an executable"
 expect_body '<span class="tag" title="[^"]*">not verified</span>' "source not verified"
-req GET /packages/app/latest/docs
+req GET /docs/app/latest
 expect_code 404 "no docs of an executable"
 req GET "/packages?q=app"
 expect_body '<span class="tag bin" title="[^"]*">bin</span>' "bin tag in the list"
