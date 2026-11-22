@@ -17,6 +17,7 @@ use pkg::packages;
 use pkg::server::admin::admin_route;
 use pkg::server::advisories;
 use pkg::server::auth::exchange;
+use pkg::server::delete;
 use pkg::server::downloads;
 use pkg::server::limit;
 use pkg::server::mail;
@@ -506,6 +507,9 @@ fn index_step(cfg: Cfg, auth: Auth, p: index::Publish, k: str, refused: ApiError
     let e = p.entry;
     try index::sync(cfg.index);
     let db = try load_db(cfg) catch x { throw index::err(500, f"data: {x}"); };
+    if !e.native && (try index::was_deleted(cfg.index, e.name, e.version)) {
+        throw index::err(409, f"{e.name} {e.version} was deleted, and a version number is never used twice (lock files may hold its checksum); publish a new version");
+    }
     if let have: str = try index::tree_at(cfg.index, e.native, e.name, e.version) {
         try fill_check(db, k, p, have);
         return true;
@@ -549,7 +553,9 @@ fn publish(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
     try need(cfg, auth, if in_index { SCOPE_UPDATE } else { SCOPE_NEW });
     if !may(auth, db, k, in_index) { throw refused; }
     if !in_index {
-        try names::check_new(e.name, try index::names(cfg.index, e.native), db.approved, auth.admin, if e.native { List::new() } else { try names::protected(cfg.index) }, org);
+        let all = try index::names(cfg.index, e.native);
+        let popular = if e.native { List::<str>::new() } else { names::popular(all, downloads::totals()) };
+        try names::check_new(e.name, all, popular, db.approved, auth.admin, if e.native { List::new() } else { try names::protected(cfg.index) }, org);
         if !auth.admin && !trusted && new_names_today(db, auth.account.id, now_secs()) >= NEW_NAMES_PER_DAY {
             throw index::err(429, f"an account takes at most {NEW_NAMES_PER_DAY} new package names a day; publish new versions of the ones you have, or wait");
         }
@@ -623,7 +629,12 @@ fn publish(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
         }
     }
     if !staged.is_empty() && fs::exists(staged) { try fs::remove_file(staged) catch _ {}; }
-    if let x: ApiError = failed { throw x; }
+    if let x: ApiError = failed {
+        // A rebuild may have read the checkout while the refused line was
+        // in it: build again from the state it was reset to.
+        STALE.store(1);
+        throw x;
+    }
     if filled { warnings.push(Value::Str(f"{e.name} {e.version} was already in the index from this tree; its missing metadata is filled in")); }
     if unsaved { warnings.push(Value::Str(f"{e.name} {e.version} is in the index, but the registry could not record its metadata and README; run the same `nabi publish` again to fill them in")); }
     // Docs, from the source just checked, outside every lock: a failure
@@ -675,6 +686,20 @@ fn yank(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
     nabion_resp(200, "Yanked", [("name", Value::Str(y.name)), ("version", Value::Str(y.version)), ("yanked", Value::Bool(!y.undo))])
 }
 
+/// `DELETE /api/v1/packages/<name>/<version>`: an owner's token with the
+/// `yank` scope deletes a version within delete::DELETE_SECS of its
+/// publish while nothing depends on it (delete.nabi).
+fn delete_route(cfg: Cfg, r: Request, client: str, name: str, version: str) throws (ApiError) -> Resp {
+    try limit::check("ip:" + client, 2i64 * cfg.rate);
+    let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
+    let auth = try authenticate(cfg, db, r);
+    try limit::check(auth.key, cfg.rate);
+    if auth.scope is List<str> { throw index::err(403, f"a trusted publishing token yanks but does not delete; delete with an account's token, or on your account page ({cfg.url}/me)"); }
+    try need(cfg, auth, SCOPE_YANK);
+    try delete::delete_version(cfg, auth.account, auth.admin, name, version, auth.who, auth.only);
+    nabion_resp(200, "Deleted", [("name", Value::Str(name)), ("version", Value::Str(version))])
+}
+
 fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
     if r.path == "/api/v1/docs" {
         if r.method != "GET" && r.method != "HEAD" { throw index::err(405, "use GET /api/v1/docs"); }
@@ -688,7 +713,8 @@ fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
         if let rest: str = r.path.strip_prefix(prefix) {
             let parts: List<str> = List::new();
             for x in rest.split("/") { parts.push(http::pct_decode(x, false) ?? x); }
-            let what = if parts.len() == 3 { f"{prefix}<name>/<version>/{parts[2]}" } else { f"{prefix}<name>" };
+            if r.method == "DELETE" && parts.len() == 2 && !native { return try delete_route(cfg, r, client, parts[0], parts[1]); }
+            let what = if parts.len() == 3 { f"{prefix}<name>/<version>/{parts[2]}" } else if parts.len() == 2 { f"{prefix}<name> (or DELETE {prefix}<name>/<version>)" } else { f"{prefix}<name>" };
             if r.method != "GET" && r.method != "HEAD" { throw index::err(405, f"use GET {what}"); }
             let json = try wants_json(r);
             try limit::check("read:" + client, limit::READS);

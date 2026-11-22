@@ -1,7 +1,8 @@
 // Which new package names the registry takes: not reserved, not an
-// official package's, and not a look-alike of an official name or of a
-// name already in the index (a typo away, or the same once confusable
-// characters are folded), unless an admin approved it.
+// official package's, not a look-alike (a typo away, or the same once
+// confusable characters are folded) of a protected name (official,
+// reserved, popular), and not the same as any name in the index once
+// confusables are folded, unless an admin approved it.
 
 use pkg::index;
 use pkg::index::ApiError;
@@ -16,6 +17,16 @@ pub const RESERVED: [str; 29] = [
     "crate", "main", "lib", "src", "registry", "packages", "nectar", "index",
     "api", "admin", "docs", "www", "playground", "official", "security", "support",
 ];
+
+/// The toolchain's own names in RESERVED: a typo of one is a look-alike
+/// too. The other reserved words only refuse their confusable spellings
+/// (`a-p-i`, `1ib`): `text` or `mail` are fine names, one edit from
+/// `test` and `main`.
+pub const TOOLCHAIN: [str; 5] = ["nabi", "nabic", "nabir", "nabils", "nabidoc"];
+
+/// Downloads (all versions, all time) from which a package is popular:
+/// its name is protected from look-alikes like an official one.
+pub const POPULAR: i64 = 1000i64;
 
 /// The packages of the nabi-lang organization (release/pipeline.json of
 /// nabi-lang/.github). Their names and look-alikes are protected before
@@ -86,8 +97,8 @@ pub fn edits(a: str, b: str) -> usize {
 }
 
 /// The name in `names` that `name` would pass for; none when it stands
-/// apart. Names of four characters or more one edit apart count; shorter
-/// ones only when their skeletons match.
+/// apart. The same once confusables are folded counts at any length;
+/// names of four characters or more also one edit apart.
 pub fn look_alike(name: str, names: List<str>) -> str | none {
     let k = index::key(name);
     let sk = skeleton(name);
@@ -100,10 +111,35 @@ pub fn look_alike(name: str, names: List<str>) -> str | none {
     none
 }
 
-/// Refuse a new name that is reserved, an `official` package's, or looks
-/// like one of `official` or `names`, unless `approved` (by an admin) or
-/// published by an admin or the nabi-lang organization (`by_org`).
-pub fn check_new(name: str, names: List<str>, approved: List<str>, admin: bool, official: List<str>, by_org: bool) throws (ApiError) {
+/// The name in `names` that reads the same as `name` once confusables
+/// are folded (skeleton); none when none does.
+pub fn same_skeleton(name: str, names: List<str>) -> str | none {
+    let k = index::key(name);
+    let sk = skeleton(name);
+    for n in names {
+        if index::key(n) != k && skeleton(n) == sk { return n; }
+    }
+    none
+}
+
+/// The packages of `totals` (downloads by `index::key`) with POPULAR
+/// downloads or more, by the names in `names`.
+pub fn popular(names: List<str>, totals: Dict<str, i64>) -> List<str> {
+    let out: List<str> = List::new();
+    for n in names {
+        if (totals.get(index::key(n)) ?? 0i64) >= POPULAR { out.push(n); }
+    }
+    out
+}
+
+const ASK: str = "or ask the registry admins (SECURITY.md) to approve it";
+
+/// Refuse a new name that is reserved, an `official` package's, a
+/// look-alike of an official, reserved or `popular` name, or the same as
+/// one of `names` (the index) once confusables are folded, unless
+/// `approved` (by an admin) or published by an admin or the nabi-lang
+/// organization (`by_org`).
+pub fn check_new(name: str, names: List<str>, popular: List<str>, approved: List<str>, admin: bool, official: List<str>, by_org: bool) throws (ApiError) {
     if admin || by_org || approved.contains(index::key(name)) { return; }
     for o in official {
         if index::key(o) == index::key(name) {
@@ -111,13 +147,24 @@ pub fn check_new(name: str, names: List<str>, approved: List<str>, admin: bool, 
         }
     }
     if let near: str = look_alike(name, official) {
-        throw index::err(403, f"`{name}` is too close to `{near}`, an official Nabi package; pick a more distinct name, or ask the registry admins (SECURITY.md) to approve it");
+        throw index::err(403, f"`{name}` is too close to `{near}`, an official Nabi package; pick a more distinct name, {ASK}");
     }
     if reserved(name) {
-        throw index::err(403, f"`{name}` is reserved for the Nabi project; pick another name, or ask the registry admins (SECURITY.md) to approve it");
+        throw index::err(403, f"`{name}` is reserved for the Nabi project; pick another name, {ASK}");
     }
-    if let near: str = look_alike(name, names) {
-        throw index::err(403, f"`{name}` is too close to `{near}`, which is in the index already; pick a more distinct name, or ask the registry admins (SECURITY.md) to approve it");
+    let tools: List<str> = List::new();
+    for t in TOOLCHAIN { tools.push(t); }
+    let words: List<str> = List::new();
+    for w in RESERVED { words.push(w); }
+    let near_reserved = look_alike(name, tools) ?? (same_skeleton(name, words) ?? "");
+    if !near_reserved.is_empty() {
+        throw index::err(403, f"`{name}` is too close to `{near_reserved}`, a name reserved for the Nabi project; pick a more distinct name, {ASK}");
+    }
+    if let near: str = look_alike(name, popular) {
+        throw index::err(403, f"`{name}` is too close to `{near}`, a popular package ({POPULAR} downloads or more); pick a more distinct name, {ASK}");
+    }
+    if let near: str = same_skeleton(name, names) {
+        throw index::err(403, f"`{name}` reads the same as `{near}`, which is in the index already (`0` / `o`, `1` / `l` / `i` and the like are one); pick a more distinct name, {ASK}");
     }
 }
 
@@ -131,20 +178,37 @@ fn reserved_and_look_alikes() {
     assert(near("jsom") == "json" && near("js0n") == "json" && near("markdwon") == "markdown" && near("tomlx") == "toml", "close");
     assert(look_alike("json", names) is none && look_alike("Json", names) is none, "same name is not a look-alike");
     assert(look_alike("yaml", names) is none && look_alike("csv", names) is none && look_alike("tom", names) is none, "apart");
-    let refused = 0;
+    assert((same_skeleton("js0n", names) ?? "") == "json" && same_skeleton("jsom", names) is none, "skeleton only");
     let none_official: List<str> = List::new();
-    try check_new("jsom", names, List::new(), false, none_official, false) catch e { refused = e.status; };
-    assert(refused == 403, "refused");
-    try check_new("jsom", names, ["jsom"], false, none_official, false) catch e { panic(e.msg); };
-    try check_new("std", names, List::new(), true, none_official, false) catch e { panic(e.msg); };
+    let none_popular: List<str> = List::new();
+    let why = "";
+    try check_new("js0n", names, none_popular, List::new(), false, none_official, false) catch e { why = e.msg; };
+    assert(why.contains("reads the same as `json`"), why);
+    // One edit from a name nobody downloads is a name of its own.
+    try check_new("jsom", names, none_popular, List::new(), false, none_official, false) catch e { panic(e.msg); };
+    why = "";
+    try check_new("jsom", names, ["json"], List::new(), false, none_official, false) catch e { why = e.msg; };
+    assert(why.contains("too close to `json`, a popular package"), why);
+    try check_new("jsom", names, ["json"], ["jsom"], false, none_official, false) catch e { panic(e.msg); };
+    try check_new("std", names, none_popular, List::new(), true, none_official, false) catch e { panic(e.msg); };
+    for (bad, near) in [("nabu", "nabi"), ("nabic2", "nabic"), ("1ib", "lib")] {
+        why = "";
+        try check_new(bad, names, none_popular, List::new(), false, none_official, false) catch e { why = e.msg; };
+        assert(why.contains(f"too close to `{near}`, a name reserved"), why);
+    }
+    for fine in ["text", "mail", "guild"] { try check_new(fine, names, none_popular, List::new(), false, none_official, false) catch e { panic(e.msg); }; }
+    let totals: Dict<str, i64> = Dict::new();
+    totals.insert("json", 1000i64);
+    totals.insert("toml", 999i64);
+    totals.insert("nabi_syntax", 5000i64);
+    assert(popular(names, totals).join(",") == "json,nabi-syntax", popular(names, totals).join(","));
     let official: List<str> = List::new();
     for n in FIRST_PARTY { official.push(n); }
-    let why = "";
-    try check_new("linalg", names, List::new(), false, official, false) catch e { why = e.msg; };
+    try check_new("linalg", names, none_popular, List::new(), false, official, false) catch e { why = e.msg; };
     assert(why.contains("is the name of an official Nabi package"), why);
-    try check_new("linalq", names, List::new(), false, official, false) catch e { why = e.msg; };
+    try check_new("linalq", names, none_popular, List::new(), false, official, false) catch e { why = e.msg; };
     assert(why.contains("too close to `linalg`, an official"), why);
-    try check_new("linalq", names, ["linalq"], false, official, false) catch e { panic(e.msg); };
-    try check_new("linalg", names, List::new(), false, official, true) catch e { panic(e.msg); };
-    try check_new("geometry", names, List::new(), false, official, false) catch e { panic(e.msg); };
+    try check_new("linalq", names, none_popular, ["linalq"], false, official, false) catch e { panic(e.msg); };
+    try check_new("linalg", names, none_popular, List::new(), false, official, true) catch e { panic(e.msg); };
+    try check_new("geometry", names, none_popular, List::new(), false, official, false) catch e { panic(e.msg); };
 }

@@ -66,6 +66,11 @@ fi
 
 # Settings that change between restarts.
 extra_env=(PACKAGES_REQUIRE_2FA=1)
+# The image proxy's key, and img.invalid pointed at the fake (curl's own
+# config: only the operator's can make a .invalid name reach anything).
+img_key=$(printf 'k%.0s' $(seq 40))
+mkdir -p "$T/curl"
+echo "connect-to = img.invalid:80:127.0.0.1:$gh_port" > "$T/curl/.curlrc"
 start_server() {
     (cd "$T/site" && exec env \
         PACKAGES_URL="https://packages.test" \
@@ -81,6 +86,8 @@ start_server() {
         PACKAGES_TRUSTED="$T/trusted.nabion" \
         GIT_ALLOW_PROTOCOL=https:file:http \
         PACKAGES_RATE_LIMIT=1000 \
+        PACKAGES_IMG_KEY="$img_key" \
+        CURL_HOME="$T/curl" \
         PACKAGES_OFFICIAL_ORG=5151 \
         PACKAGES_MAIL_FROM="Nabi packages <noreply@packages.test>" \
         PACKAGES_SES_REGION=us-east-1 \
@@ -614,6 +621,49 @@ req POST /api/v1/yank "${auth[@]}" --data-binary 'Yank { name: "geom", version: 
 expect_code 404 "yank unknown"
 ok "yank"
 
+# Deleting: within 72 hours of its publish, while nothing depends on it;
+# the number is never used again.
+publish "${line//0.1.0/0.1.5}"
+expect_code 200 "publish to delete"
+req DELETE /api/v1/packages/geom/0.1.5
+expect_code 401 "delete without a token"
+req DELETE /api/v1/packages/ge-om/0.1.0 "${auth[@]}"
+expect_code 409 "delete a version another package depends on"
+expect_body 'geom depends on ge-om; yank it instead' "dependents refusal"
+req DELETE /api/v1/packages/geom/9.9.9 "${auth[@]}"
+expect_code 409 "delete a version with no publish record"
+req DELETE /api/v1/packages/geom/0.1.5 "${auth[@]}"
+expect_code 200 "delete"
+expect_body 'Deleted { name: "geom", version: "0.1.5" }' "delete body"
+[ "$(git -C "$T/remote.git" log -1 --format=%s)" = "Delete geom 0.1.5" ] || fail "delete commit"
+git -C "$T/remote.git" show HEAD:ge/om/geom | grep -q '"0.1.5"' && fail "deleted line still in the index"
+grep -q 'action: "delete", target: "geom 0.1.5"' "$T/data/audit.nabion" || fail "delete audited"
+mail_to alice@example.com 'alice deleted geom 0.1.5.'
+publish "${line//0.1.0/0.1.5}"
+expect_code 409 "republish a deleted number"
+expect_body 'was deleted, and a version number is never used twice' "deleted number body"
+req GET /api/v1/packages/geom/0.1.5/download
+expect_code 404 "deleted archive"
+# On the account page: listed while it may be deleted, asked once more.
+publish "${line//0.1.0/0.1.6}"
+expect_code 200 "publish to delete from the account page"
+req GET /me -H "Cookie: __Host-pkg_session=$sess"
+expect_body '<h2 class="t-h3" id="versions">Recent versions</h2>' "recent versions"
+expect_body '<td class="mono">0.1.6</td>' "deletable version listed"
+req POST /me/versions/delete -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&package=geom&version=0.1.6"
+expect_code 200 "delete asks first"
+expect_body 'Delete geom 0.1.6?' "confirm page"
+expect_body 'name="confirm" value="yes"' "confirm form"
+git -C "$T/remote.git" show HEAD:ge/om/geom | grep -q '"0.1.6"' || fail "deleted before the confirmation"
+req POST /me/versions/delete -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&package=geom&version=0.1.6&confirm=yes"
+expect_code 303 "delete from the account page"
+[ "$(header location)" = "/me#versions" ] || fail "delete location: $(header location)"
+[ "$(git -C "$T/remote.git" log -1 --format=%s)" = "Delete geom 0.1.6" ] || fail "account page delete commit"
+req POST /me/versions/delete -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&package=ge-om&version=0.1.0&confirm=yes"
+expect_code 409 "account page refuses a depended-on version"
+expect_body 'yank it instead' "account page refusal says what to do"
+ok "delete"
+
 # Metadata and who did what: the public API, no token.
 req GET /api/v1/packages/geom
 expect_code 200 "package api"
@@ -916,7 +966,12 @@ expect_body '<td class="num">4.0 KiB</td><td class="num" title="[0-9,]* in the l
 expect_body '<th scope="col" class="num">Downloads</th>' "downloads column"
 req GET /packages/geom/0.0.9
 expect_body '<dt>Published</dt><dd><time datetime="[0-9T:Z-]*">[0-9-]* [0-9:]* UTC</time> by <a class="who" href="https://github.com/acme"><img class="av" src="https://avatars.githubusercontent.com/u/4242?s=32&v=4" width="16" height="16" alt="" loading="lazy" decoding="async"><span>acme</span></a> via GitHub Actions (<a href="https://github.com/acme/geom">acme/geom</a>, <a href="https://github.com/acme/geom/actions/runs/777"' "trusted publisher on the version page"
-req GET /packages/geom
+# The refused push above asked for a rebuild from the reset checkout.
+for _ in $(seq 100); do
+    req GET /packages/geom
+    grep -q '<dt>Category</dt>' "$T/b" && break
+    sleep 0.1
+done
 expect_body '<dt>Category</dt><dd class="kws"><a href="/categories/mathematics">mathematics</a></dd>' "categories on the page"
 expect_body '<p>Shapes, <strong>fast</strong>.</p>' "published README rendered"
 req GET /packages/geom/dependencies
@@ -948,7 +1003,12 @@ expect_code 200 "badge"
 expect_body '<title>geom: v[0-9.]* on packages.nabi-lang.org</title>' "badge title"
 req GET /packages/geom
 expect_body '<dt>Badge</dt><dd class="badge"><img src="/packages/geom/badge.svg"' "badge on the page"
-req GET /categories
+# A rebuild may be under way: ask again until the category is there.
+for _ in $(seq 100); do
+    req GET /categories
+    grep -q 'href="/categories/mathematics"' "$T/b" && break
+    sleep 0.1
+done
 expect_code 200 "categories"
 expect_body '<a href="/categories/mathematics">Mathematics</a><span class="ct">' "category count"
 req GET /categories/mathematics
@@ -962,6 +1022,9 @@ expect_body '<h1 class="t-h2">Keywords</h1>' "keywords title"
 req GET /packages/geom/0.1.0
 expect_body '<a href="/packages?q=geometry">geometry</a>' "an old version's keyword searches"
 grep -q '<loc>https://packages.nabi-lang.org/categories/mathematics</loc>' "$T/site/public/sitemap.xml" || fail "category in the sitemap"
+grep -Eq '<loc>https://packages.nabi-lang.org/packages/geom</loc><lastmod>20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z</lastmod>' "$T/site/public/sitemap.xml" || fail "lastmod in the sitemap"
+grep -q '<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareSourceCode","name":"geom","url":"https://packages.nabi-lang.org/packages/geom"' "$T/site/public/packages/geom.html" || fail "SoftwareSourceCode"
+grep -q '"@type":"BreadcrumbList","itemListElement":\[{"@type":"ListItem","position":1,"name":"Packages"' "$T/site/public/packages/geom/versions.html" || fail "BreadcrumbList"
 # An executable alone: no Docs tab, `nabi install` in the box, a bin tag.
 req GET /packages/app
 expect_code 200 "executable page"
@@ -975,6 +1038,135 @@ grep -q '>Docs <span' "$T/b" && fail "an executable has no Docs tab"
 req GET "/packages?q=app"
 expect_body '<span class="tag bin" title="[^"]*">bin</span>' "bin tag in the list"
 ok "site rebuilt"
+
+# README images through the proxy: signed addresses on the page, fetched
+# from public hosts only, images only, at most 5 MiB, cached for good,
+# no cookie or referrer passed either way.
+pics_rev=$(source_repo pics lib.nabi)
+pics_line=${line//example.invalid\/geom/example.invalid\/pics}
+pics_line=${pics_line//\"geom\"/\"pics\"}
+pics_line=${pics_line//$rev/$pics_rev}
+pics_line=${pics_line//$tree/$(git -C "$T/src/pics" rev-parse "HEAD^{tree}")}
+readme='# pics\n\n![logo](http://img.invalid/img/logo.svg) ![moved](http://img.invalid/img/moved.svg) ![page](http://img.invalid/img/page) ![big](http://img.invalid/img/big.png) ![inside](http://127.0.0.1/img/logo.svg)\n'
+publish "$pics_line" "{ description: \"Pictures\", readme_content: \"$readme\" }"
+expect_code 200 "publish a readme with images"
+for _ in $(seq 100); do grep -q 'src="/img/' "$T/site/public/packages/pics.html" 2>/dev/null && break; sleep 0.1; done
+grep -q 'img.invalid' "$T/site/public/packages/pics.html" && fail "an image linked directly with the proxy on"
+hexof() { printf %s "$1" | od -An -tx1 | tr -d ' \n'; }
+img_at() { grep -o "src=\"/img/[0-9a-f]\{32\}/$(hexof "$1")\"" "$T/site/public/packages/pics.html" | head -1 | sed -e 's/^src="//' -e 's/"$//'; }
+logo=$(img_at http://img.invalid/img/logo.svg)
+[ -n "$logo" ] || fail "no signed image address: $(grep -o '<img [^>]*>' "$T/site/public/packages/pics.html" | head -3)"
+req GET "$logo" -H "Cookie: __Host-pkg_session=$sess" -H "Referer: https://packages.test/packages/pics"
+expect_code 200 "proxied image"
+[ "$(header content-type)" = "image/svg+xml" ] || fail "image type: $(header content-type)"
+[ "$(header cache-control)" = "public, max-age=31536000, immutable" ] || fail "image cache: $(header cache-control)"
+header content-security-policy | grep -q "sandbox" || fail "image csp: $(header content-security-policy)"
+[ -z "$(header set-cookie)" ] || fail "the image host's cookie passed on"
+expect_body '<svg xmlns' "image body"
+seen=$(curl -s "http://127.0.0.1:$gh_port/_img" | grep -c 'GET /img/logo.svg')
+req GET "$logo"
+expect_code 200 "cached image"
+[ "$(curl -s "http://127.0.0.1:$gh_port/_img" | grep -c 'GET /img/logo.svg')" = "$seen" ] || fail "a cached image fetched again"
+curl -s "http://127.0.0.1:$gh_port/_img" | grep 'GET /img/logo.svg' | grep -qi 'cookie:\|referer:' && fail "cookie or referrer sent to the image host"
+ls "$T/data/img-cache" | grep -q '\.type$' || fail "image cache on disk"
+req GET "$(img_at http://img.invalid/img/moved.svg)"
+expect_code 200 "redirected image"
+req GET "$(img_at http://img.invalid/img/page)"
+expect_code 415 "not an image"
+expect_body 'is not an image (Content-Type `text/html`)' "not an image body"
+req GET "$(img_at http://img.invalid/img/big.png)"
+expect_code 413 "image size cap"
+req GET "$(img_at http://127.0.0.1/img/logo.svg)"
+expect_code 403 "an image on an internal address"
+expect_body 'has no address on the public internet' "internal image body"
+req GET "/img/$(printf '0%.0s' $(seq 32))/$(hexof http://img.invalid/img/logo.svg)"
+expect_code 404 "unsigned image address"
+req GET /packages/pics
+header content-security-policy | grep -q "img-src 'self' data: https://avatars.githubusercontent.com;" || fail "page csp with the proxy: $(header content-security-policy)"
+ok "image proxy"
+
+# Korean: every page at /ko/.., its chrome in Korean, the package's own
+# text as written; a language menu to the same page, hreflang links,
+# the sitemap; login and the account pages under /ko.
+req GET /ko
+expect_code 200 "korean home"
+expect_body '<html lang="ko" class="nb lt">' "korean lang"
+expect_body '<h1 class="t-h1">Nabi 패키지</h1>' "korean home title"
+expect_body '<a href="/ko/packages">둘러보기</a>' "korean nav"
+expect_body '<a href="https://nabi-lang.org/ko" title="nabi-lang.org">홈</a>' "home link"
+expect_body '<details class="lang-menu"><summary class="ib" aria-label="언어"' "korean language menu"
+expect_body '<a href="/" hreflang="en" lang="en">' "language menu to english"
+expect_body '<link rel="alternate" hreflang="en" href="https://packages.nabi-lang.org/">' "hreflang en"
+expect_body '<link rel="alternate" hreflang="ko" href="https://packages.nabi-lang.org/ko">' "hreflang ko"
+expect_body '<link rel="alternate" hreflang="x-default" href="https://packages.nabi-lang.org/">' "hreflang x-default"
+expect_body 'href="/ko/login"><span class="wide">GitHub로 </span>로그인</a>' "korean login button"
+expect_body '<footer class="foot" lang="ko">' "korean footer"
+req GET /
+expect_body '<a href="/ko" hreflang="ko" lang="ko">' "language menu to korean"
+expect_body '<a href="https://nabi-lang.org" title="nabi-lang.org">Home</a>' "english home link"
+req GET /ko/packages/geom
+expect_code 200 "korean package page"
+expect_body '<h2 class="t-label">설치</h2>' "korean install label"
+expect_body '<a href="/ko/packages/geom/versions">버전<span class="ct">' "korean tab"
+expect_body '<article class="prose md readme" lang="en">' "readme as written"
+expect_body 'action="/ko/packages"' "korean search box"
+expect_body '<link rel="canonical" href="https://packages.nabi-lang.org/ko/packages/geom">' "korean canonical"
+expect_body '<a href="/packages/geom" hreflang="en" lang="en">' "same page in english"
+req GET /ko/packages/geom/versions
+expect_code 200 "korean versions tab"
+expect_body '<th scope="col">공개한 사람</th>' "korean versions table"
+req GET "/ko/packages?q=geom"
+expect_code 200 "korean search"
+expect_body '<q>geom</q>에 맞는 패키지' "korean search note"
+expect_body '<a href="/packages?q=geom" hreflang="en" lang="en">' "language menu keeps the search"
+req GET /ko/packages/nope
+expect_code 404 "korean missing package"
+expect_body 'nope(이)라는 패키지가 없습니다' "korean missing package body"
+req GET /ko/nope
+expect_code 404 "korean 404"
+expect_body '페이지를 찾을 수 없습니다' "korean 404 body"
+for page in publishing api policy categories keywords; do
+    req GET "/ko/$page"
+    expect_code 200 "korean $page"
+    expect_body '<html lang="ko"' "korean $page lang"
+done
+req GET /ko/publishing
+expect_body '<h1 class="t-h1">패키지 사용과 공개</h1>' "korean guide"
+grep -Eq '<loc>https://packages.nabi-lang.org/ko/packages/geom</loc><lastmod>' "$T/site/public/sitemap.xml" || fail "korean page in the sitemap"
+# Logging in from a Korean page comes back to the Korean account page.
+req GET /ko/login
+expect_code 303 "korean login"
+state=$(cookie_of __Host-pkg_state)
+curl -s -o /dev/null "$(header location)&as=admin"
+req GET "/auth/github/callback?code=admin&state=$state" -H "Cookie: __Host-pkg_state=$state"
+expect_code 303 "korean callback"
+[ "$(header location)" = "/ko/me" ] || fail "korean login location: $(header location)"
+ko_sess=$(cookie_of __Host-pkg_session)
+req GET /ko/me -H "Cookie: __Host-pkg_session=$ko_sess"
+expect_code 200 "korean account page"
+expect_body '<h1 class="t-h1">계정</h1>' "korean account title"
+expect_body 'action="/ko/me/tokens"' "korean token form"
+expect_body '<h2 class="t-h3" id="sessions">세션</h2>' "korean sessions"
+ko_csrf=$(sed -n 's/.*name="csrf" value="\([0-9a-f]*\)".*/\1/p' "$T/b" | head -1)
+req POST /ko/me/tokens -H "Cookie: __Host-pkg_session=$ko_sess" --data "csrf=$ko_csrf&name=ko&days=400"
+expect_code 400 "korean form refusal"
+expect_body '잘못된 토큰 기간' "korean refusal title"
+req POST /ko/me/owners -H "Cookie: __Host-pkg_session=$ko_sess" --data "csrf=$ko_csrf&package=geom&login=a/b/c"
+expect_code 400 "korean refusal of an api message"
+expect_body '소유자를 추가하지 못했습니다' "korean title over the api message"
+req POST /ko/me/notices -H "Cookie: __Host-pkg_session=$ko_sess" --data "csrf=$ko_csrf&notify=on&kind-yank=on&kind-owners=on&kind-trusted=on&kind-token=on&kind-advisory=on"
+expect_code 303 "korean notices"
+[ "$(header location)" = "/ko/me#notices" ] || fail "korean notices location: $(header location)"
+req GET /ko -H "Cookie: __Host-pkg_session=$ko_sess"
+expect_body 'aria-label="alice 계정 메뉴"' "korean account menu"
+expect_body '<a href="/ko/me">계정</a><form method="post" action="/ko/logout">' "korean account menu links"
+req POST /ko/logout -H "Cookie: __Host-pkg_session=$ko_sess" --data "csrf=$ko_csrf"
+expect_code 303 "korean logout"
+[ "$(header location)" = "/ko" ] || fail "korean logout location: $(header location)"
+req GET /ko/me
+expect_code 303 "korean account page logged out"
+[ "$(header location)" = "/ko/login" ] || fail "korean account page login location: $(header location)"
+ok "korean pages"
 
 # Sources the server will not fetch, and commits a repository does not
 # hold on a branch or tag (as GitHub serves a fork's commits through the
@@ -1049,7 +1241,7 @@ req GET /api/v1/packages/ge-om
 expect_code 200 "restored api"
 grep -q 'action: "takedown", target: "ge_om", reason: "malware"' "$T/data/audit.nabion" || fail "audit: $(cat "$T/data/audit.nabion")"
 # Five moderation steps; the accounts' own changes are logged beside them.
-[ "$(grep '^Audit' "$T/data/audit.nabion" | grep -cvE 'action: "(login|logout|logout-all|notices|token-[a-z]+|owner-[a-z]+|invite-[a-z]+|trusted-[a-z]+)"')" = 5 ] || fail "audit lines: $(cat "$T/data/audit.nabion")"
+[ "$(grep '^Audit' "$T/data/audit.nabion" | grep -cvE 'action: "(login|logout|logout-all|notices|token-[a-z]+|owner-[a-z]+|invite-[a-z]+|trusted-[a-z]+|delete)"')" = 5 ] || fail "audit lines: $(cat "$T/data/audit.nabion")"
 ls "$T/data/backup/" | grep -q '^registry-[0-9]\{10\}\.sqlite3$' || fail "db snapshot"
 ok "moderation"
 

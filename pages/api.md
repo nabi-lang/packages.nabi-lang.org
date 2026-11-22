@@ -97,6 +97,18 @@ curl 'https://packages.nabi-lang.org/api/v1/advisories?format=json'
 
 A version is affected when a range covers it (evaluated as OSV says: from each `introduced` up to the next `fixed`, through a `last_affected`) or `versions` lists it, and the advisory is not withdrawn. Package and version pages show the advisories that affect them.
 
+## Deleting a version
+
+`DELETE /api/v1/packages/<name>/<version>`
+
+The one write described here, since `nabi` has no command for it: an owner deletes a version for 72 hours after its publish, while no version of another package depends on the package. It takes an account's token with the `yank` scope (`Authorization: Bearer pkg_..`), and answers `Deleted { name, version }`.
+
+```sh
+curl -X DELETE -H "Authorization: Bearer $TOKEN" https://packages.nabi-lang.org/api/v1/packages/json/0.3.1
+```
+
+The version's line leaves the index, its archive, README and docs leave the registry, and its number is never published again. Past 72 hours, or once another package depends on it, the answer is a `409` saying so: yank it with `nabi yank <name>@<version>` instead. The package's owners get a notice by mail. The account page lists the versions that may still be deleted, with a Delete button that asks once more.
+
 ## Badges
 
 `GET /packages/<name>/badge.svg`
@@ -122,8 +134,10 @@ An error is a status and `Error { message: ".." }` (`{"message": ".."}` in JSON)
 | Status | When |
 |--------|------|
 | 400 | A bad `format` |
+| 401, 403 | A delete without a token, or with one that may not delete this package |
 | 404 | No such package, version, README, archive, docs or advisory, or no such route |
-| 405 | A method other than `GET` or `HEAD` |
+| 405 | A method other than `GET` or `HEAD` (or `DELETE` of a version) |
+| 409 | A delete past 72 hours, or of a version another package depends on: yank it instead |
 | 429 | Over the rate limit; wait `Retry-After` seconds |
 | 451 | The registry took the package or version down; `message` says why |
 | 500, 503 | The registry failed; try again later |

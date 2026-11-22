@@ -4,7 +4,7 @@
 
 import { render } from "preact";
 import { CodeBlock } from "./ui/code-block.tsx";
-import { MAX, Results, type Entry } from "./ui/results.tsx";
+import { KO, MAX, Results, type Entry } from "./ui/results.tsx";
 
 (() => {
   let index: Entry[] | null = null;
@@ -116,7 +116,7 @@ import { MAX, Results, type Entry } from "./ui/results.tsx";
       if (terms.some((w) => t.includes(w))) where.push("name");
       if (terms.some((w) => p.includes(w))) where.push("description");
       if (terms.some(inKw)) where.push("keywords");
-      e.why = where.length === 3 ? "name, description and keywords" : where.join(" and ");
+      e.why = where;
       hits.push([t === q ? 0 : t.startsWith(q) ? 1 : t.includes(q) ? 2 : ks.includes(q) ? 3 : 4, e]);
     }
     hits.sort((a, b) => a[0] - b[0] || (b[1].o ?? 0) - (a[1].o ?? 0) || a[1].t.localeCompare(b[1].t));
@@ -181,7 +181,8 @@ import { MAX, Results, type Entry } from "./ui/results.tsx";
   };
 
   // Header search: a combobox over the index; Enter without a pick opens
-  // the full list filtered (packages/?q=).
+  // the full list filtered (packages/?q=). On a Korean page the rows lead
+  // to the Korean pages (results.tsx).
   const form = document.querySelector<HTMLFormElement>(".hdr .search");
   const q = form?.querySelector<HTMLInputElement>(".q");
   const box = form?.querySelector<HTMLUListElement>(".results");
@@ -224,8 +225,13 @@ import { MAX, Results, type Entry } from "./ui/results.tsx";
       if (box.hidden) fill(hits, terms, data, fixed);
       else resize(box, () => fill(hits, terms, data, fixed));
       show(true);
-      const n = !hits.length ? "No packages match" : hits.length === 1 ? "1 package" : `${hits.length} packages`;
-      status.textContent = fixed && hits.length ? `${n} for ${fixed}` : n;
+      if (KO) {
+        const n = !hits.length ? "맞는 패키지가 없습니다" : `패키지 ${hits.length}개`;
+        status.textContent = fixed && hits.length ? `${fixed}: ${n}` : n;
+      } else {
+        const n = !hits.length ? "No packages match" : hits.length === 1 ? "1 package" : `${hits.length} packages`;
+        status.textContent = fixed && hits.length ? `${n} for ${fixed}` : n;
+      }
       mark(-1);
     };
     q.addEventListener("focus", () => void load(), { once: true });

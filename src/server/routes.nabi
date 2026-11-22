@@ -9,7 +9,7 @@ use pkg::server::account::account_route;
 use pkg::server::api::{api_route, open_to_all, wants_json};
 use pkg::server::auth::{callback, login};
 use pkg::server::limit;
-use pkg::server::{Cfg, Resp, html, HTML_CACHE, IMMUTABLE, message, shared_html};
+use pkg::server::{Cfg, Resp, html, HTML_CACHE, IMMUTABLE, ko_path, message, shared_html};
 use std::fs;
 use std::nabion;
 use std::thread;
@@ -59,7 +59,8 @@ pub fn health(site: Site) -> Resp {
 /// case, else a 404 naming the package (or its missing version) and the
 /// closest names. None when `name` is a package and the page is something
 /// else.
-fn missing_package(site: Site, p: str, rest: str, query: str) -> Resp | none {
+fn missing_package(site: Site, p: str, rest: str, query: str, ko: bool) -> Resp | none {
+    let at = |x: str| layout::lp(ko, x);
     let (raw, tail) = rest.split_once("/") ?? (rest, "");
     let name = http::pct_decode(raw, false) ?? raw;
     let names: List<str> = List::new();
@@ -68,23 +69,27 @@ fn missing_package(site: Site, p: str, rest: str, query: str) -> Resp | none {
     if !has {
         for n in names {
             if n == name.to_lowercase() {
-                let to = "/packages/" + n + (if tail.is_empty() { "" } else { "/" + tail });
+                let to = at("/packages/" + n + (if tail.is_empty() { "" } else { "/" + tail }));
                 return Resp { status: 301, headers: [url::moved(to, query), "Cache-Control: public, max-age=3600"], body: "", file: "" };
             }
         }
         let near: List<(str, str)> = List::new();
-        for n in layout::closest(names, name) { near.push(("/packages/" + n, n)); }
-        let sentence = if near.is_empty() { "Nothing in the index has that name. Search with <kbd class=\"kbd\">/</kbd>, or go to:" } else { "Packages with a similar name:" };
-        near.push(("/packages", "All packages"));
-        near.push(("/publishing", "Publishing a package"));
-        let body = f"<div class=\"frame lost-page\">{web::chrome::not_found(f"No package named {name}", sentence, near)}</div>\n";
-        return html(404, layout::page(site, p[1:], f"No package named {name}", body));
+        for n in layout::closest(names, name) { near.push((at("/packages/" + n), n)); }
+        let sentence = if ko {
+            if near.is_empty() { "index에 그런 이름은 없습니다. <kbd class=\"kbd\">/</kbd>로 검색하거나, 다음으로 이동하십시오." } else { "이름이 비슷한 패키지:" }
+        } else if near.is_empty() { "Nothing in the index has that name. Search with <kbd class=\"kbd\">/</kbd>, or go to:" } else { "Packages with a similar name:" };
+        near.push((at("/packages"), layout::tr(ko, "All packages", "모든 패키지")));
+        near.push((at("/publishing"), layout::tr(ko, "Publishing a package", "패키지 공개하기")));
+        let title = layout::tr(ko, f"No package named {name}", f"{name}(이)라는 패키지가 없습니다");
+        let body = f"<div class=\"frame lost-page\">{web::chrome::not_found(title, sentence, near)}</div>\n";
+        return html(404, layout::page(site, p[1:], title, body));
     }
     let ver = (tail.split_once("/") ?? (tail, "")).0;
     if !ver.is_empty() && ver.byte(0) >= 48u8 && ver.byte(0) <= 57u8 {
-        let links: List<(str, str)> = [(f"/packages/{name}/versions", f"Versions of {name}"), (f"/packages/{name}", f"{name}, latest version")];
-        let body = f"<div class=\"frame lost-page\">{web::chrome::not_found(f"No version {ver} of {name}", "The index has no such version. Go to:", links)}</div>\n";
-        return html(404, layout::page(site, p[1:], f"No version {ver} of {name}", body));
+        let links: List<(str, str)> = [(at(f"/packages/{name}/versions"), layout::tr(ko, f"Versions of {name}", f"{name}의 버전")), (at(f"/packages/{name}"), layout::tr(ko, f"{name}, latest version", f"{name} 최신 버전"))];
+        let title = layout::tr(ko, f"No version {ver} of {name}", f"{name}에는 {ver} 버전이 없습니다");
+        let body = f"<div class=\"frame lost-page\">{web::chrome::not_found(title, layout::tr(ko, "The index has no such version. Go to:", "index에 그런 버전이 없습니다. 다음으로 이동하십시오."), links)}</div>\n";
+        return html(404, layout::page(site, p[1:], title, body));
     }
     none
 }
@@ -112,6 +117,12 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
         if p == from { return Resp { status: 301, headers: ["Location: " + to, "Cache-Control: public, max-age=86400"], body: "", file: "" }; }
     }
     if p.starts_with("/api/") { return api_route(cfg, r, client); }
+    if p.starts_with("/img/") {
+        if !limit::allow("img:" + client, limit::READS) {
+            return Resp { status: 429, headers: ["Content-Type: text/plain; charset=utf-8", "Retry-After: 60", "Cache-Control: no-store"], body: "too many images; wait a minute\n", file: "" };
+        }
+        return pkg::server::img::route(cfg, r);
+    }
     if p == http::REPORT_PATH {
         if r.method != "POST" { return Resp { status: 405, headers: ["Content-Type: text/plain; charset=utf-8", "Cache-Control: no-store"], body: "POST only\n", file: "" }; }
         // Anyone may send one: past REPORTS a minute an address's go
@@ -127,21 +138,25 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     }
     let post = r.method == "POST";
     let get = r.method == "GET" || r.method == "HEAD";
-    if (p == "/login" || p == "/auth/github/callback") && get && !limit::allow("login:" + client, limit::LOGINS) {
-        let m = message(site, p, 429, "Too many logins", "Wait a minute, then log in again.");
+    // The Korean pages: `/ko` and `/ko/..`, routed as the English path
+    // (`bare`) with Korean chrome.
+    let ko = ko_path(p);
+    let bare = unko(p);
+    if (bare == "/login" || p == "/auth/github/callback") && get && !limit::allow("login:" + client, limit::LOGINS) {
+        let m = message(site, p, 429, "Too many logins", "Wait a minute, then log in again.", "로그인이 너무 많습니다", "1분 기다린 뒤 다시 로그인하십시오.");
         m.headers.push("Retry-After: 60");
         return m;
     }
-    if p == "/login" && get { return try login(cfg, site, p); }
+    if bare == "/login" && get { return try login(cfg, site, p); }
     if p == "/auth/github/callback" && get { return try callback(cfg, site, r); }
-    if (p == "/me" && get) || (post && (p == "/logout" || p == "/me/tokens" || (p.starts_with("/me/tokens/") && p.ends_with("/revoke")) || p == "/me/trusted" || (p.starts_with("/me/trusted/") && p.ends_with("/remove")) || p == "/me/owners" || p == "/me/owners/remove" || p == "/me/invites/accept" || p == "/me/invites/decline" || p == "/me/notices" || p == "/me/sessions/logout-all" || (p.starts_with("/me/sessions/") && p.ends_with("/logout")))) {
+    if (bare == "/me" && get) || (post && is_account_form(bare)) {
         return try account_route(cfg, site, r, client);
     }
-    if !get { return message(site, p, 405, "Method not allowed", "Only GET here."); }
+    if !get { return message(site, p, 405, "Method not allowed", "Only GET here: pages are read with GET, and forms are sent from the account page.", "허용되지 않는 메서드", "여기서는 GET만 받습니다. 페이지는 GET으로 읽고, 양식은 계정 페이지에서 보냅니다."); }
     // A search or a misspelt package name scans every name.
-    let costly = (p == "/packages" && !r.query.is_empty()) || (p.starts_with("/packages/") && http::page_file(site.out, p) is none);
+    let costly = (bare == "/packages" && !r.query.is_empty()) || (bare.starts_with("/packages/") && http::page_file(site.out, p) is none);
     if costly && !limit::allow("read:" + client, limit::READS) {
-        let m = message(site, p, 429, "Too many requests", "Wait a minute, then try again.");
+        let m = message(site, p, 429, "Too many requests", "Wait a minute, then try again.", "요청이 너무 많습니다", "1분 기다린 뒤 다시 시도하십시오.");
         m.headers.push("Retry-After: 60");
         return m;
     }
@@ -150,21 +165,22 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     }
     // A search or another order: the list page, filtered and sorted here
     // (it works without JS). The bare list is a file.
-    if p == "/packages" {
+    if bare == "/packages" {
         let f = http::form(r.query);
         let q = f.get("q") ?? "";
         let sort = f.get("sort") ?? "";
         if !q.trim().is_empty() || !sort.is_empty() {
-            let (title, body) = layout::list_page(rows(site), q, sort);
-            return shared_html(200, layout::page(site, "packages/index.html", title, body));
+            let (title, body) = layout::list_page(rows(site), q, sort, ko);
+            let out = layout::in_lang("packages/index.html", ko);
+            return shared_html(200, layout::page_desc(site, out, title, "", body, "", "", "", r.query));
         }
     }
     // Package names are lowercase: never let a case-insensitive file system
     // answer for `/packages/JSON`.
-    if let rest: str = p.strip_prefix("/packages/") {
+    if let rest: str = bare.strip_prefix("/packages/") {
         let seg = (rest.split_once("/") ?? (rest, "")).0;
         if seg != seg.to_lowercase() {
-            if let m: Resp = missing_package(site, p, rest, r.query) { return m; }
+            if let m: Resp = missing_package(site, p, rest, r.query, ko) { return m; }
         }
     }
     // A rebuild renames `public/` away and the new site into its place
@@ -178,11 +194,23 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
             return Resp { status: 200, headers: [f"Content-Type: {http::content_type(f)}", "Cache-Control: " + cache_for(site, p, f, r.query)], body: "", file: f };
         }
     }
-    if let rest: str = p.strip_prefix("/packages/") {
-        if let m: Resp = missing_package(site, p, rest, r.query) { return m; }
+    if let rest: str = bare.strip_prefix("/packages/") {
+        if let m: Resp = missing_package(site, p, rest, r.query, ko) { return m; }
     }
     // The 404 every Nabi site shares, as public/404.html has it.
-    html(404, layout::page(site, p[1:], "Not found", layout::not_found()))
+    html(404, layout::page(site, p[1:], layout::tr(ko, "Not found", "페이지 없음"), layout::not_found(ko)))
+}
+
+/// `p` without its `/ko` (`/ko` is `/`).
+pub fn unko(p: str) -> str {
+    if p == "/ko" { return "/"; }
+    if let x: str = p.strip_prefix("/ko/") { return "/" + x; }
+    p
+}
+
+/// Whether `p` (without `/ko`) is a form the account pages take.
+fn is_account_form(p: str) -> bool {
+    p == "/logout" || p == "/me/tokens" || (p.starts_with("/me/tokens/") && p.ends_with("/revoke")) || p == "/me/trusted" || (p.starts_with("/me/trusted/") && p.ends_with("/remove")) || p == "/me/owners" || p == "/me/owners/remove" || p == "/me/invites/accept" || p == "/me/invites/decline" || p == "/me/notices" || p == "/me/versions/delete" || p == "/me/sessions/logout-all" || (p.starts_with("/me/sessions/") && p.ends_with("/logout"))
 }
 
 /// The bytes of `file`, found for `path`. A rebuild swaps `public/` for

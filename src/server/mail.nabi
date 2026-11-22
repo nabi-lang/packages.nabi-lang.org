@@ -4,7 +4,7 @@
 // With PACKAGES_MAIL_FROM or PACKAGES_SES_REGION unset, mail is off and
 // each mail is logged instead.
 
-use pkg::server::account::date;
+use pkg::server::account::stamp;
 use pkg::server::aws;
 use pkg::server::aws::Creds;
 use pkg::server::store::{Account, Locked, account_of, load_db, lock_of, now_secs, owners_of};
@@ -16,7 +16,7 @@ use std::thread;
 pub fn kinds() -> List<(str, str)> {
     [
         ("publish", "a version of a package you own is published"),
-        ("yank", "a version of a package you own is yanked or unyanked"),
+        ("yank", "a version of a package you own is yanked, unyanked or deleted"),
         ("owners", "owners of a package you own are invited, added or removed"),
         ("trusted", "trusted publishers of a package you own are added or removed"),
         ("token", "a publish token is created on your account"),
@@ -150,12 +150,6 @@ fn deliver(cfg: Cfg, creds: Creds | none, m: Mail) -> Creds | none {
 /// The account page's notice settings.
 pub fn settings_url(cfg: Cfg) -> str { cfg.url + "/me#notices" }
 
-/// `yyyy-mm-dd hh:mm UTC`.
-fn stamp(t: i64) -> str {
-    let p2 = |x: i64| if x < 10i64 { f"0{x}" } else { f"{x}" };
-    let s = t % 86400i64;
-    f"{date(t)} {p2(s / 3600i64)}:{p2((s / 60i64) % 60i64)} UTC"
-}
 
 /// The text of a notice: what happened, the link, what to do if it was
 /// not the reader, and why they get it.

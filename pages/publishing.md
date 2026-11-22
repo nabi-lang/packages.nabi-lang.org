@@ -24,6 +24,8 @@ nabi publish
 nabi yank <name>@0.3.1    # new resolutions skip it; existing locks keep working
 ```
 
+A version published by mistake can be deleted for 72 hours after its publish, while no other package depends on it: on the [account page](/me#versions), or with `DELETE /api/v1/packages/<name>/<version>` (see the [API reference](/api#deleting-a-version)). Its number is never used again. After that, yank it.
+
 Publishing is not open to everyone yet: tokens and trusted publishers are for the registry's maintainers for now. Tokens are made on the [account page](/me), where a package's owners also invite other owners and add trusted publishers. Names are first come, first served, within the [usage policy](/policy).
 
 More, in the guide's [Publishing Packages](https://docs.nabi-lang.org/latest/learn/packages):

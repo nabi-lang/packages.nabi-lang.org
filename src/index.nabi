@@ -242,7 +242,7 @@ pub fn public_addrs(host: str, resolve: fn(str) -> List<IpAddr>) throws (ApiErro
 }
 
 /// `host`'s addresses by the system resolver; none when it has none.
-fn system_addrs(host: str) -> List<IpAddr> {
+pub fn system_addrs(host: str) -> List<IpAddr> {
     let out: List<IpAddr> = List::new();
     for a in (try std::net::resolve(host) catch _ { return out; }) {
         if !out.contains(a.ip()) { out.push(a.ip()); }
@@ -1053,6 +1053,66 @@ pub fn yank(dir: str, name: str, version: str, yanked: bool, native: bool, who: 
     let verb = if yanked { "Yank" } else { "Unyank" };
     try commit_push(dir, rel, f"{verb} {what}{name} {version}", who);
     true
+}
+
+/// The packages in the checkout with a version that depends on `name`
+/// (any kind of dependency, renamed or not, on this index), by name.
+pub fn dependents(dir: str, name: str) throws (ApiError) -> List<str> {
+    let out: List<str> = List::new();
+    for n in try names(dir, false) {
+        if key(n) == key(name) { continue; }
+        for line in (try read_rel(dir, packages::shard(n))).split("\n") {
+            if line.trim().is_empty() { continue; }
+            let (_, v) = try packages::parse_line(line) catch _ { continue; };
+            let hit = false;
+            for d in v.deps {
+                if d.registry.is_empty() && key(packages::real(d)) == key(name) { hit = true; }
+            }
+            if hit && !out.contains(n) { out.push(n); }
+        }
+    }
+    out
+}
+
+/// The subject of the index commit that deletes `name` `version`.
+fn delete_subject(name: str, version: str) -> str { f"Delete {name} {version}" }
+
+/// Remove the line of `name` `version` (and the file with its last
+/// line), commit and push.
+pub fn delete(dir: str, name: str, version: str, who: str) throws (ApiError) {
+    if !packages::is_name(name) || !is_version(version) { throw bad("bad name or version"); }
+    let rel = packages::shard(name);
+    let out = StrBuf::new();
+    let found = false;
+    for line in (try read_rel(dir, rel)).split("\n") {
+        if line.trim().is_empty() { continue; }
+        let hit = false;
+        if let Value::Struct { name: _, fields } = try nabion::parse(line) catch _ { Value::None } {
+            let nm = if let Value::Str(s) = fields.get("name") ?? Value::None { s } else { "" };
+            let vs = if let Value::Str(s) = fields.get("version") ?? Value::None { s } else { "" };
+            hit = key(nm) == key(name) && is_version(vs) && packages::cmp_vers(vs, version) == Ordering::Equal;
+        }
+        if hit { found = true; } else { out.push_str(line + "\n"); }
+    }
+    if !found { throw err(404, f"{name} {version} is not in the index"); }
+    let full = dir + "/" + rel;
+    if out.is_empty() {
+        try fs::remove_file(full) catch x { throw err(500, f"{x}"); };
+    } else {
+        try fs::write(full, out.to_str()) catch x { throw err(500, f"{x}"); };
+    }
+    try commit_push(dir, rel, delete_subject(name, version), who);
+}
+
+/// Whether the checkout's history deleted `name` `version`: its number
+/// is never used again, since lock files may hold its checksum.
+pub fn was_deleted(dir: str, name: str, version: str) throws (ApiError) -> bool {
+    let want = delete_subject(name, version);
+    let log = try git(dir, ["log", "--format=%s", "-F", f"--grep={want}"], 500);
+    for l in log.split("\n") {
+        if l.trim() == want { return true; }
+    }
+    false
 }
 
 #[cfg(test)]

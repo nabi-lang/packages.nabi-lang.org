@@ -9,8 +9,15 @@ The registry is shared by everyone who writes Nabi. This policy says what may be
 - Names are first come, first served. A name belongs to the account that first publishes it, and to the owners it adds.
 - Do not take names you do not use. A package that holds no real code (a placeholder, a name kept for later) may be removed and its name given to someone who will use it.
 - Some names are reserved for the Nabi project: the toolchain's names (`nabi`, `nabic`, ...) and names that start with `nabi-`, `std-` or `core-`. The standard library's `std`, `core` and `bare` are the Nabi project's own entries.
-- A new name that looks like a name already in the registry (one letter apart, or the same once `0` and `o`, `1` and `l`, `-` and `_` are folded) is refused. If yours is a real, different project, ask the admins to approve the name.
-- Official packages, the ones published from the nabi-lang organization, share the same name space. Their names are protected: a name that looks like an official one is refused unless the admins approve it.
+- A new name that reads the same as a name already in the registry once `0` and `o`, `1`, `l` and `i`, `5` and `s`, `rn` and `m`, `vv` and `w`, case, `-` and `_` are folded is refused.
+- Some names are protected from look-alikes as well: a new name one letter apart from one of them (four characters or more), or reading the same, is refused. Protected are the names of official packages (the ones published from the nabi-lang organization, which share the same name space), the toolchain's names (`nabi`, `nabic`, ...), and popular packages: those with 1,000 downloads or more. A name one letter apart from any other package is fine.
+- If your name is refused but is a real, different project, ask the admins to approve it.
+
+## Deleting a version
+
+- For 72 hours after it is published, an owner may delete a version, on the account page or through the API, as long as no other package depends on the package. Its line leaves the index and its archive leaves the registry. Its number is never used again: a fix is a new version.
+- After 72 hours, or once another package depends on it, a version is not deleted: yank it. A yanked version stays for the projects that pinned it, and new resolutions skip it.
+- Every deletion is recorded, and the package's owners are told by mail.
 
 ## What may not be published
 

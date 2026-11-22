@@ -529,7 +529,8 @@ pub fn advisory_page(a: Advisory, base: str) -> str {
         let fixes = fixed_in(x);
         let fix = if fixes.is_empty() { "<span class=\"muted\">none yet</span>" } else {
             let fl: List<str> = List::new();
-            for f in fixes { fl.push(f"<a class=\"mono\" href=\"/packages/{esc(x.package.name)}/{esc(f)}\">{esc(f)}</a>"); }
+            // A fixed version may not be published yet, or was deleted: text.
+            for f in fixes { fl.push(f"<code class=\"ic\">{esc(f)}</code>"); }
             fl.join(", ")
         };
         rows.push_str(f"<tr><td><a class=\"mono\" href=\"/packages/{esc(x.package.name)}\">{esc(x.package.name)}</a></td><td class=\"mono\">{esc(ranges_text(x))}</td><td>{fix}</td></tr>");
