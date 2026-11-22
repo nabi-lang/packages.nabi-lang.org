@@ -11,7 +11,7 @@ use pkg::secret;
 use pkg::server::admin::{Audit, audit};
 use pkg::server::github::{cq, curl, github_user};
 use pkg::server::routes::read_page;
-use pkg::server::store::{Account, Db, Locked, MAX_SESSIONS, SESSION_COOKIE, Session, STATE_COOKIE, account_of, load_db, lock_of, now_secs, save_db, session_cookie, session_of};
+use pkg::server::store::{Account, Db, Locked, MAX_SESSIONS, SEEN_SECS, SESSION_COOKIE, SESSION_SECS, Session, STATE_COOKIE, account_of, load_db, lock_of, now_secs, save_db, session_cookie, session_of};
 use pkg::server::{Cfg, Resp, cookie, counts, LOCK, message, nabion_resp, page, redirect};
 use pkg::trust;
 use pkg::trust::{TrustedPublisher, TrustToken};
@@ -28,8 +28,6 @@ use web::http::Request;
 
 /// When the issuer's keys were last fetched (unix seconds).
 static JWKS_AT: Atomic<i64> = Atomic::new(0i64);
-
-const SESSION_SECS: i64 = 2592000;
 
 /// The body of a token exchange; GitHub's OIDC tokens are about 1 KiB.
 const MAX_EXCHANGE: usize = 16384;
@@ -122,6 +120,8 @@ pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
     let id = gh.id;
     let sid = try secret::random_hex(32);
     let csrf = try secret::random_hex(16);
+    let public_id = try secret::random_hex(8);
+    let agent = agent_of(r.header("user-agent"));
     let now = now_secs();
     let out = Resp { status: 500, headers: List::new(), body: "", file: "" };
     using g = LOCK.lock() {
@@ -152,7 +152,7 @@ pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
             }
             kept.push(x);
         }
-        kept.push(Session { hash: secret::sha256_hex(sid), account: id, csrf: csrf, expires: now + SESSION_SECS });
+        kept.push(Session { hash: secret::sha256_hex(sid), account: id, csrf: csrf, expires: now + SESSION_SECS, id: public_id, created: now, seen: now, agent: agent });
         db.sessions = kept;
         try save_db(cfg, db);
         audit(cfg, Audit { at: now, by: id, action: "login", target: gh.login });
@@ -274,13 +274,47 @@ pub struct Viewer {
 
 /// Who a request with a live session cookie is; none without one. No
 /// lock: the data file is replaced in one rename, and a cookie that is
-/// not 64 hex digits never reaches it.
+/// not 64 hex digits never reaches it. The session's `seen` moves on at
+/// most every SEEN_SECS.
 pub fn viewer(cfg: Cfg, r: Request) -> Viewer | none {
     if session_cookie(r) is none { return none; }
     let d = (try? load_db(cfg)) ?? { return none; };
     let s = session_of(d, r) ?? { return none; };
     let a = account_of(d, s.account) ?? { return none; };
+    if now_secs() - s.seen >= SEEN_SECS { touch(cfg, s.hash); }
     Viewer { account: a, csrf: s.csrf }
+}
+
+/// Mark the session stored as `hash` seen now.
+fn touch(cfg: Cfg, hash: str) {
+    using g = LOCK.lock() {
+        let d = (try? load_db(cfg)) ?? { return; };
+        for i in 0..d.sessions.len() {
+            if d.sessions[i].hash == hash { d.sessions[i].seen = now_secs(); }
+        }
+        try save_db(cfg, d) catch e { eprintln(f"data: {e}"); };
+    }
+}
+
+/// A short name for a User-Agent: `Firefox on Linux`, `curl`. Only this
+/// is kept, never the header itself.
+pub fn agent_of(ua: str) -> str {
+    let browser = "Unknown browser";
+    for (mark, name) in [("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"), ("FxiOS/", "Firefox"), ("CriOS/", "Chrome"), ("Chrome/", "Chrome"), ("Safari/", "Safari"), ("curl/", "curl"), ("Wget/", "Wget")] {
+        if ua.contains(mark) {
+            browser = name;
+            break;
+        }
+    }
+    if ua.starts_with("curl/") || ua.starts_with("Wget/") { return browser; }
+    let os = "";
+    for (mark, name) in [("iPhone", "iOS"), ("iPad", "iPadOS"), ("Android", "Android"), ("CrOS", "ChromeOS"), ("Windows", "Windows"), ("Macintosh", "macOS"), ("Linux", "Linux")] {
+        if ua.contains(mark) {
+            os = name;
+            break;
+        }
+    }
+    if os.is_empty() { browser } else { f"{browser} on {os}" }
 }
 
 /// `resp` with the header's login button turned into the account menu,
@@ -297,6 +331,15 @@ pub fn signed_in(site: Site, r: Request, resp: Resp, v: Viewer) -> Resp {
     }
     headers.push("Cache-Control: no-store");
     Resp { status: resp.status, headers: headers, body: layout::signed_in(text, v.account.login, v.account.id, v.csrf), file: "" }
+}
+
+#[test]
+fn agents() {
+    assert(agent_of("Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0") == "Firefox on Linux", "firefox");
+    assert(agent_of("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15") == "Safari on macOS", "safari");
+    assert(agent_of("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0") == "Edge on Windows", "edge");
+    assert(agent_of("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36") == "Chrome on Android", "android");
+    assert(agent_of("curl/8.7.1") == "curl" && agent_of("") == "Unknown browser", "others");
 }
 
 #[test]

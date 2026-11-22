@@ -9,7 +9,7 @@ use pkg::secret;
 use pkg::server::admin::{Audit, audit};
 use pkg::server::limit;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, may_manage, remove_owner, remove_trusted};
-use pkg::server::store::{Account, Db, SESSION_COOKIE, Session, TOKEN_DAYS, TOKEN_DAYS_MAX, Token, account_of, invites_of, load_db, now_secs, save_db, session_of};
+use pkg::server::store::{Account, Db, SESSION_COOKIE, SESSION_IDLE, SESSION_SECS, Session, TOKEN_DAYS, TOKEN_DAYS_MAX, Token, account_of, invites_of, load_db, now_secs, save_db, seen_at, session_end, session_id, session_of};
 use pkg::server::{Cfg, Resp, cookie, is_admin, LOCK, may_act, message, page, redirect};
 use pkg::trust;
 use pkg::trust::TrustedPublisher;
@@ -46,6 +46,7 @@ fn me_page(cfg: Cfg, site: Site, path: str, db: Db, s: Session, fresh: str) -> R
     b.push_str("<p class=\"t-small muted\">Your name, login and avatar come from your GitHub account; they are updated each time you log in.</p>\n");
     b.push_str(f"<form method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Log out</button></form>\n");
     invites_section(b, csrf, db, a.id);
+    sessions_section(b, csrf, db, s);
     b.push_str("<h2 class=\"t-h3\">Publish tokens</h2>\n");
     let admin = is_admin(cfg, a.id);
     if !may_act(cfg, a.id) {
@@ -77,6 +78,25 @@ fn me_page(cfg: Cfg, site: Site, path: str, db: Db, s: Session, fresh: str) -> R
     owners_section(b, csrf, db, a.id, admin);
     if admin { moderation_section(b, db); }
     page(site, path, "Account", b.to_str(), 200)
+}
+
+/// The account's sessions, this one first, each with Log out, and Log
+/// out everywhere.
+fn sessions_section(b: StrBuf, csrf: str, db: Db, cur: Session) {
+    b.push_str(f"<h2 class=\"t-h3\" id=\"sessions\">Sessions</h2>\n<p>Each browser logged in to this account. A session ends after {SESSION_IDLE / 86400i64} days without a visit, and {SESSION_SECS / 86400i64} days after its login at the latest. Log out one you do not know, then revoke your tokens.</p>\n");
+    let mine: List<Session> = [cur];
+    for x in db.sessions {
+        if x.account == cur.account && x.hash != cur.hash { mine.push(x); }
+    }
+    b.push_str("<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">Browser</th><th scope=\"col\">Logged in</th><th scope=\"col\">Last seen</th><th scope=\"col\">Ends</th><th scope=\"col\"><span class=\"sr-only\">Log out</span></th></tr></thead>\n<tbody>\n");
+    for x in mine {
+        let what = if x.agent.is_empty() { "Unknown browser" } else { x.agent };
+        let here = if x.hash == cur.hash { " <span class=\"tag\">this session</span>" } else { "" };
+        let made = if x.created > 0i64 { date(x.created) } else { "unknown" };
+        b.push_str(f"<tr><td>{esc(what)}{here}</td><td>{made}</td><td>{date(seen_at(x))}</td><td>{date(session_end(x))}</td><td><form method=\"post\" action=\"/me/sessions/{esc(session_id(x))}/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Log out</button></form></td></tr>\n");
+    }
+    b.push_str("</tbody>\n</table></div>\n");
+    b.push_str(f"<form method=\"post\" action=\"/me/sessions/logout-all\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"btn-2 btn-sm\" type=\"submit\">Log out everywhere</button></form>\n");
 }
 
 /// The account's open invitations to own a package, each with Accept and
@@ -194,8 +214,34 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
             d.sessions = keep;
             try save_db(cfg, d);
         }
-        audit(cfg, Audit { at: now_secs(), by: s.account, action: "logout", target: s.hash[:16] });
+        audit(cfg, Audit { at: now_secs(), by: s.account, action: "logout", target: session_id(s) });
         return redirect("/", [cookie(SESSION_COOKIE, "", 0i64)]);
+    }
+    // `/me/sessions/<id>/logout` and `/me/sessions/logout-all`.
+    if let rest: str = r.path.strip_prefix("/me/sessions/") {
+        let all = rest == "logout-all";
+        let which = rest.strip_suffix("/logout") ?? "";
+        let found = false;
+        let this_one = false;
+        using g = LOCK.lock() {
+            let d = try load_db(cfg);
+            let keep: List<Session> = List::new();
+            for x in d.sessions {
+                if x.account == s.account && (all || session_id(x) == which) {
+                    found = true;
+                    if x.hash == s.hash { this_one = true; }
+                } else {
+                    keep.push(x);
+                }
+            }
+            if found {
+                d.sessions = keep;
+                try save_db(cfg, d);
+            }
+        }
+        if !found { return message(site, r.path, 404, "No such session", "It has ended already; reload the account page."); }
+        audit(cfg, Audit { at: now_secs(), by: s.account, action: if all { "logout-all" } else { "logout" }, target: if all { "all" } else { which } });
+        return if this_one { redirect("/", [cookie(SESSION_COOKIE, "", 0i64)]) } else { redirect("/me#sessions", []) };
     }
     let a = account_of(db, s.account) ?? Account { id: 0i64, login: "", created: 0i64 };
     if r.path == "/me/invites/accept" || r.path == "/me/invites/decline" {

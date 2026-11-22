@@ -33,8 +33,40 @@ pub struct Session {
     pub hash: str;
     pub account: i64;
     pub csrf: str;
+    /// The latest it may last: SESSION_SECS after the login.
     pub expires: i64;
+    /// What the account page names it by; "" for one made before
+    /// (session_id).
+    pub id: str = "";
+    pub created: i64 = 0i64;
+    /// When a request last came with it, written at most every SEEN_SECS;
+    /// 0 for one made before (seen_at).
+    pub seen: i64 = 0i64;
+    /// The browser and system it logged in from (auth::agent_of).
+    pub agent: str = "";
 }
+
+/// A session lasts this long after its login at most,
+pub const SESSION_SECS: i64 = 2592000i64;
+/// and ends after this long without a request.
+pub const SESSION_IDLE: i64 = 604800i64;
+/// A session's `seen` is written at most this often.
+pub const SEEN_SECS: i64 = 3600i64;
+
+/// When session `s` was last seen; for one made before `seen` was kept,
+/// its login.
+pub fn seen_at(s: Session) -> i64 { if s.seen > 0i64 { s.seen } else { s.expires - SESSION_SECS } }
+
+/// When session `s` ends if it is not used again.
+pub fn session_end(s: Session) -> i64 {
+    let idle = seen_at(s) + SESSION_IDLE;
+    if idle < s.expires { idle } else { s.expires }
+}
+
+pub fn session_live(s: Session, now: i64) -> bool { session_end(s) > now }
+
+/// The id the account page names session `s` by.
+pub fn session_id(s: Session) -> str { if s.id.is_empty() { s.hash[:16] } else { s.id } }
 
 #[derive(Nabion)]
 pub struct Token {
@@ -201,7 +233,7 @@ pub fn save_db(cfg: Cfg, db: Db) throws {
     let now = now_secs();
     let live: List<Session> = List::new();
     for s in db.sessions {
-        if s.expires > now { live.push(s); }
+        if session_live(s, now) { live.push(s); }
     }
     db.sessions = live;
     let kept: List<TrustToken> = List::new();
@@ -253,7 +285,7 @@ pub fn session_of(db: Db, r: Request) -> Session | none {
     let h = secret::sha256_hex(c);
     let now = now_secs();
     for s in db.sessions {
-        if secret::same(s.hash, h) && s.expires > now && lock_of(db, s.account) is none { return s; }
+        if secret::same(s.hash, h) && session_live(s, now) && lock_of(db, s.account) is none { return s; }
     }
     none
 }
@@ -388,6 +420,20 @@ fn ownership_and_tokens() {
     assert(back.tokens.len() == 1 && back.tokens[0].hash == db.tokens[0].hash, "data file round trip");
     assert(token_at(db, t) == 0usize && token_at(db, "pkg_" + "AB".repeat(32)) is none, "token index");
     assert(is_hex("ab".repeat(32), 64) && !is_hex("ab".repeat(32) + "0", 64) && !is_hex("xy".repeat(32), 64), "hex");
+}
+
+#[test]
+fn sessions() {
+    let now = 1800000000i64;
+    let s = Session { hash: "ab".repeat(32), account: 5i64, csrf: "", expires: now + SESSION_SECS, created: now, seen: now };
+    assert(session_live(s, now + SESSION_IDLE - 1i64) && !session_live(s, now + SESSION_IDLE), "idle");
+    s.seen = now + SESSION_SECS - 10i64;
+    assert(session_live(s, now + SESSION_SECS - 1i64) && !session_live(s, now + SESSION_SECS), "absolute");
+    // One made before `seen`: idle since its login.
+    let old = Session { hash: "cd".repeat(32), account: 5i64, csrf: "", expires: now + SESSION_SECS };
+    assert(seen_at(old) == now && session_end(old) == now + SESSION_IDLE && session_id(old) == "cd".repeat(8), "before");
+    s.id = "0123456789abcdef";
+    assert(session_id(s) == s.id, "id");
 }
 
 #[test]

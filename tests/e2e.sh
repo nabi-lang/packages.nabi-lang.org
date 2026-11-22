@@ -1036,6 +1036,36 @@ for a in login logout token-revoke owner-add trusted-add; do
 done
 ok "revoke and logout"
 
+# Sessions: each listed with its browser; one ends another, then all end.
+login admin
+first=$sess
+login admin
+expect_body '<h2 class="t-h3" id="sessions">Sessions</h2>' "sessions listed"
+expect_body '<td>curl <span class="tag">this session</span></td>' "this session"
+n=$(grep -c 'action="/me/sessions/[0-9a-f]*/logout"' "$T/b")
+[ "$n" -ge 2 ] || fail "sessions listed: $n"
+oid=$(grep -v 'this session' "$T/b" | sed -n 's|.*action="/me/sessions/\([0-9a-f]*\)/logout".*|\1|p' | head -1)
+[ -n "$oid" ] || fail "no other session"
+req POST "/me/sessions/$oid/logout" -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf"
+expect_code 303 "log out another session"
+[ "$(header location)" = "/me#sessions" ] || fail "log out another session location: $(header location)"
+req GET /me -H "Cookie: __Host-pkg_session=$sess"
+[ "$(grep -c 'action="/me/sessions/[0-9a-f]*/logout"' "$T/b")" = $((n - 1)) ] || fail "session not ended"
+req POST "/me/sessions/$oid/logout" -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf"
+expect_code 404 "a session ended already"
+req POST /me/sessions/logout-all -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$first"
+expect_code 403 "log out everywhere with a wrong csrf"
+req POST /me/sessions/logout-all -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf"
+expect_code 303 "log out everywhere"
+[ "$(header location)" = "/" ] || fail "log out everywhere location: $(header location)"
+cookie_of __Host-pkg_session | grep -q . && fail "session cookie kept"
+for c in "$first" "$sess"; do
+    req GET /me -H "Cookie: __Host-pkg_session=$c"
+    expect_code 303 "logged out everywhere"
+done
+grep -q 'action: "logout-all"' "$T/data/audit.nabion" || fail "audited: logout-all"
+ok "sessions"
+
 grep -q "code=" "$T/server.log" && fail "OAuth code in the log"
 grep -q "test-secret\|gho_" "$T/server.log" && fail "secret in the log"
 grep -q "pkt_\|eyJ" "$T/server.log" && fail "trusted token or OIDC token in the log"
