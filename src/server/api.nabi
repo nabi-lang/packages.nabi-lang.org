@@ -19,7 +19,7 @@ use pkg::server::limit;
 use pkg::server::mail;
 use pkg::server::names;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, remove_owner, remove_trusted};
-use pkg::server::store::{Account, Db, Locked, Owner, Removal, SCOPE_ADMIN, SCOPE_NEW, SCOPE_OWNERS, SCOPE_UPDATE, SCOPE_YANK, account_of, fill_owner_ids, load_db, lock_of, may_publish, now_secs, owners_of, release_at, removal_of, save_db, scope_says, token_at, token_scopes};
+use pkg::server::store::{Account, Db, Event, Locked, Owner, Removal, SCOPE_ADMIN, SCOPE_NEW, SCOPE_OWNERS, SCOPE_UPDATE, SCOPE_YANK, account_of, fill_owner_ids, load_db, lock_of, may_publish, now_secs, owners_of, record, release_at, removal_of, save_db, scope_says, token_at, token_scopes};
 use pkg::server::{Cfg, Resp, api_error, INDEX, is_admin, LOCK, may_act, nabion_resp, STALE};
 use pkg::trust;
 use pkg::trust::{TrustedPublisher, TrustToken};
@@ -509,6 +509,7 @@ fn publish(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
                         fs::write(rp, p.readme);
                     } catch x { eprintln(f"readme: {x}"); };
                 }
+                if !filled { record(ref d, Event { package: k, at: by.at, by: by.id, who: who_did(auth), action: "publish", detail: e.version }); }
                 let i = release_at(d, k, e.version);
                 d.releases[i].meta = if filled { meta::over(d.releases[i].meta, p.meta) } else { p.meta };
                 d.releases[i].published_by = by;
@@ -572,6 +573,7 @@ fn yank(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
                 let i = release_at(d, k, y.version);
                 if changed {
                     if y.undo { d.releases[i].unyanked_by = by; } else { d.releases[i].yanked_by = by; }
+                    record(ref d, Event { package: k, at: by.at, by: by.id, who: who_did(auth), action: if y.undo { "unyank" } else { "yank" }, detail: if y.message.is_empty() { y.version } else { f"{y.version}: {y.message}" } });
                 }
                 d.releases[i].yank_message = y.message;
                 try save_db(cfg, d) catch x { eprintln(f"data: {x}"); };

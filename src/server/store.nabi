@@ -1,6 +1,7 @@
 // The data file (`db.nabion` under PACKAGES_DATA): accounts, sessions,
-// tokens, owners, releases and trusted publishers, and the lookups into
-// it. Callers hold `LOCK` around a read and the write that follows.
+// tokens, owners, releases, trusted publishers and each package's
+// events, and the lookups into it. Callers hold `LOCK` around a read and
+// the write that follows.
 
 use pkg::index;
 use pkg::meta;
@@ -193,6 +194,27 @@ pub struct Removal {
     pub at: i64;
 }
 
+/// One change to a package, kept for its owners to see (`events`).
+#[derive(Nabion)]
+pub struct Event {
+    /// `index::key`, `native/` prefixed for a native package.
+    pub package: str;
+    pub at: i64;
+    /// The GitHub id of the account that made it; for a trusted publish,
+    /// of the user who started the run.
+    pub by: i64;
+    /// Who made it, as the account page shows it.
+    pub who: str;
+    /// `publish`, `yank`, `unyank`, `owner-invite`, `owner-add`,
+    /// `owner-decline`, `owner-remove`, `trusted-add`, `trusted-remove`,
+    /// `token-create`, `token-revoke`.
+    pub action: str;
+    pub detail: str = "";
+}
+
+/// Events kept for each package; older ones go.
+pub const EVENTS_KEPT: usize = 100;
+
 #[derive(Nabion)]
 pub struct Db {
     pub accounts: List<Account>;
@@ -212,6 +234,48 @@ pub struct Db {
     /// Names (`index::key`) the admins let through the reserved list and
     /// the look-alike check.
     pub approved: List<str> = List::new();
+    /// What was done to each package, oldest first (record).
+    pub events: List<Event> = List::new();
+}
+
+/// Keep `e` in `db`, past EVENTS_KEPT of its package the oldest going.
+pub fn record(ref db: Db, e: Event) {
+    db.events.push(e);
+    let n = 0usize;
+    for x in db.events {
+        if x.package == e.package { n += 1; }
+    }
+    if n <= EVENTS_KEPT { return; }
+    let drop = n - EVENTS_KEPT;
+    let keep: List<Event> = List::new();
+    for x in db.events {
+        if x.package == e.package && drop > 0 {
+            drop -= 1;
+            continue;
+        }
+        keep.push(x);
+    }
+    db.events = keep;
+}
+
+/// The packages account `id` owns, as `index::key`s.
+pub fn owned_by(db: Db, id: i64) -> List<str> {
+    let out: List<str> = List::new();
+    for o in db.owners {
+        if o.accounts.contains(id) { out.push(o.name); }
+    }
+    out
+}
+
+/// The latest `n` events of the packages in `keys`, newest first.
+pub fn events_of(db: Db, keys: List<str>, n: usize) -> List<Event> {
+    let out: List<Event> = List::new();
+    let i = db.events.len();
+    while i > 0 && out.len() < n {
+        i -= 1;
+        if keys.contains(db.events[i].package) { out.push(db.events[i]); }
+    }
+    out
 }
 
 /// Sessions an account keeps; a new login past it ends the oldest.
@@ -471,6 +535,17 @@ fn ownership_and_tokens() {
     db.tokens[0].scopes = [SCOPE_YANK];
     assert(token_scopes(db.tokens[0]).join(" ") == "yank" && scope_says(SCOPE_ADMIN) == "moderate (admins only)" && scope_says("x").is_empty(), "scopes");
     assert(is_hex("ab".repeat(32), 64) && !is_hex("ab".repeat(32) + "0", 64) && !is_hex("xy".repeat(32), 64), "hex");
+}
+
+#[test]
+fn events() {
+    let db = Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: [Owner { name: "geom", accounts: [5i64] }, Owner { name: "json", accounts: [6i64] }] };
+    for i in 0..(EVENTS_KEPT + 5) { record(ref db, Event { package: "geom", at: i as i64, by: 5i64, who: "ann", action: "publish" }); }
+    record(ref db, Event { package: "json", at: 1000i64, by: 6i64, who: "bob", action: "yank" });
+    let mine = events_of(db, owned_by(db, 5i64), 3);
+    assert(db.events.len() == EVENTS_KEPT + 1 && db.events[0].at == 5i64, f"{db.events.len()}");
+    assert(mine.len() == 3 && mine[0].at == (EVENTS_KEPT + 4) as i64 && mine[2].at == (EVENTS_KEPT + 2) as i64, "newest first, own packages only");
+    assert(owned_by(db, 6i64).join(" ") == "json" && events_of(db, ["json"], 10).len() == 1, "owned");
 }
 
 #[test]

@@ -781,6 +781,16 @@ expect_code 200 "trusted unyank"
 req GET /api/v1/packages/geom
 expect_body 'version: "0.0.9", yanked: false, yank_message: none, removed: none, deps: \[\], meta: { description: "Shapes" }, has_readme: false, archive: Archive { sha256: "[0-9a-f]*", size: [0-9]*, url: "https://packages.test/api/v1/packages/geom/0.0.9/download" }, downloads: 0, published_by: Actor { id: 0, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom", workflow: "publish.yml", ref: "refs/tags/v1", run_id: "777", run_attempt: "1", owner_id: 4242 } }' "trusted publisher recorded"
 expect_body 'yanked_by: Actor { id: 0, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom"' "trusted yank recorded"
+# The owners' activity log on the account page: who did what to their
+# packages, a trusted publish by its workflow run.
+req GET /me -H "Cookie: __Host-pkg_session=$sess"
+expect_body '<h2 class="t-h3" id="activity">Activity</h2>' "activity on the owner's page"
+for want in '<td>alice</td><td>published 0.1.0</td>' '<td>alice</td><td>yanked 0.1.0: wrong areas</td>' '<td>alice</td><td>invited Bob to own it</td>' '<td>Bob</td><td>added owner Bob</td>' '<td>alice</td><td>removed owner Bob</td>' '<td>alice</td><td>added trusted publisher acme/geom publish.yml</td>' '<td>alice</td><td>created token narrow: publish-update, yank</td>' '<td>GitHub Actions in acme/geom (workflow publish.yml, run started by carol)</td><td>published 0.0.9</td>'; do
+    expect_body "$want" "activity: $want"
+done
+req GET /me -H "Cookie: __Host-pkg_session=$bob_sess"
+grep -q 'id="activity"' "$T/b" && fail "activity shown to a non-owner"
+ok "activity"
 
 # A version a maintainer wrote with `nabi publish --index-dir` has no metadata:
 # publishing it again from the same tree fills it in.

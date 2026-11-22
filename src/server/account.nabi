@@ -10,7 +10,7 @@ use pkg::server::admin::{Audit, audit};
 use pkg::server::limit;
 use pkg::server::mail;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, may_manage, remove_owner, remove_trusted};
-use pkg::server::store::{Account, Db, SCOPE_ADMIN, SESSION_COOKIE, SESSION_IDLE, SESSION_SECS, Session, TOKEN_DAYS, TOKEN_DAYS_MAX, Token, account_of, default_scopes, invites_of, load_db, now_secs, save_db, scopes, seen_at, session_end, session_id, session_of};
+use pkg::server::store::{Account, Db, Event, SCOPE_ADMIN, SESSION_COOKIE, SESSION_IDLE, SESSION_SECS, Session, TOKEN_DAYS, TOKEN_DAYS_MAX, Token, account_of, default_scopes, events_of, invites_of, load_db, now_secs, owned_by, record, save_db, scopes, seen_at, session_end, session_id, session_of};
 use pkg::server::{Cfg, Resp, cookie, is_admin, LOCK, may_act, message, page, redirect};
 use pkg::trust;
 use pkg::trust::TrustedPublisher;
@@ -90,6 +90,7 @@ fn me_page(cfg: Cfg, site: Site, path: str, db: Db, s: Session, fresh: str) -> R
     b.push_str(f"<form method=\"post\" action=\"/me/tokens\" class=\"token-form\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"scopes\" value=\"1\"><label>Name <input name=\"name\" maxlength=\"64\" required></label> <label>Packages <input name=\"packages\" maxlength=\"512\" placeholder=\"all yours\" aria-describedby=\"token-help\"></label> <label>Days <input name=\"days\" type=\"number\" min=\"1\" max=\"{TOKEN_DAYS_MAX}\" value=\"{TOKEN_DAYS}\" required></label> <fieldset class=\"scopes\"><legend>It may</legend>{boxes.to_str()}</fieldset> <button class=\"btn btn-sm\" type=\"submit\">Create token</button></form>\n<p class=\"t-small muted\" id=\"token-help\">Packages: names separated by commas, to let the token act only on those; empty, it acts for every package you own. Give a token only what its job needs: a release workflow publishes new versions and yanks; tick a new package or owners only for the token that does that. A token works for the number of days given, at most {TOKEN_DAYS_MAX}.</p>\n");
     trusted_section(b, csrf, trusted);
     owners_section(b, csrf, db, a.id, admin);
+    activity_section(b, db, a.id);
     if admin { moderation_section(b, db); }
     page(site, path, "Account", b.to_str(), 200)
 }
@@ -130,6 +131,45 @@ fn notices_section(cfg: Cfg, b: StrBuf, csrf: str, a: Account) {
     }
     let all = if a.notify { " checked" } else { "" };
     b.push_str(f"<form method=\"post\" action=\"/me/notices\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><label><input type=\"checkbox\" name=\"notify\" value=\"on\"{all}> Send me notices</label> <fieldset><legend>Mail me when</legend>{boxes.to_str()}</fieldset> <button class=\"btn-2 btn-sm\" type=\"submit\">Save</button></form>\n");
+}
+
+/// The latest changes to the packages the account owns, by anyone.
+fn activity_section(b: StrBuf, db: Db, id: i64) {
+    let mine = owned_by(db, id);
+    if mine.is_empty() { return; }
+    b.push_str(f"<h2 class=\"t-h3\" id=\"activity\">Activity</h2>\n<p>The latest {ACTIVITY} changes to the packages you own: publishes, yanks, owners, trusted publishers and tokens. Only their owners see this. If one was not you or a co-owner, revoke your tokens and log out the sessions you do not know.</p>\n");
+    let list = events_of(db, mine, ACTIVITY);
+    if list.is_empty() {
+        b.push_str("<p>Nothing recorded yet.</p>\n");
+        return;
+    }
+    b.push_str("<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">Package</th><th scope=\"col\">When</th><th scope=\"col\">Who</th><th scope=\"col\">What</th></tr></thead>\n<tbody>\n");
+    for e in list {
+        b.push_str(f"<tr><td>{esc(e.package)}</td><td>{date(e.at)}</td><td>{esc(e.who)}</td><td>{esc(event_text(e))}</td></tr>\n");
+    }
+    b.push_str("</tbody>\n</table></div>\n");
+}
+
+/// Changes the account page shows.
+const ACTIVITY: usize = 30;
+
+/// What event `e` did, in words.
+pub fn event_text(e: Event) -> str {
+    let d = e.detail;
+    match e.action {
+        "publish" => f"published {d}",
+        "yank" => f"yanked {d}",
+        "unyank" => f"unyanked {d}",
+        "owner-invite" => f"invited {d} to own it",
+        "owner-add" => f"added owner {d}",
+        "owner-decline" => f"{d} declined the invitation",
+        "owner-remove" => f"removed owner {d}",
+        "trusted-add" => f"added trusted publisher {d}",
+        "trusted-remove" => f"removed trusted publisher {d}",
+        "token-create" => f"created token {d}",
+        "token-revoke" => f"revoked token {d}",
+        _ => f"{e.action} {d}".trim(),
+    }
 }
 
 /// The account's open invitations to own a package, each with Accept and
@@ -367,6 +407,7 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
             if n >= MAX_TOKENS { return message(site, r.path, 400, "Too many tokens", f"Revoke one first (at most {MAX_TOKENS})."); }
             let now = now_secs();
             d.tokens.push(Token { id: id, name: name, account: a.id, hash: secret::sha256_hex(tok), created: now, last_used: 0i64, expires: now + days * 86400i64, packages: only, scopes: picked });
+            for k in token_keys(d, a.id, only) { record(ref d, Event { package: k, at: now, by: a.id, who: a.login, action: "token-create", detail: f"{name}: {picked.join(", ")}" }); }
             try save_db(cfg, d);
             shown = d;
         }
@@ -380,17 +421,22 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
     using g = LOCK.lock() {
         let d = try load_db(cfg);
         let keep: List<Token> = List::new();
-        let gone = false;
+        let gone: Token | none = none;
         for t in d.tokens {
-            if t.id == id && t.account == a.id { gone = true; } else { keep.push(t); }
+            if t.id == id && t.account == a.id { gone = t; } else { keep.push(t); }
         }
-        if !gone { return message(site, r.path, 404, "No such token", "It was revoked already."); }
+        let was = gone ?? { return message(site, r.path, 404, "No such token", "It was revoked already."); };
         d.tokens = keep;
+        for k in token_keys(d, a.id, was.packages) { record(ref d, Event { package: k, at: now_secs(), by: a.id, who: a.login, action: "token-revoke", detail: was.name }); }
         try save_db(cfg, d);
     }
     audit(cfg, Audit { at: now_secs(), by: a.id, action: "token-revoke", target: id });
     redirect("/me", [])
 }
+
+/// The packages a token of account `id` limited to `only` acts on, whose
+/// owners see its creation and revocation: `only`, or all the account's.
+fn token_keys(db: Db, id: i64, only: List<str>) -> List<str> { if only.is_empty() { owned_by(db, id) } else { only } }
 
 /// The package names of a token form, as `index::key`s; none when one is
 /// not a package name. Empty: every package.
@@ -409,5 +455,6 @@ fn token_packages(text: str) -> List<str> | none {
 #[test]
 fn dates() {
     assert(date(0i64) == "never" && date(1700000000i64) == "2023-11-14" && date(951782400i64) == "2000-02-29", "dates");
+    assert(event_text(Event { package: "geom", at: 0i64, by: 5i64, who: "ann", action: "yank", detail: "0.1.0: broken" }) == "yanked 0.1.0: broken" && event_text(Event { package: "geom", at: 0i64, by: 5i64, who: "ann", action: "new-thing" }) == "new-thing", "events");
     assert((token_packages("") ?? ["x"]).is_empty() && (token_packages("json, Nabi-Syntax,json") ?? List::new()).join(" ") == "json nabi_syntax" && token_packages("a b/c") is none, "token packages");
 }

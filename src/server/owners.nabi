@@ -11,7 +11,7 @@ use pkg::secret;
 use pkg::server::admin::{Audit, audit};
 use pkg::server::github::{github_owner, github_repo, is_login};
 use pkg::server::mail;
-use pkg::server::store::{Account, Db, Invite, OrgOwner, Owner, account_of, invites_of, load_db, now_secs, owners_of, save_db};
+use pkg::server::store::{Account, Db, Event, Invite, OrgOwner, Owner, account_of, invites_of, load_db, now_secs, owners_of, record, save_db};
 use pkg::server::{Cfg, LOCK, STALE};
 use pkg::trust;
 use pkg::trust::TrustedPublisher;
@@ -66,6 +66,7 @@ pub fn add_trusted(cfg: Cfg, a: Account, admin: bool, p: TrustedPublisher) throw
         }
         if n >= trust::MAX_PER_PACKAGE { throw index::err(400, f"a package has at most {trust::MAX_PER_PACKAGE} trusted publishers; remove one first"); }
         db.trusted.push(out);
+        record(ref db, Event { package: k, at: now_secs(), by: a.id, who: a.login, action: "trusted-add", detail: f"{out.repository} {out.workflow} {out.environment}".trim() });
         try save(cfg, db);
     }
     // A trusted publisher's repository owner is shown as an owner.
@@ -95,6 +96,7 @@ pub fn remove_trusted(cfg: Cfg, a: Account, admin: bool, id: str) throws (ApiErr
         }
         if !gone { throw index::err(404, "no such trusted publisher"); }
         db.trusted = keep;
+        record(ref db, Event { package: index::key(was.package), at: now_secs(), by: a.id, who: a.login, action: "trusted-remove", detail: f"{was.repository} {was.workflow} {was.environment}".trim() });
         try save(cfg, db);
     }
     STALE.store(1);
@@ -182,6 +184,7 @@ pub fn add_owner(cfg: Cfg, a: Account, admin: bool, package: str, who: str) thro
             db.owners[i].orgs.push(OrgOwner { login: login, id: id, added_by: a.login, added_by_id: a.id, added: now_secs() });
             out = meta::Person { login: login, id: id, org: true };
         }
+        record(ref db, Event { package: k, at: now_secs(), by: a.id, who: a.login, action: if out.org { "owner-add" } else { "owner-invite" }, detail: out.login });
         try save(cfg, db);
     }
     STALE.store(1);
@@ -213,6 +216,7 @@ pub fn accept_invite(cfg: Cfg, a: Account, package: str, accept: bool) throws (A
             let i = owner_at(db, k);
             if !db.owners[i].accounts.contains(a.id) { db.owners[i].accounts.push(a.id); }
         }
+        record(ref db, Event { package: k, at: now_secs(), by: a.id, who: a.login, action: if accept { "owner-add" } else { "owner-decline" }, detail: a.login });
         try save(cfg, db);
     }
     STALE.store(1);
@@ -261,6 +265,7 @@ pub fn remove_owner(cfg: Cfg, a: Account, admin: bool, package: str, who: str, i
         }
         db.invites = keep;
         if !gone { throw index::err(404, f"`{who}` does not own `{package}`"); }
+        record(ref db, Event { package: k, at: now_secs(), by: a.id, who: a.login, action: "owner-remove", detail: if who.is_empty() { f"{target}" } else { who } });
         try save(cfg, db);
     }
     STALE.store(1);
