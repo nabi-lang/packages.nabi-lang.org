@@ -180,21 +180,25 @@ pre.cmd{border:1px solid var(--line);border-radius:var(--r);background:var(--cod
   .meta .kv dd{margin-top:2px}
 }
 .inst{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);overflow:hidden;box-sizing:border-box}
-.itabs{display:flex;gap:16px;padding:0 12px;border-bottom:1px solid var(--line)}
-.itabs button{background:none;border:0;padding:10px 0;font-size:13px;line-height:18px;color:var(--ink-2);cursor:pointer}
+/* the install box: every row inside the same 14px inset, the Copy
+   buttons on one right edge */
+.inst-note{margin:0;padding:10px 14px;border-bottom:1px solid var(--line);font-size:13px;line-height:20px;color:var(--ink-2)}
+.inst-note .ic{white-space:nowrap}
+.itabs{display:flex;gap:18px;padding:0 14px;border-bottom:1px solid var(--line)}
+.itabs button{background:none;border:0;padding:11px 0;font-size:13px;line-height:18px;color:var(--ink-2);cursor:pointer}
 .itabs button:hover{color:var(--ink)}
 .itabs [aria-selected=true]{color:var(--ink);font-weight:500;box-shadow:inset 0 -2px 0 var(--acc)}
 html:not(.js) .itabs{display:none}
 html.js .ipanel:not(.on){display:none}
 html:not(.js) .ipanel+.ipanel{border-top:1px solid var(--line)}
 .ipanel{position:relative}
-.ipanel pre,.iuse pre{font-size:14px;line-height:22px;padding:9px 76px 9px 12px;overflow-x:auto;margin:0}
+.ipanel pre,.iuse pre{font-size:14px;line-height:22px;padding:12px 84px 12px 14px;overflow-x:auto;margin:0}
 .iuse{position:relative;border-top:1px solid var(--line)}
-.iuse .t-small{padding:8px 12px 0;color:var(--ink-3)}
-.iuse pre{padding-top:2px}
-.iuse .copy{position:absolute;bottom:7px;right:6px}
+.iuse .t-small{margin:0;padding:10px 14px 0;color:var(--ink-3)}
+.iuse pre{padding-top:4px}
 .ipanel .p{color:var(--acc);-webkit-user-select:none;user-select:none}
-.ipanel .copy{position:absolute;top:6px;right:6px}
+.ipanel .copy{position:absolute;top:9px;right:8px}
+.iuse .copy{position:absolute;bottom:9px;right:8px}
 .vers ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
 .vers li{display:flex;align-items:center;gap:10px;font-size:14px;line-height:24px}
 .vers .dot{width:8px;height:8px;border-radius:50%;background:var(--acc);flex:none}

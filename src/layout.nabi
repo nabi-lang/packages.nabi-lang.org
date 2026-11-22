@@ -718,7 +718,7 @@ fn install_box(s: Package, id: str) -> str {
     // tabs only.
     let use_line = if s.import.is_empty() || !s.has_lib { "" } else { f"<div class=\"iuse\"><p class=\"t-small\">Then in your code</p><pre><code class=\"language-nabi\">{nabi_syntax::highlight_nabi(s.import)}</code></pre>{chrome::copy_button(s.import, false)}</div>" };
     // The newest version of an official package comes in on `use` alone.
-    let auto = if s.official && s.has_lib && !old && !packages::is_pre(l.version) { f"<p class=\"t-small\">Official: <code class=\"ic\">use {esc(s.name.replace("-", "_"))}::..;</code> alone is enough, the first build adds it. Or:</p>" } else { "" };
+    let auto = if s.official && s.has_lib && !old && !packages::is_pre(l.version) { f"<p class=\"inst-note\">Official: <code class=\"ic\">use {esc(s.name.replace("-", "_"))}::..;</code> alone is enough, the first build adds it. Or:</p>" } else { "" };
     let heads = StrBuf::new();
     let panels = StrBuf::new();
     for k in 0..tabs.len() {
