@@ -980,7 +980,7 @@ fn package_head(site: Site, s: Package, tab: str, ko: bool) -> str {
 <nav class=\"crumbs\" aria-label=\"{tr(ko, "Breadcrumb", "이동 경로")}\"><a href=\"{lp(ko, "/packages")}\">{tr(ko, "packages", "패키지")}</a> / {crumbs(s, tab, ko)}</nav>
 <div class=\"title\"><span class=\"gl-box {hue_class(s.name)}\">{glyph(s.name, 44, "gl")}</span><div class=\"what\"><div class=\"name-line\"><h1>{esc(s.name)}</h1><span class=\"ver{if l.yanked { " gone" } else { "" }}\">{esc(l.version)}</span>{if s.official { official_badge(ko) } else { "" }}</div>{about}</div></div>
 <p class=\"sum t-small\"><span>{sum.join("</span> · <span>")}</span></p>
-{notice}{osv::banner(s.advisories, s.name, l.version)}{inst}<div class=\"tabs-line\"><nav class=\"tabs\" aria-label=\"{tr(ko, "Package sections", "패키지 섹션")}\">{tabs.to_str()}</nav></div>
+{notice}{osv::banner(s.advisories, s.name, l.version, ko)}{inst}<div class=\"tabs-line\"><nav class=\"tabs\" aria-label=\"{tr(ko, "Package sections", "패키지 섹션")}\">{tabs.to_str()}</nav></div>
 </div>
 "
 }
@@ -1125,7 +1125,7 @@ fn side(site: Site, s: Package, ko: bool) -> str {
         kv.push_str(f"<dt>{tr(ko, "Published", "공개")}</dt><dd>{when}{who}</dd>");
     }
     kv.push_str(downloads_kv(s, ko));
-    kv.push_str(osv::side_kv(s.advisories, s.name, l.version));
+    kv.push_str(osv::side_kv(s.advisories, s.name, l.version, ko));
     if !m.license.is_empty() { kv.push_str(f"<dt>{tr(ko, "License", "라이선스")}</dt><dd>{esc(m.license)}</dd>"); }
     if !l.nabi_version.is_empty() { kv.push_str(f"<dt>{tr(ko, "Requires", "필요한 버전")}</dt><dd>{esc(admits(l.nabi_version, ko))}</dd>"); }
     if !m.links.is_empty() { kv.push_str(f"<dt>{tr(ko, "Links", "링크")}</dt><dd title=\"{tr(ko, "The native library it links", "링크하는 네이티브 라이브러리")}\"><code class=\"ic\">{esc(m.links)}</code></dd>"); }
@@ -1510,7 +1510,7 @@ pub fn versions_page(site: Site, s: Package, ko: bool = false) -> str {
             tags.push_str(f"<span class=\"tag\"{by}>{yanked_tag(ko)}</span>");
         }
         if packages::is_pre(v.version) { tags.push_str(f"<span class=\"tag\">{tr(ko, "pre-release", "프리릴리스")}</span>"); }
-        if !osv::affecting(s.advisories, s.name, v.version).is_empty() { tags.push_str("<span class=\"tag vuln\" title=\"A security advisory affects it\">advisory</span>"); }
+        if !osv::affecting(s.advisories, s.name, v.version).is_empty() { tags.push_str(f"<span class=\"tag vuln\" title=\"{tr(ko, "A security advisory affects it", "보안 권고가 이 버전에 해당합니다")}\">{tr(ko, "advisory", "보안 권고")}</span>"); }
         // The day; the time is in the title.
         let none_yet = f"<span class=\"muted\">{tr(ko, "unknown", "알 수 없음")}</span>";
         let when = if v.date.is_empty() { none_yet } else { when_tag(v.date, "", true).replace("<time ", f"<time title=\"{esc(when_text(v.date))}\" ") };

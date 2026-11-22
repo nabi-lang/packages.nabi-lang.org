@@ -573,27 +573,33 @@ pub fn advisory_page(a: Advisory, base: str) -> str {
 
 /// The red banner of a package or version page: the live advisories of
 /// `xs` that affect `version` of `name`; "" for none.
-pub fn banner(xs: List<Advisory>, name: str, version: str) -> str {
+pub fn banner(xs: List<Advisory>, name: str, version: str, ko: bool = false) -> str {
     let hit = affecting(xs, name, version);
     if hit.is_empty() { return ""; }
+    let lp = if ko { "/ko" } else { "" };
     let links: List<str> = List::new();
-    for a in hit { links.push(f"<a href=\"{esc(href(a.id))}\">{esc(a.id)}</a>: {esc(a.summary)}"); }
+    for a in hit { links.push(f"<a href=\"{lp}{esc(href(a.id))}\">{esc(a.id)}</a>: {esc(a.summary)}"); }
+    if ko {
+        return f"<div class=\"callout vuln\" role=\"alert\"><span class=\"lab\">보안</span><span>보안 권고 {hit.len()}건이 {esc(name)} {esc(version)}에 해당합니다. {links.join("; ")}. 수정된 버전으로 올리세요.</span></div>";
+    }
     let n = if hit.len() == 1 { "1 advisory affects" } else { f"{hit.len()} advisories affect" };
     f"<div class=\"callout vuln\" role=\"alert\"><span class=\"lab\">security</span><span>{n} {esc(name)} {esc(version)}. {links.join("; ")}. Upgrade to a fixed version.</span></div>"
 }
 
 /// The side panel's line: each public advisory on `name`, those that
 /// affect `version` marked; none when there are none.
-pub fn side_kv(xs: List<Advisory>, name: str, version: str) -> str {
+pub fn side_kv(xs: List<Advisory>, name: str, version: str, ko: bool = false) -> str {
+    let lp = if ko { "/ko" } else { "" };
+    let (label, nothing, aff, aff_t) = if ko { ("보안 권고", "없음", "해당", "이 버전에 해당합니다") } else { ("Advisories", "None", "affects", "affects this version") };
     let k = index::key(name);
     let items: List<str> = List::new();
     for a in xs {
         if !live(a) || !packages_of(a).contains(k) { continue; }
-        let mark = if affects(a, name, version) { " <span class=\"tag\" title=\"affects this version\">affects</span>" } else { "" };
-        items.push(f"<a class=\"mono\" href=\"{esc(href(a.id))}\" title=\"{esc(a.summary)}\">{esc(a.id)}</a>{mark}");
+        let mark = if affects(a, name, version) { f" <span class=\"tag\" title=\"{aff_t}\">{aff}</span>" } else { "" };
+        items.push(f"<a class=\"mono\" href=\"{lp}{esc(href(a.id))}\" title=\"{esc(a.summary)}\">{esc(a.id)}</a>{mark}");
     }
-    if items.is_empty() { return "<dt>Advisories</dt><dd>None</dd>"; }
-    f"<dt>Advisories</dt><dd>{items.join("<br>")}</dd>"
+    if items.is_empty() { return f"<dt>{label}</dt><dd>{nothing}</dd>"; }
+    f"<dt>{label}</dt><dd>{items.join("<br>")}</dd>"
 }
 
 #[test]
