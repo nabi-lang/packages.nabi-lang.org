@@ -22,14 +22,46 @@ pub fn collect(krate: str, read: fn(str) -> (str | none)) -> List<Module> { web:
 /// `src` with a link mapper for relative links in docs.
 fn md(text: str, link: fn(str) -> str) -> str {
     if text.trim().is_empty() { return ""; }
-    "<div class=\"md\">" + web::chrome::align_classes(markdown::render_untrusted(text, markdown::Options { link: link, code: doc_code }).html) + "</div>"
+    let doc = markdown::render_untrusted(text, markdown::Options { link: link, code: doc_code });
+    let top = 7;
+    for h in doc.headings { if h.level < top { top = h.level; } }
+    "<div class=\"md\">" + web::chrome::align_classes(shift_heads(doc.html, if top < 3 { 3 - top } else { 0 })) + "</div>"
+}
+
+/// `html` with each heading `by` levels lower, at most h6: the page
+/// title is h1 and a module's name h2, so a doc's own `#` heading
+/// becomes h3, as rustdoc does.
+fn shift_heads(html: str, by: i32) -> str {
+    if by == 0 { return html; }
+    let out = html;
+    for n in [5, 4, 3, 2, 1] {
+        let to = if n + by > 6 { 6 } else { n + by };
+        out = out.replace(f"<h{n}", f"<h{to}").replace(f"</h{n}>", f"</h{to}>");
+    }
+    out
 }
 
 /// Fenced code in a doc comment is Nabi unless it says otherwise.
-fn doc_code(lang: str, body: str) -> (str | none) {
-    if lang == "" || lang == "nabi" { return nabi_syntax::highlight_nabi(body); }
+fn doc_code(info: str, body: str) -> (str | none) {
+    // `nabi,norun`: the words after the language are for the doc test.
+    let lang = (info.split_once(",") ?? (info, "")).0;
+    if lang == "" || lang == "nabi" { return nabi_syntax::highlight_nabi(shown(body)); }
     if lang == "nabion" { return nabi_syntax::highlight_nabion(body); }
     none
+}
+
+/// A doc test's code as the reader sees it: lines that start with `# `
+/// (or are a lone `#`) are setup for the test, and hidden, as `nabi doc`
+/// hides them.
+fn shown(code: str) -> str {
+    let out = StrBuf::new();
+    for line in code.lines() {
+        let l = line.trim_start();
+        if l == "#" || l.starts_with("# ") { continue; }
+        out.push_str(line);
+        out.push_str("\n");
+    }
+    out.to_str()
 }
 
 /// The first sentence of `doc`, as text.
@@ -318,6 +350,19 @@ pub fn import_line(krate: str, mods: List<Module>, readme: str) -> str {
         k += 2;
     }
     f"use {krate};"
+}
+
+#[test]
+fn doc_tests_hide_setup() {
+    assert(shown("let x = 1;\n# assert(x == 1);\n#\nprintln(x);\n") == "let x = 1;\nprintln(x);\n", shown("let x = 1;\n# assert(x == 1);\n"));
+    assert(!(doc_code("nabi,norun", "# hidden\nshown()\n") ?? "").contains("hidden"), "with words after the language");
+}
+
+#[test]
+fn doc_headings_sit_below_the_module() {
+    assert(shift_heads("<h1 id=\"a\">A</h1><h2>B</h2>", 2) == "<h3 id=\"a\">A</h3><h4>B</h4>", "shifted");
+    assert(shift_heads("<h5>x</h5>", 2) == "<h6>x</h6>" && shift_heads("<h2>x</h2>", 0) == "<h2>x</h2>", "capped");
+    assert(md("# T\n\n## S", |d| d).contains("<h3") && md("## T\n\n### S", |d| d).contains("<h4"), "both styles start at h3");
 }
 
 #[test]
