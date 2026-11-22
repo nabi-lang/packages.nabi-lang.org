@@ -357,6 +357,19 @@ fn main() throws {
         }
     }
 
+    // Browsing by category and keyword.
+    for cats in [true, false] {
+        let ts = layout::topics(all, cats);
+        let index_out = if cats { "categories/index.html" } else { "keywords/index.html" };
+        let (title, body) = layout::topics_page(ts, cats);
+        files.insert(index_out, layout::page_desc(site, index_out, title, if cats { "Nabi packages by category." } else { "Nabi packages by keyword." }, body));
+        for t in ts {
+            let out = layout::topic_out(cats, t.slug);
+            let (tt, about, tb) = layout::topic_page(t, cats);
+            files.insert(out, layout::page_desc(site, out, tt, about, tb));
+        }
+    }
+
     // Search index: every package, its latest version, description and keywords.
     let sx = StrBuf::new();
     sx.push('[');

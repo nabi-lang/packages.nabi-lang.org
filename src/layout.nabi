@@ -182,7 +182,7 @@ pub fn page_desc(site: Site, out: str, title: str, about: str, body: str, img: s
     let body = body.replace("class=\"anchor\" href=", "class=\"anchor\" tabindex=\"-1\" href=");
     let (ogimg, ogalt) = if img.is_empty() { (site.base_url + "/og.png" + (if site.og.is_empty() { "" } else { "?v=" + site.og }), f"{site.title}: {site.tagline}") } else { (img, alt) };
     let cur = |on: bool| if on { " aria-current=\"page\"" } else { "" };
-    let browse = cur(out == "packages/index.html" || out.starts_with("packages/"));
+    let browse = cur(out.starts_with("packages/") || out.starts_with("categories/") || out.starts_with("keywords/"));
     let publish = cur(out == "publishing.html");
     f"<!doctype html>
 <html lang=\"{lang}\" class=\"nb lt\">
@@ -416,6 +416,12 @@ pub fn landing(all: List<Package>) -> str {
         f"<section aria-labelledby=\"official\" class=\"block\"><div class=\"list-head\"><h2 class=\"t-h3\" id=\"official\">Official packages</h2><span class=\"t-small\">Published from the nabi-lang organization · <a href=\"/packages?q=official:yes\">see all</a></span></div>
 {official_groups(official)}</section>"
     };
+    // The biggest categories, for browsing.
+    let cats = topics(all, true);
+    cats.sort_by(|a: Topic, b: Topic| if a.packages.len() != b.packages.len() { b.packages.len().cmp(a.packages.len()) } else { a.slug.cmp(b.slug) });
+    let cb = StrBuf::new();
+    for k in 0..cats.len().min(8) { cb.push_str(f"<li><a href=\"{esc(url(topic_out(true, cats[k].slug)))}\">{esc(cats[k].label)}</a><span class=\"ct\">{grouped(cats[k].packages.len())}</span></li>"); }
+    let browse = if cats.is_empty() { "" } else { f"<section><h2 class=\"t-h3\">Browse by category</h2><ul class=\"topics compact\">{cb.to_str()}</ul><p><a href=\"/categories\">All categories</a> · <a href=\"/keywords\">keywords</a></p></section>\n" };
     let example = if all.is_empty() { "json" } else { recent[0].name };
     let example_official = !all.is_empty() && recent[0].official;
     for s in all {
@@ -441,7 +447,7 @@ pub fn landing(all: List<Package>) -> str {
 <section><h2 class=\"t-h3\">Using a package</h2>
 {use_note}
 <div class=\"inst\"><div class=\"ipanel on\"><pre class=\"sh\"><code><span class=\"p\" aria-hidden=\"true\">$ </span>nabi add {esc(example)}</code></pre>{chrome::copy_button("nabi add " + example, false)}</div></div></section>
-<section><h2 class=\"t-h3\">Publishing</h2>
+{browse}<section><h2 class=\"t-h3\">Publishing</h2>
 <p>Packages are published here with <code class=\"ic\">nabi publish</code>, or from GitHub Actions with trusted publishing. Publishing is not open to everyone yet.</p>
 <p><a href=\"/publishing#publishing\">How publishing works</a></p></section>
 </aside>
@@ -613,7 +619,7 @@ pub fn list_page(rows: List<Row>, q: str, sort: str) -> (str, str) {
     let (title, note) = if terms.is_empty() && only == "yes" {
         ("Official packages", f"{plural(hits.len(), "official package", "official packages")}, {order}. Official packages are published from the nabi-lang organization.")
     } else if terms.is_empty() && only.is_empty() {
-        ("All packages", f"{plural(rows.len(), "package", "packages")}, {order}.")
+        ("All packages", f"{plural(rows.len(), "package", "packages")}, {order}. Browse by <a href=\"/categories\">category</a> or <a href=\"/keywords\">keyword</a>.")
     } else if hits.is_empty() {
         (f"Search: {q}", f"No packages match {qt}.")
     } else if !fixed.is_empty() {
@@ -635,6 +641,127 @@ pub fn list_page(rows: List<Row>, q: str, sort: str) -> (str, str) {
 <div class=\"page-head\"><h1 class=\"t-h2\">{esc(title)}</h1><p class=\"t-small\">{note}</p></div>
 {form}
 {list}
+</div>
+")
+}
+
+// Browsing by category and keyword: /categories, /categories/<slug>,
+// /keywords, /keywords/<slug>, from the latest version's metadata.
+
+/// The address part of a category or keyword: lowercase ASCII letters
+/// and digits, each run of anything else one `-`, none at the ends; ""
+/// when nothing is left (a keyword in another script has no page).
+pub fn slug(s: str) -> str {
+    let out = StrBuf::new();
+    let dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            if dash && out.len() > 0 { out.push('-'); }
+            dash = false;
+            out.push(c.to_ascii_lowercase());
+        } else {
+            dash = true;
+        }
+    }
+    out.to_str()
+}
+
+/// A category or keyword and the packages whose latest version has it.
+pub struct Topic {
+    pub slug: str;
+    /// As the first package to name it spelt it; a category with its
+    /// first letter raised and `-` as spaces.
+    pub label: str;
+    pub packages: List<Package>;
+}
+
+/// The page of category (`cats`) or keyword `slug`.
+pub fn topic_out(cats: bool, slug: str) -> str { f"{if cats { "categories" } else { "keywords" }}/{slug}.html" }
+
+/// Where a category or keyword links: its page, or a search when it has
+/// no slug.
+pub fn topic_href(cats: bool, word: str) -> str {
+    let s = slug(word);
+    if s.is_empty() { "/packages?q=" + http::pct_encode(word) } else { url(topic_out(cats, s)) }
+}
+
+fn category_label(c: str) -> str {
+    let t = c.trim().replace("-", " ").replace("_", " ");
+    if t.is_empty() { return t; }
+    if t.byte(0) < 128u8 { t[:1].to_uppercase() + t[1:] } else { t }
+}
+
+/// Every category (`cats`) or keyword of `all`, by slug; each package
+/// once per topic, official ones first, then by name.
+pub fn topics(all: List<Package>, cats: bool) -> List<Topic> {
+    let labels: Dict<str, str> = Dict::new();
+    let members: Dict<str, List<Package>> = Dict::new();
+    for s in all {
+        if s.library { continue; }
+        let words = if cats { s.meta.categories } else { s.meta.keywords };
+        for w in words {
+            let k = slug(w);
+            if k.is_empty() { continue; }
+            if !labels.contains_key(k) {
+                labels.insert(k, if cats { category_label(w) } else { w.trim().to_lowercase() });
+                members.insert(k, List::new());
+            }
+            let ps = members[k];
+            let dup = false;
+            for p in ps {
+                if p.name == s.name { dup = true; }
+            }
+            if !dup { ps.push(s); }
+            members.insert(k, ps);
+        }
+    }
+    let out: List<Topic> = List::new();
+    for k in labels.keys() {
+        let ps = members[k];
+        ps.sort_by(|a: Package, b: Package| if a.official != b.official { b.official.cmp(a.official) } else { a.name.cmp(b.name) });
+        out.push(Topic { slug: k, label: labels[k], packages: ps });
+    }
+    out.sort_by(|a: Topic, b: Topic| a.slug.cmp(b.slug));
+    out
+}
+
+/// The links between the two indexes, the current one marked.
+fn topic_switch(cats: bool) -> str {
+    let cur = |on: bool| if on { " aria-current=\"page\"" } else { "" };
+    f"<nav class=\"topic-switch t-ui\" aria-label=\"Browse by\"><a href=\"/categories\"{cur(cats)}>Categories</a><a href=\"/keywords\"{cur(!cats)}>Keywords</a><a href=\"/packages\">All packages</a></nav>"
+}
+
+/// `/categories` or `/keywords`: every one with how many packages have
+/// it. The page title and the body.
+pub fn topics_page(ts: List<Topic>, cats: bool) -> (str, str) {
+    let title = if cats { "Categories" } else { "Keywords" };
+    let what = if cats { "category" } else { "keyword" };
+    let b = StrBuf::new();
+    for t in ts { b.push_str(f"<li><a href=\"{esc(url(topic_out(cats, t.slug)))}\">{esc(t.label)}</a><span class=\"ct\">{grouped(t.packages.len())}</span></li>"); }
+    let list = if ts.is_empty() { f"<p class=\"empty\">No package names a {what} yet.</p>" } else { f"<ul class=\"topics\">{b.to_str()}</ul>" };
+    let note = if cats { "The categories packages name in their manifest (<code class=\"ic\">categories</code>), with how many packages are in each." } else { "The keywords packages name in their manifest (<code class=\"ic\">keywords</code>), with how many packages have each." };
+    (title, f"<div class=\"frame list-page\">
+<div class=\"page-head\"><h1 class=\"t-h2\">{title}</h1><p class=\"t-small\">{plural(ts.len(), what, if cats { "categories" } else { "keywords" })}. {note}</p></div>
+{topic_switch(cats)}
+{list}
+</div>
+")
+}
+
+/// `/categories/<slug>` or `/keywords/<slug>`: its packages. The page
+/// title, its description and the body.
+pub fn topic_page(t: Topic, cats: bool) -> (str, str, str) {
+    let title = if cats { f"Category: {t.label}" } else { f"Keyword: {t.label}" };
+    let about = f"Nabi packages {if cats { "in the category" } else { "with the keyword" }} {t.label}.";
+    let b = StrBuf::new();
+    b.push_str("<ul class=\"rows\">");
+    for s in t.packages { b.push_str(package_row(row_of(s), "")); }
+    b.push_str("</ul>");
+    let all = if cats { "<a href=\"/categories\">All categories</a>" } else { "<a href=\"/keywords\">All keywords</a>" };
+    (title, about, f"<div class=\"frame list-page\">
+<nav class=\"crumbs\" aria-label=\"Breadcrumb\"><a href=\"{if cats { "/categories" } else { "/keywords" }}\">{if cats { "categories" } else { "keywords" }}</a> / {esc(t.slug)}</nav>
+<div class=\"page-head\"><h1 class=\"t-h2\">{esc(title)}</h1><p class=\"t-small\">{plural(t.packages.len(), "package", "packages")}, official first, then by name. {all}</p></div>
+{b.to_str()}
 </div>
 ")
 }
@@ -890,15 +1017,18 @@ fn side(site: Site, s: Package) -> str {
         }
         kv.push_str(f"<dt>Dependencies</dt><dd>{ds.join(", ")}</dd>");
     }
+    // The browse pages are the latest version's: an old version's
+    // keywords and categories search instead.
+    let old = !s.at.is_empty() && s.at != s.top;
     if !m.keywords.is_empty() {
         let ks: List<str> = List::new();
-        for k in m.keywords { ks.push(f"<a href=\"/packages?q={esc(http::pct_encode(k))}\">{esc(k)}</a>"); }
+        for k in m.keywords { ks.push(f"<a href=\"{esc(if old { "/packages?q=" + http::pct_encode(k) } else { topic_href(false, k) })}\">{esc(k)}</a>"); }
         kv.push_str(f"<dt>Keywords</dt><dd class=\"kws\">{ks.join(" ")}</dd>");
     }
     if !m.categories.is_empty() {
         let cs: List<str> = List::new();
-        for c in m.categories { cs.push(esc(c)); }
-        kv.push_str(f"<dt>{if cs.len() == 1 { "Category" } else { "Categories" }}</dt><dd>{cs.join(", ")}</dd>");
+        for c in m.categories { cs.push(f"<a href=\"{esc(if old { "/packages?q=" + http::pct_encode(c) } else { topic_href(true, c) })}\">{esc(c)}</a>"); }
+        kv.push_str(f"<dt>{if cs.len() == 1 { "Category" } else { "Categories" }}</dt><dd class=\"kws\">{cs.join(" ")}</dd>");
     }
     if !m.authors.is_empty() {
         let au: List<str> = List::new();
@@ -1255,4 +1385,27 @@ fn people() {
     let menu = signed_in(page, "a<b", 5i64, "c\"1");
     assert(!menu.contains("href=\"/login\"") && menu.contains("<details class=\"user\">") && menu.contains("a&lt;b") && menu.contains("value=\"c&quot;1\"") && menu.contains("action=\"/logout\"") && menu.contains("/u/5?s=40&v=4"), menu);
     assert(signed_in("<p>no header</p>", "a", 5i64, "c") == "<p>no header</p>", "nothing to swap");
+}
+
+#[test]
+fn browse_pages() {
+    assert(slug("Linear Algebra") == "linear-algebra" && slug("--c++--") == "c" && slug("2d") == "2d" && slug("한국어") == "" && slug("a__b") == "a-b", slug("--c++--"));
+    assert(topic_href(true, "Science") == "/categories/science" && topic_href(false, "한국어") == "/packages?q=%ED%95%9C%EA%B5%AD%EC%96%B4", topic_href(false, "한국어"));
+    assert(category_label("command-line-utilities") == "Command line utilities", category_label("command-line-utilities"));
+    let mk = |name: str, cats: List<str>, kws: List<str>, official: bool| {
+        let m = packages::no_meta();
+        m.categories = cats;
+        m.keywords = kws;
+        let v = Version { version: "1.0.0", deps: List::new(), url: "", rev: "", tree: "", yanked: false, features: List::new() };
+        Package { name: name, file: "", versions: [v], latest: v, time: 0i64, date: "", readme: "", desc: "", rdeps: List::new(), facts: none, api: List::new(), api_none: "", import: "", meta: m, official: official }
+    };
+    let all = [mk("b", ["science"], ["Math", "math"], false), mk("a", ["Science", "parsing"], List::new(), false), mk("c", ["science"], ["한국어"], true)];
+    let ts = topics(all, true);
+    assert(ts.len() == 2 && ts[1].slug == "science" && ts[1].label == "Science" && ts[1].packages.len() == 3 && ts[1].packages[0].name == "c" && ts[1].packages[1].name == "a", "categories");
+    let ks = topics(all, false);
+    assert(ks.len() == 1 && ks[0].slug == "math" && ks[0].packages.len() == 1, "keywords: once per package, none without a slug");
+    let (title, body) = topics_page(ts, true);
+    assert(title == "Categories" && body.contains("<a href=\"/categories/science\">Science</a><span class=\"ct\">3</span>") && body.contains("2 categories"), body);
+    let (tt, _about, tb) = topic_page(ts[1], true);
+    assert(tt == "Category: Science" && tb.contains("3 packages") && tb.contains("href=\"/packages/c\""), tb);
 }

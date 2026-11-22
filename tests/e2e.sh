@@ -740,7 +740,7 @@ expect_body '<td>4.0 KiB</td><td>nabi 0.2.0 or a later 0.2.x</td>' "size and nab
 req GET /packages/geom/0.0.9
 expect_body '<dt>Published</dt><dd><time datetime="[0-9T:Z-]*">[0-9-]* [0-9:]* UTC</time> by <a class="who" href="https://github.com/acme"><img class="av" src="https://avatars.githubusercontent.com/u/4242?s=32&v=4" width="16" height="16" alt="" loading="lazy" decoding="async"><span>acme</span></a> via GitHub Actions (<a href="https://github.com/acme/geom">acme/geom</a>, <a href="https://github.com/acme/geom/actions/runs/777"' "trusted publisher on the version page"
 req GET /packages/geom
-expect_body '<dt>Category</dt><dd>mathematics</dd>' "categories on the page"
+expect_body '<dt>Category</dt><dd class="kws"><a href="/categories/mathematics">mathematics</a></dd>' "categories on the page"
 expect_body '<p>Shapes, <strong>fast</strong>.</p>' "published README rendered"
 req GET /packages/geom/dependencies
 expect_body 'href="/packages/ge-om">ge-om</a> <span class="muted">as</span> <span class="mono">shapes</span> <span class="tag" title="only for this target">cfg(unix)</span>' "rename and target on the page"
@@ -764,6 +764,20 @@ req GET "/packages?q=gemo"
 expect_code 200 "typo search"
 expect_body 'Showing results for <a class="fixed" href="/packages?q=geom"><q>geom</q></a>' "typo corrected"
 expect_body '<b class="nm"><mark>geom</mark></b>' "typo results"
+req GET /categories
+expect_code 200 "categories"
+expect_body '<a href="/categories/mathematics">Mathematics</a><span class="ct">' "category count"
+req GET /categories/mathematics
+expect_code 200 "category page"
+expect_body 'href="/packages/geom"' "category lists the package"
+req GET /categories/mathematics/
+expect_code 301 "category trailing slash"
+req GET /keywords
+expect_code 200 "keywords"
+expect_body '<h1 class="t-h2">Keywords</h1>' "keywords title"
+req GET /packages/geom/0.1.0
+expect_body '<a href="/packages?q=geometry">geometry</a>' "an old version's keyword searches"
+grep -q '<loc>https://packages.nabi-lang.org/categories/mathematics</loc>' "$T/site/public/sitemap.xml" || fail "category in the sitemap"
 # An executable alone: no Docs tab, `nabi install` in the box, a bin tag.
 req GET /packages/app
 expect_code 200 "executable page"

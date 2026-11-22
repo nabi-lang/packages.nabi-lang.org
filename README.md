@@ -59,6 +59,8 @@ python3 -m http.server -d public 8000
 
 `/packages?q=` (served by `serve`, works without JS) and the header's search box (`static/search.tsx`, over `/search-index.json`) match alike: every term must be in the name, the description or a keyword; exact name first, then name prefix, name, keyword, the rest, official packages first among equals. When nothing matches, each term found nowhere is replaced by the nearest name, part of a name (split at `-` / `_`) or keyword within a few edits (1 for 3 to 4 characters, 2 up to 8, 3 beyond; `names::edits`, which counts a swap of two neighbours as one), and the page shows those results under "Showing results for ..": `?q=jsn` shows `json`, `?q=lnalg` shows `linalg`.
 
+`/categories` and `/keywords` list every category and keyword the packages' latest versions name, with how many packages have each; `/categories/<slug>` and `/keywords/<slug>` list those packages, official first, then by name. The slug is the word in lowercase ASCII letters and digits, each run of anything else one `-` (`Linear Algebra` is `/keywords/linear-algebra`); a word with no letter or digit in ASCII has no page and its chip searches for it instead. The side panel's keyword and category chips link these pages; on an old version's page, whose words may have changed since, they search. They are in the sitemap like every page.
+
 ## Server
 
 `nabi run -- serve` serves `public/` and the API over plain HTTP on `PACKAGES_ADDR` (TLS ends at a reverse proxy). Run it from this directory (reads `site.nabion` and `.env`). At start and after each index commit it rebuilds the site in the background. `GET /api/health` answers `ok`, `nabi <release>` (the toolchain the footer names) and `packages <count>`, one a line, or a 503 `failing` while the package list cannot be read.
@@ -190,7 +192,7 @@ Edit `site.nabion` (NABION). Key fields: `title`, `tagline`, `description`, `ind
 | `src/packages.nabi` | Reads the index, semver ordering, dependents, version dates, README and source tree fetching |
 | `src/apidoc.nabi` | Docs tab: public items and `///` docs scanned from a package's sources; the install box's `use` line |
 | `src/docs.nabi`   | Each version's docs: made at publish in a bounded process of its own, kept with the data, their status |
-| `src/layout.nabi` | Page frame, home, package list, publishing guide, package pages and their tabs (Readme, Docs, Versions, Dependencies, Dependents) |
+| `src/layout.nabi` | Page frame, home, package list and search, category and keyword pages, publishing guide, package pages and their tabs (Readme, Docs, Versions, Dependencies, Dependents) |
 | `tests/`         | `e2e.sh` and the fake GitHub it runs (OAuth, `/user`, `/repos`, an OIDC issuer that signs test tokens) |
 | `pages/publishing.md` | Publishing guide text |
 | `pages/{terms,privacy,policy}.md`, `pages/ko/` | Terms of use, privacy notice and usage policy (drafts, not yet reviewed), at `/terms`, `/privacy`, `/policy` and in Korean under `/ko/` |
