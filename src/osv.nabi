@@ -510,7 +510,7 @@ pub fn list_page(xs: List<Advisory>, base: str) -> (str, str) {
     }
     let table = if shown.is_empty() { "<p class=\"empty\">No advisories yet.</p>" } else { f"<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">Id</th><th scope=\"col\">Summary</th><th scope=\"col\">Packages</th><th scope=\"col\">Published</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>" };
     ("Security advisories", f"<div class=\"frame list-page\">
-<div class=\"page-head\"><h1 class=\"t-h2\">Security advisories</h1><p class=\"t-small\">Vulnerabilities in packages of this registry, newest first, in the <a href=\"https://ossf.github.io/osv-schema/\">OSV format</a> at <a href=\"{esc(base)}/api/v1/advisories?format=json\"><code class=\"ic\">/api/v1/advisories</code></a>. A withdrawn advisory stays listed, marked so. To report one, write to <a href=\"mailto:security@nabi-lang.org\">security@nabi-lang.org</a>.</p></div>
+<div class=\"page-head\"><h1 class=\"t-h2\">Security advisories</h1><p class=\"t-small\">Vulnerabilities in packages of this registry, newest first, in the <a href=\"https://ossf.github.io/osv-schema/\">OSV format</a> at <a href=\"{esc(base)}/api/v1/advisories?format=json\"><code class=\"ic\">/api/v1/advisories</code></a>. A withdrawn advisory stays listed, marked so. To report one, write to <a href=\"mailto:security@nabi-lang.org\">security@nabi-lang.org</a>.</p><p class=\"t-small\">Check your project against them: run <code class=\"ic\">nabi audit</code> where its <code class=\"ic\">nabi.lock</code> is. It exits with 1 when one applies, so a CI job fails.</p></div>
 {table}
 </div>
 ")
