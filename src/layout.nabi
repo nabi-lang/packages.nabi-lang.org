@@ -183,7 +183,7 @@ pub fn page_desc(site: Site, out: str, title: str, about: str, body: str, img: s
     let (ogimg, ogalt) = if img.is_empty() { (site.base_url + "/og.png" + (if site.og.is_empty() { "" } else { "?v=" + site.og }), f"{site.title}: {site.tagline}") } else { (img, alt) };
     let cur = |on: bool| if on { " aria-current=\"page\"" } else { "" };
     let browse = cur(out.starts_with("packages/") || out.starts_with("categories/") || out.starts_with("keywords/"));
-    let publish = cur(out == "publishing.html");
+    let publish = cur(out == "publishing.html" || out == "api.html");
     f"<!doctype html>
 <html lang=\"{lang}\" class=\"nb lt\">
 <head>
@@ -778,15 +778,16 @@ pub fn legal(doc: markdown::Doc, other: str, ko: bool) -> str {
 "
 }
 
-/// Body of `publishing.html`: the guide in `pages/publishing.md`.
-pub fn guide(doc: markdown::Doc) -> str {
+/// Body of `publishing.html`: the guide in `pages/publishing.md`; of
+/// `api.html`, with another `title`, the reference in `pages/api.md`.
+pub fn guide(doc: markdown::Doc, title: str = "Using and publishing packages") -> str {
     let toc = StrBuf::new();
     for h in doc.headings {
         if h.level == 2 { toc.push_str(f"<a href=\"#{esc(h.id)}\">{esc(h.text)}</a>"); }
     }
     f"<div class=\"frame doc\">
 <article class=\"prose md\">
-<h1 class=\"t-h1\">Using and publishing packages</h1>
+<h1 class=\"t-h1\">{esc(title)}</h1>
 {doc.html}</article>
 <nav class=\"toc\" aria-label=\"On this page\"><h2 class=\"t-label\">On this page</h2>{toc.to_str()}</nav>
 </div>

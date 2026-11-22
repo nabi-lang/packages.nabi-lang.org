@@ -318,6 +318,9 @@ fn main() throws {
     guide.html = web::chrome::align_classes(guide.html);
     files.insert("index.html", layout::page(site, "index.html", site.title, layout::landing(all)));
     files.insert("publishing.html", layout::page_desc(site, "publishing.html", "Using and publishing packages", "How to add a package as a dependency, and how a version gets into the index.", layout::guide(guide)));
+    let api = markdown::render(try fs::read_to_str("pages/api.md"), layout::md(|h| h));
+    api.html = web::chrome::align_classes(api.html);
+    files.insert("api.html", layout::page_desc(site, "api.html", "Registry API", "The public API of the Nabi package registry: package info, READMEs, source archives and docs, in NABION or JSON.", layout::guide(api, "Registry API")));
     files.insert("404.html", layout::page(site, "404.html", "Not found", layout::not_found()));
     // The policies, in English at /<name> and Korean at /ko/<name>.
     let policies: List<(str, str, str, str)> = [

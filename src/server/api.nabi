@@ -10,6 +10,7 @@
 use pkg::docs;
 use pkg::index;
 use pkg::index::ApiError;
+use pkg::json;
 use pkg::meta;
 use pkg::meta::{Release, Actor};
 use pkg::packages;
@@ -55,7 +56,76 @@ const SOURCE_PROTOCOLS: str = "https";
 static FETCHING: Mutex<Set<str>> = Mutex::new(Set::new());
 
 pub fn api_route(cfg: Cfg, r: Request, client: str) -> Resp {
-    try api(cfg, r, client) catch e { api_error(e.status, e.msg) }
+    let resp = try api(cfg, r, client) catch e { api_error(e.status, e.msg) };
+    if !public_read(r) { return resp; }
+    // A bad `format` was answered by api() already, in NABION.
+    if (try? wants_json(r)) ?? false { resp = as_json(resp); }
+    open_to_all(resp)
+}
+
+/// A read anyone may make, from any origin: package info, READMEs,
+/// archives and docs. Authenticated routes and writes are not.
+pub fn public_read(r: Request) -> bool {
+    (r.method == "GET" || r.method == "HEAD") && (r.path == "/api/v1/docs" || r.path.starts_with("/api/v1/packages/") || r.path.starts_with("/api/v1/native/"))
+}
+
+/// `resp` readable by a page on any origin, and cached apart per Accept
+/// (its format follows it).
+pub fn open_to_all(resp: Resp) -> Resp {
+    resp.headers.push("Access-Control-Allow-Origin: *");
+    resp.headers.push("Vary: Accept");
+    resp
+}
+
+/// Whether a public read answers JSON: `?format=json`, or an Accept that
+/// ranks `application/json` above `application/nabion`. NABION is the
+/// default (`?format=nabion`, or neither named).
+pub fn wants_json(r: Request) throws (ApiError) -> bool {
+    let f = http::form(r.query).get("format") ?? "";
+    if f == "json" { return true; }
+    if f == "nabion" { return false; }
+    if !f.is_empty() { throw index::err(400, f"`format` is `json` or `nabion`, not `{f}`; or leave it out and send `Accept: application/json`"); }
+    let h = r.header("accept");
+    accept_q(h, "application/json") > accept_q(h, "application/nabion")
+}
+
+/// The weight an Accept header gives media type `kind`, in thousandths
+/// (`q=0.5` is 500); 0 when it is not named.
+pub fn accept_q(h: str, kind: str) -> i64 {
+    let best = 0i64;
+    for part in h.split(",") {
+        let ps: List<str> = List::new();
+        for x in part.split(";") { ps.push(x.trim().to_lowercase()); }
+        if ps.is_empty() || ps[0] != kind { continue; }
+        let q = 1000i64;
+        for p in ps {
+            if let v: str = p.strip_prefix("q=") {
+                let (whole, frac) = v.split_once(".") ?? (v, "");
+                q = if whole == "1" { 1000i64 } else if whole == "0" || whole.is_empty() {
+                    let t = (frac + "000")[:3];
+                    try t.parse::<i64>() catch _ { 0i64 }
+                } else { 0i64 };
+            }
+        }
+        if q > best { best = q; }
+    }
+    best
+}
+
+/// A NABION answer as JSON (json::write); anything else as it is.
+pub fn as_json(resp: Resp) -> Resp {
+    let at = resp.headers.len();
+    for i in 0..resp.headers.len() {
+        if resp.headers[i].starts_with("Content-Type: application/nabion") { at = i; }
+    }
+    if at == resp.headers.len() { return resp; }
+    let v = try nabion::parse(resp.body) catch e {
+        eprintln(f"json: {e}");
+        return resp;
+    };
+    resp.body = json::write(v) + "\n";
+    resp.headers[at] = "Content-Type: application/json";
+    resp
 }
 
 fn actor_value(a: Actor | none) -> Value {
@@ -239,13 +309,19 @@ fn docs_of(cfg: Cfg, db: Db, name: str, version: str) throws (ApiError) -> Resp 
 
 /// `GET /api/v1/packages/<name>/<version>/readme`: the README text sent
 /// with that version, as Markdown.
-fn readme_of(cfg: Cfg, db: Db, native: bool, name: str, version: str) throws (ApiError) -> Resp {
+fn readme_of(cfg: Cfg, db: Db, native: bool, name: str, version: str, as_record: bool) throws (ApiError) -> Resp {
     if !packages::is_name(name) || !index::is_version(version) { throw index::err(404, "no such package version"); }
     let k = (if native { "native/" } else { "" }) + index::key(name);
     try gone(db, k, name, version);
     let p = meta::readme_file(cfg.data, k, version);
     if !fs::exists(p) { throw index::err(404, f"{name} {version} was published without a README"); }
     let text = try fs::read_to_str(p) catch e { throw index::err(500, f"readme: {e}"); };
+    // For JSON: a record api_route turns into an object.
+    if as_record {
+        let r = nabion_resp(200, "Readme", [("name", Value::Str(name)), ("version", Value::Str(version)), ("readme", Value::Str(text))]);
+        r.headers[1] = "Cache-Control: public, max-age=60";
+        return r;
+    }
     Resp { status: 200, headers: ["Content-Type: text/markdown; charset=utf-8", "Cache-Control: public, max-age=60"], body: text, file: "" }
 }
 
@@ -568,6 +644,7 @@ fn yank(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
 fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
     if r.path == "/api/v1/docs" {
         if r.method != "GET" && r.method != "HEAD" { throw index::err(405, "use GET /api/v1/docs"); }
+        _ = try wants_json(r);
         try limit::check("read:" + client, limit::READS);
         let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
         return try docs_index(cfg, db);
@@ -578,9 +655,10 @@ fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
             for x in rest.split("/") { parts.push(http::pct_decode(x, false) ?? x); }
             let what = if parts.len() == 3 { f"{prefix}<name>/<version>/{parts[2]}" } else { f"{prefix}<name>" };
             if r.method != "GET" && r.method != "HEAD" { throw index::err(405, f"use GET {what}"); }
+            let json = try wants_json(r);
             try limit::check("read:" + client, limit::READS);
             let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
-            if parts.len() == 3 && parts[2] == "readme" { return try readme_of(cfg, db, native, parts[0], parts[1]); }
+            if parts.len() == 3 && parts[2] == "readme" { return try readme_of(cfg, db, native, parts[0], parts[1], json); }
             if parts.len() == 3 && parts[2] == "download" && !native { return try download(cfg, db, parts[0], parts[1]); }
             if parts.len() == 3 && parts[2] == "docs" && !native { return try docs_of(cfg, db, parts[0], parts[1]); }
             if parts.len() != 1 { throw index::err(404, "no such API route"); }
@@ -697,4 +775,18 @@ fn new_names() {
     let db = Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: List::new() };
     db.releases = [rel("a", "0.1.0", 5i64, now - 100i64), rel("a", "0.2.0", 5i64, now - 50i64), rel("b", "0.1.0", 6i64, now - 200000i64), rel("b", "0.2.0", 5i64, now - 10i64), rel("c", "0.1.0", 5i64, now - 90000i64)];
     assert(new_names_today(db, 5i64, now) == 1 && new_names_today(db, 6i64, now) == 0, f"{new_names_today(db, 5i64, now)}");
+}
+
+#[test]
+fn formats() {
+    assert(accept_q("application/json", "application/json") == 1000i64 && accept_q("text/html, application/json;q=0.9", "application/json") == 900i64, "json");
+    assert(accept_q("application/JSON; q=0.25", "application/json") == 250i64 && accept_q("*/*", "application/json") == 0i64 && accept_q("", "application/json") == 0i64, "weights");
+    assert(accept_q("application/nabion, application/json;q=0.5", "application/nabion") == 1000i64, "nabion");
+    let r = Resp { status: 200, headers: ["Content-Type: application/nabion; charset=utf-8", "Cache-Control: no-store"], body: "Error { message: \"no \\\"x\\\"\" }\n", file: "" };
+    let j = as_json(r);
+    assert(j.body == "{\"message\":\"no \\\"x\\\"\"}\n" && j.headers[0] == "Content-Type: application/json", j.body);
+    let gz = as_json(Resp { status: 200, headers: ["Content-Type: application/gzip"], body: "", file: "a.tar.gz" });
+    assert(gz.headers[0] == "Content-Type: application/gzip", "an archive stays as it is");
+    let o = open_to_all(j);
+    assert(o.headers.contains("Access-Control-Allow-Origin: *") && o.headers.contains("Vary: Accept"), "cors");
 }

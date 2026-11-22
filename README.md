@@ -65,7 +65,7 @@ Each package has a badge at `/packages/<name>/badge.svg` for its README: a flat,
 
 ## Server
 
-`nabi run -- serve` serves `public/` and the API over plain HTTP on `PACKAGES_ADDR` (TLS ends at a reverse proxy). Run it from this directory (reads `site.nabion` and `.env`). At start and after each index commit it rebuilds the site in the background. `GET /api/health` answers `ok`, `nabi <release>` (the toolchain the footer names) and `packages <count>`, one a line, or a 503 `failing` while the package list cannot be read.
+`nabi run -- serve` serves `public/` and the API over plain HTTP on `PACKAGES_ADDR` (TLS ends at a reverse proxy). Run it from this directory (reads `site.nabion` and `.env`). At start and after each index commit it rebuilds the site in the background. `GET /api/health` answers `ok`, `nabi <release>` (the toolchain the footer names) and `packages <count>`, one a line, or a 503 `failing` while the package list cannot be read (`{"status", "nabi", "packages"}` when JSON is asked for, as below).
 
 Settings live in `.env` (copy `.env.example`; process env wins over the file):
 
@@ -86,7 +86,9 @@ Settings live in `.env` (copy `.env.example`; process env wins over the file):
 | `GITHUB_API_TOKEN` | Optional GitHub token (no scopes) sent with the repository and owner lookups, for 5000 requests an hour in place of 60 per address |
 | `GITHUB_OAUTH_URL`, `GITHUB_API_URL`, `GITHUB_OIDC_ISSUER` | Default GitHub; tests point them at a fake |
 
-Login is GitHub OAuth only (`read:user`) and open to anyone: the header always offers it, and an account that may not act only logs in. The account keeps GitHub's id, login, display name and avatar address from the last login; pages draw avatars from the id alone (`https://avatars.githubusercontent.com/u/<id>?s=<px>&v=4`). Pages are built logged out; for a request with a live session `serve` swaps the header's login button for an account menu (`<details>`, no script) and sends the page `no-store`. Sessions are a 32-byte cookie (`__Host-pkg_session`: this host only, https, every path) stored as SHA-256, at most 10 per account; a cookie that is not 64 hex digits is ignored before the data file is read. Publish tokens (`pkg_` + 64 hex) are admin-only until `PACKAGES_OPEN_PUBLISHING` is set, stored as SHA-256 and compared in constant time. Each lasts the days chosen when it is made (90 by default, at most 365) and may be limited to some packages; a limited token moderates nothing, even an admin's. The NABION API takes `Authorization: Bearer pkg_..`:
+Login is GitHub OAuth only (`read:user`) and open to anyone: the header always offers it, and an account that may not act only logs in. The account keeps GitHub's id, login, display name and avatar address from the last login; pages draw avatars from the id alone (`https://avatars.githubusercontent.com/u/<id>?s=<px>&v=4`). Pages are built logged out; for a request with a live session `serve` swaps the header's login button for an account menu (`<details>`, no script) and sends the page `no-store`. Sessions are a 32-byte cookie (`__Host-pkg_session`: this host only, https, every path) stored as SHA-256, at most 10 per account; a cookie that is not 64 hex digits is ignored before the data file is read. Publish tokens (`pkg_` + 64 hex) are admin-only until `PACKAGES_OPEN_PUBLISHING` is set, stored as SHA-256 and compared in constant time. Each lasts the days chosen when it is made (90 by default, at most 365) and may be limited to some packages; a limited token moderates nothing, even an admin's. The NABION API takes `Authorization: Bearer pkg_..` where a route needs a token.
+
+The public reads (`GET` and `HEAD` of `/api/v1/packages/..`, `/api/v1/native/..` and `/api/v1/docs`) answer JSON for `?format=json` or an `Accept` that ranks `application/json` above `application/nabion` (`api::wants_json`), NABION otherwise; the NABION answer is parsed and written as JSON (`json::write`: a struct is an object without its name, `none` is `null`, a variant with data an object keyed by its path), a README is `{ name, version, readme }`, and an archive stays an archive. Any other `format` is a 400. They carry `Access-Control-Allow-Origin: *` and `Vary: Accept`, errors included; routes that take a token and writes carry neither. `/api` is their reference for users (`pages/api.md`); `/api/v1` redirects there. Keep it in step with the routes.
 
 | Route | Purpose |
 |-------|---------|
@@ -195,13 +197,14 @@ Edit `site.nabion` (NABION). Key fields: `title`, `tagline`, `description`, `ind
 | `src/meta.nabi`   | Per-version metadata and publisher records kept in `db.nabion` |
 | `src/secret.nabi` | SHA-256, random bytes, constant-time compare |
 | `src/trust.nabi`  | Trusted publishing: OIDC token (JWT) checks, JWKS keys, claim matching, exchanged tokens, the bootstrap file |
-| `src/json.nabi`   | The JSON GitHub answers with |
+| `src/json.nabi`   | The JSON GitHub answers with; NABION values written as JSON for the API |
 | `src/packages.nabi` | Reads the index, semver ordering, dependents, version dates, README and source tree fetching |
 | `src/apidoc.nabi` | Docs tab: public items and `///` docs scanned from a package's sources; the install box's `use` line |
 | `src/docs.nabi`   | Each version's docs: made at publish in a bounded process of its own, kept with the data, their status |
 | `src/layout.nabi` | Page frame, home, package list and search, category and keyword pages, publishing guide, package pages and their tabs (Readme, Docs, Versions, Dependencies, Dependents) |
 | `tests/`         | `e2e.sh` and the fake GitHub it runs (OAuth, `/user`, `/repos`, an OIDC issuer that signs test tokens) |
 | `pages/publishing.md` | Publishing guide text |
+| `pages/api.md` | The public API's reference, at `/api` |
 | `pages/{terms,privacy,policy}.md`, `pages/ko/` | Terms of use, privacy notice and usage policy (drafts, not yet reviewed), at `/terms`, `/privacy`, `/policy` and in Korean under `/ko/` |
 | `pages/publish.yml` | The trusted publishing workflow for a package's repository |
 | `static/`        | `style.css`, `search.tsx` and its `ui/*.tsx` components, `og.png` |

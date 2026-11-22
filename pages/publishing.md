@@ -31,3 +31,7 @@ More, in the guide's [Publishing Packages](https://docs.nabi-lang.org/latest/lea
 - [Publishing a package](https://docs.nabi-lang.org/latest/learn/packages/01-publishing): what a package needs, `nabi login`, `nabi publish`, names and owners, the API docs the registry makes, `nabi yank`
 - [Trusted publishing](https://docs.nabi-lang.org/latest/learn/packages/02-trusted-publishing): publishing from GitHub Actions with no stored token, and the workflow to copy
 - [Keeping an API stable](https://docs.nabi-lang.org/latest/learn/packages/03-stable-api): `#[deprecated]`, `#[non_exhaustive]` and `#[sealed]`
+
+## The registry API
+
+Package info, READMEs, source archives and docs are open to anyone, in NABION or JSON, from any origin: see the [API reference](/api). Each package also has a badge of its latest version for its README, at `/packages/<name>/badge.svg`.

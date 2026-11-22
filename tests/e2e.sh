@@ -509,8 +509,44 @@ req GET /api/v1/packages/geom/0.1.2/readme
 expect_code 200 "readme api"
 [ "$(header content-type)" = "text/markdown; charset=utf-8" ] || fail "readme type: $(header content-type)"
 [ "$(cat "$T/b")" = "$(printf '# geom\n\nShapes, **fast**.')" ] || fail "readme text: $(cat "$T/b")"
+req GET /api/v1/packages/geom/0.1.2/readme -H 'Accept: application/json'
+expect_code 200 "readme json"
+[ "$(header content-type)" = "application/json" ] || fail "readme json type: $(header content-type)"
+expect_body '^{"name":"geom","version":"0.1.2","readme":"# geom\\n\\nShapes, \*\*fast\*\*.\\n"}$' "readme json body"
 req GET /api/v1/packages/geom/0.1.0/readme
 expect_code 404 "no readme"
+# JSON on request, NABION by default; any origin may read.
+req GET /api/v1/packages/geom -H 'Accept: application/json'
+expect_code 200 "package json"
+[ "$(header content-type)" = "application/json" ] || fail "package json type: $(header content-type)"
+expect_body '^{"name":"geom","native":false,"owners":\[{"id":1001,"login":"alice"}\],.*"versions":\[{"version":"0.1.0","yanked":false,"yank_message":null,' "package json body"
+[ "$(header access-control-allow-origin)" = "*" ] || fail "cors on a public read"
+header vary | grep -q 'Accept' || fail "vary: $(header vary)"
+req GET "/api/v1/packages/geom?format=json" -H 'Accept: application/nabion'
+expect_body '^{"name":"geom"' "format=json wins"
+req GET /api/v1/packages/geom -H 'Accept: text/html,*/*;q=0.8'
+expect_body '^Package { name: "geom"' "nabion by default"
+req GET "/api/v1/packages/geom?format=xml"
+expect_code 400 "bad format"
+expect_body '`format` is `json` or `nabion`' "bad format says what to send"
+req GET /api/v1/packages/nope -H 'Accept: application/json'
+expect_code 404 "json error"
+expect_body '^{"message":"package `nope` is not in the index"}$' "json error body"
+[ "$(header access-control-allow-origin)" = "*" ] || fail "cors on a public error"
+req GET "/api/v1/docs?format=json"
+expect_body '^\[{"name":' "docs index json"
+req GET /api/v1/me "${auth[@]}"
+[ -z "$(header access-control-allow-origin)" ] || fail "cors on an authenticated read"
+req POST /api/v1/yank "${auth[@]}" --data 'x'
+[ -z "$(header access-control-allow-origin)" ] || fail "cors on a write"
+req GET "/api/health?format=json"
+expect_body '^{"status":"ok","nabi":"[^"]*","packages":[0-9]*}$' "health json"
+req GET /api/v1
+expect_code 301 "api reference redirect"
+[ "$(header location)" = "/api" ] || fail "api redirect: $(header location)"
+req GET /api
+expect_code 200 "api reference"
+expect_body '<h1 class="t-h1">Registry API</h1>' "api reference title"
 req GET /api/v1/packages/geom/0.1.2/x
 expect_code 404 "unknown sub-route"
 # Source archives: the published commit's tree, kept at publish.
