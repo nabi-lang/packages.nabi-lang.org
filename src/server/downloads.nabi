@@ -153,6 +153,23 @@ pub fn of(k: str, version: str) -> (i64, i64) {
     }
 }
 
+/// Every package's downloads so far, all versions and days, by
+/// `index::key`.
+pub fn totals() -> Dict<str, i64> {
+    let out: Dict<str, i64> = Dict::new();
+    using g = COUNTS.lock() {
+        let by = g.get();
+        for k in by.keys() {
+            let name = (k.split_once("@") ?? (k, "")).0;
+            let days = by[k];
+            let n = 0i64;
+            for d in days.keys() { n += days[d]; }
+            out.insert(name, (out.get(name) ?? 0i64) + n);
+        }
+    }
+    out
+}
+
 /// Write the counts, folded, to `dir/downloads.nabion` in one rename.
 pub fn flush(dir: str) throws {
     try fs::write_atomic(file_of(dir), (try nabion::to_str(snapshot())) + "\n");

@@ -612,6 +612,49 @@ req POST /api/v1/yank "${auth[@]}" --data-binary 'Yank { name: "geom", version: 
 expect_code 404 "yank unknown"
 ok "yank"
 
+# Deleting: within 72 hours of its publish, while nothing depends on it;
+# the number is never used again.
+publish "${line//0.1.0/0.1.5}"
+expect_code 200 "publish to delete"
+req DELETE /api/v1/packages/geom/0.1.5
+expect_code 401 "delete without a token"
+req DELETE /api/v1/packages/ge-om/0.1.0 "${auth[@]}"
+expect_code 409 "delete a version another package depends on"
+expect_body 'geom depends on ge-om; yank it instead' "dependents refusal"
+req DELETE /api/v1/packages/geom/9.9.9 "${auth[@]}"
+expect_code 409 "delete a version with no publish record"
+req DELETE /api/v1/packages/geom/0.1.5 "${auth[@]}"
+expect_code 200 "delete"
+expect_body 'Deleted { name: "geom", version: "0.1.5" }' "delete body"
+[ "$(git -C "$T/remote.git" log -1 --format=%s)" = "Delete geom 0.1.5" ] || fail "delete commit"
+git -C "$T/remote.git" show HEAD:ge/om/geom | grep -q '"0.1.5"' && fail "deleted line still in the index"
+grep -q 'action: "delete", target: "geom 0.1.5"' "$T/data/audit.nabion" || fail "delete audited"
+mail_to alice@example.com 'alice deleted geom 0.1.5.'
+publish "${line//0.1.0/0.1.5}"
+expect_code 409 "republish a deleted number"
+expect_body 'was deleted, and a version number is never used twice' "deleted number body"
+req GET /api/v1/packages/geom/0.1.5/download
+expect_code 404 "deleted archive"
+# On the account page: listed while it may be deleted, asked once more.
+publish "${line//0.1.0/0.1.6}"
+expect_code 200 "publish to delete from the account page"
+req GET /me -H "Cookie: __Host-pkg_session=$sess"
+expect_body '<h2 class="t-h3" id="versions">Recent versions</h2>' "recent versions"
+expect_body '<td class="mono">0.1.6</td>' "deletable version listed"
+req POST /me/versions/delete -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&package=geom&version=0.1.6"
+expect_code 200 "delete asks first"
+expect_body 'Delete geom 0.1.6?' "confirm page"
+expect_body 'name="confirm" value="yes"' "confirm form"
+git -C "$T/remote.git" show HEAD:ge/om/geom | grep -q '"0.1.6"' || fail "deleted before the confirmation"
+req POST /me/versions/delete -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&package=geom&version=0.1.6&confirm=yes"
+expect_code 303 "delete from the account page"
+[ "$(header location)" = "/me#versions" ] || fail "delete location: $(header location)"
+[ "$(git -C "$T/remote.git" log -1 --format=%s)" = "Delete geom 0.1.6" ] || fail "account page delete commit"
+req POST /me/versions/delete -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&package=ge-om&version=0.1.0&confirm=yes"
+expect_code 409 "account page refuses a depended-on version"
+expect_body 'yank it instead' "account page refusal says what to do"
+ok "delete"
+
 # Metadata and who did what: the public API, no token.
 req GET /api/v1/packages/geom
 expect_code 200 "package api"
@@ -1047,7 +1090,7 @@ req GET /api/v1/packages/ge-om
 expect_code 200 "restored api"
 grep -q 'action: "takedown", target: "ge_om", reason: "malware"' "$T/data/audit.nabion" || fail "audit: $(cat "$T/data/audit.nabion")"
 # Five moderation steps; the accounts' own changes are logged beside them.
-[ "$(grep '^Audit' "$T/data/audit.nabion" | grep -cvE 'action: "(login|logout|logout-all|notices|token-[a-z]+|owner-[a-z]+|invite-[a-z]+|trusted-[a-z]+)"')" = 5 ] || fail "audit lines: $(cat "$T/data/audit.nabion")"
+[ "$(grep '^Audit' "$T/data/audit.nabion" | grep -cvE 'action: "(login|logout|logout-all|notices|token-[a-z]+|owner-[a-z]+|invite-[a-z]+|trusted-[a-z]+|delete)"')" = 5 ] || fail "audit lines: $(cat "$T/data/audit.nabion")"
 ls "$T/data/backup/" | grep -q '^db-[0-9]\{10\}\.nabion$' || fail "db snapshot"
 ok "moderation"
 

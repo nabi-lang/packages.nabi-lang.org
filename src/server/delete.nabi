@@ -1,0 +1,127 @@
+// An owner deletes a version: within DELETE_SECS of its publish, and
+// only while no other package depends on it (as crates.io has it).
+// After that a version is only yanked. The line leaves the index, the
+// archive, README and docs leave the data, and the number is never used
+// again (index::was_deleted). The API (`DELETE /api/v1/packages/<name>/
+// <version>`) and the account page both come here.
+
+use pkg::docs;
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::meta;
+use pkg::meta::Actor;
+use pkg::packages;
+use pkg::server::admin::{Audit, audit};
+use pkg::server::mail;
+use pkg::server::store::{Account, Db, Event, load_db, may_publish, now_secs, owners_of, record, removal_of, save_db};
+use pkg::server::{Cfg, INDEX, LOCK, STALE};
+use std::fs;
+
+/// How long after its publish an owner may delete a version: 72 hours.
+pub const DELETE_SECS: i64 = 259200i64;
+
+/// A version an account may still delete: its package as the index
+/// spells it, the version, and when it was published.
+pub struct Deletable {
+    pub name: str;
+    pub version: str;
+    pub at: i64;
+}
+
+/// When `k` `version` was published through the API; 0 when it was not
+/// (written with `nabi publish --index-dir`, or before records were kept).
+pub fn published_at(db: Db, k: str, version: str) -> i64 {
+    for r in db.releases {
+        if r.name == k && r.version == version {
+            if let a: Actor = r.published_by { return a.at; }
+        }
+    }
+    0i64
+}
+
+/// The versions of the packages account `id` owns that are within
+/// DELETE_SECS of their publish and still in the index, newest first.
+/// Dependents are checked on delete, not here.
+pub fn deletable(cfg: Cfg, db: Db, id: i64, now: i64) -> List<Deletable> {
+    let out: List<Deletable> = List::new();
+    let all = try index::names(cfg.index, false) catch _ { return out; };
+    for n in all {
+        let k = index::key(n);
+        if !(owners_of(db, k) ?? List::new()).contains(id) { continue; }
+        for (v, _) in try index::releases(cfg.index, false, n) catch _ { List::new() } {
+            let at = published_at(db, k, v);
+            if at > 0i64 && now - at < DELETE_SECS && removal_of(db, k, v) is none { out.push(Deletable { name: n, version: v, at: at }); }
+        }
+    }
+    out.sort_by(|a: Deletable, b: Deletable| b.at.cmp(a.at));
+    out
+}
+
+fn yank_instead(name: str, version: str) -> str { f"yank it instead (`nabi yank {name}@{version}`): projects that pinned it keep building, new ones skip it" }
+
+/// Why `name` `version`, published at `at` (0: not through the API),
+/// may no longer be deleted at `now`; none while it may.
+pub fn too_late(name: str, version: str, at: i64, now: i64) -> str | none {
+    if at <= 0i64 { return f"{name} {version} was not published through this registry's API, so there is no publish time to go by; {yank_instead(name, version)}"; }
+    if now - at >= DELETE_SECS { return f"{name} {version} was published more than {DELETE_SECS / 3600i64} hours ago; {yank_instead(name, version)}"; }
+    none
+}
+
+/// `name` as the index spells it; none when it has no such package.
+fn index_name(cfg: Cfg, name: str) throws (ApiError) -> str | none {
+    for n in try index::names(cfg.index, false) {
+        if index::key(n) == index::key(name) { return n; }
+    }
+    none
+}
+
+/// Delete `name` `version` for account `a` (`admin`: one of the
+/// registry admins, whose token has the admin scope). `who` is the
+/// index commit's author, `only` the packages a token is limited to.
+pub fn delete_version(cfg: Cfg, a: Account, admin: bool, name: str, version: str, who: str, only: List<str>) throws (ApiError) {
+    if !packages::is_name(name) || !index::is_version(version) { throw index::err(404, f"`{name} {version}` is not a package name and version; write them as the index has them, such as `json 0.2.0`"); }
+    let k = index::key(name);
+    let found = try index_name(cfg, name);
+    let n = found ?? { throw index::err(404, f"package `{name}` is not in the index"); };
+    let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
+    if removal_of(db, k, version) is pkg::server::store::Removal { throw index::err(451, f"{n} {version} was taken down by the registry; the admins decide what happens to it"); }
+    let limited = !only.is_empty() && !only.contains(k);
+    if limited || !may_publish(owners_of(db, k), true, a.id, admin) { throw index::err(403, f"`{n}` belongs to other accounts; only its owners delete its versions"); }
+    if let why: str = too_late(n, version, published_at(db, k, version), now_secs()) { throw index::err(409, why); }
+    using ix = INDEX.lock() {
+        try index::sync(cfg.index);
+        let tree = try index::tree_at(cfg.index, false, n, version);
+        if tree is none { throw index::err(404, f"{n} {version} is not in the index"); }
+        let users = try index::dependents(cfg.index, n);
+        if !users.is_empty() {
+            throw index::err(409, f"{n} {version} cannot be deleted: {users.join(", ")} {if users.len() == 1 { "depends" } else { "depend" }} on {n}; {yank_instead(n, version)}");
+        }
+        try index::delete(cfg.index, n, version, who);
+        using g = LOCK.lock() {
+            let d = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
+            record(ref d, Event { package: k, at: now_secs(), by: a.id, who: a.login, action: "delete", detail: version });
+            try save_db(cfg, d) catch e { eprintln(f"data: {e}"); };
+        }
+    }
+    // The version's files go with it; the record of its publish stays,
+    // so the new-name cap still counts it.
+    for f in [meta::archive_file(cfg.data, k, version), meta::readme_file(cfg.data, k, version)] {
+        if fs::exists(f) { try fs::remove_file(f) catch e { eprintln(f"delete: {f}: {e}"); }; }
+    }
+    let dd = docs::dir_of(cfg.data + "/docs", k, version);
+    if fs::exists(dd) { try fs::remove_dir_all(dd) catch e { eprintln(f"delete: {dd}: {e}"); }; }
+    STALE.store(1);
+    audit(cfg, Audit { at: now_secs(), by: a.id, action: "delete", target: f"{n} {version}" });
+    mail::notify(cfg, "yank", k, n, f"{n} {version} deleted", f"{a.login} deleted {n} {version}. Its number is not used again: publish a new version for a fix.", List::new());
+}
+
+#[test]
+fn deletion_window() {
+    let db = Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: List::new() };
+    db.releases = [meta::Release { name: "geom", version: "0.1.0", meta: meta::empty(), published_by: Actor { id: 5i64, login: "a", at: 100i64 }, yanked_by: none, unyanked_by: none }, meta::Release { name: "geom", version: "0.0.1", meta: meta::empty(), published_by: none, yanked_by: none, unyanked_by: none }];
+    assert(published_at(db, "geom", "0.1.0") == 100i64 && published_at(db, "geom", "0.0.1") == 0i64 && published_at(db, "json", "0.1.0") == 0i64, "publish times");
+    assert(DELETE_SECS == 72i64 * 3600i64, "72 hours");
+    assert(too_late("geom", "0.1.0", 100i64, 100i64 + DELETE_SECS - 1i64) is none, "within the window");
+    assert((too_late("geom", "0.1.0", 100i64, 100i64 + DELETE_SECS) ?? "").contains("more than 72 hours ago; yank it instead (`nabi yank geom@0.1.0`)"), "past it");
+    assert((too_late("geom", "0.1.0", 0i64, 5i64) ?? "").contains("not published through this registry's API"), "no record");
+}

@@ -7,6 +7,7 @@ use pkg::layout;
 use pkg::meta;
 use pkg::secret;
 use pkg::server::admin::{Audit, audit};
+use pkg::server::delete;
 use pkg::server::limit;
 use pkg::server::mail;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, may_manage, remove_owner, remove_trusted};
@@ -90,9 +91,52 @@ fn me_page(cfg: Cfg, site: Site, path: str, db: Db, s: Session, fresh: str) -> R
     b.push_str(f"<form method=\"post\" action=\"/me/tokens\" class=\"token-form\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"scopes\" value=\"1\"><label>Name <input name=\"name\" maxlength=\"64\" required></label> <label>Packages <input name=\"packages\" maxlength=\"512\" placeholder=\"all yours\" aria-describedby=\"token-help\"></label> <label>Days <input name=\"days\" type=\"number\" min=\"1\" max=\"{TOKEN_DAYS_MAX}\" value=\"{TOKEN_DAYS}\" required></label> <fieldset class=\"scopes\"><legend>It may</legend>{boxes.to_str()}</fieldset> <button class=\"btn btn-sm\" type=\"submit\">Create token</button></form>\n<p class=\"t-small muted\" id=\"token-help\">Packages: names separated by commas, to let the token act only on those; empty, it acts for every package you own. Give a token only what its job needs: a release workflow publishes new versions and yanks; tick a new package or owners only for the token that does that. A token works for the number of days given, at most {TOKEN_DAYS_MAX}.</p>\n");
     trusted_section(b, csrf, trusted);
     owners_section(b, csrf, db, a.id, admin);
+    versions_section(cfg, b, csrf, db, a.id);
     activity_section(b, db, a.id);
     if admin { moderation_section(b, db); }
     page(site, path, "Account", b.to_str(), 200)
+}
+
+/// The versions of the account's packages it may still delete
+/// (delete::DELETE_SECS after their publish), each with Delete, which
+/// asks again before it deletes.
+fn versions_section(cfg: Cfg, b: StrBuf, csrf: str, db: Db, id: i64) {
+    let list = delete::deletable(cfg, db, id, now_secs());
+    let hours = delete::DELETE_SECS / 3600i64;
+    b.push_str(f"<h2 class=\"t-h3\" id=\"versions\">Recent versions</h2>\n<p>For {hours} hours after its publish, an owner may delete a version that no other package depends on: its line leaves the index and its number is never used again. After that, or once another package depends on it, yank it instead: projects that pinned it keep building, new ones skip it.</p>\n");
+    if list.is_empty() {
+        b.push_str(f"<p>No version of your packages was published in the last {hours} hours.</p>\n");
+        return;
+    }
+    b.push_str("<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">Package</th><th scope=\"col\">Version</th><th scope=\"col\">Published</th><th scope=\"col\">Deletable until</th><th scope=\"col\"><span class=\"sr-only\">Delete</span></th></tr></thead>\n<tbody>\n");
+    for v in list {
+        b.push_str(f"<tr><td>{esc(v.name)}</td><td class=\"mono\">{esc(v.version)}</td><td>{stamp(v.at)}</td><td>{stamp(v.at + delete::DELETE_SECS)}</td><td>{delete_form(csrf, v.name, v.version, false, "Delete")}</td></tr>\n");
+    }
+    b.push_str("</tbody>\n</table></div>\n");
+}
+
+/// The form that asks to delete `name` `version`; `confirm`: the one
+/// that deletes.
+fn delete_form(csrf: str, name: str, version: str, confirm: bool, label: str) -> str {
+    let yes = if confirm { "<input type=\"hidden\" name=\"confirm\" value=\"yes\">" } else { "" };
+    f"<form method=\"post\" action=\"/me/versions/delete\"><input type=\"hidden\" name=\"csrf\" value=\"{esc(csrf)}\"><input type=\"hidden\" name=\"package\" value=\"{esc(name)}\"><input type=\"hidden\" name=\"version\" value=\"{esc(version)}\">{yes}<button class=\"{if confirm { "btn" } else { "btn-2" }} btn-sm\" type=\"submit\">{esc(label)}</button></form>"
+}
+
+/// The page that asks once more before `name` `version` is deleted.
+fn confirm_delete(site: Site, path: str, csrf: str, name: str, version: str) -> Resp {
+    let b = StrBuf::new();
+    b.push_str(f"<h1 class=\"t-h1\">Delete {esc(name)} {esc(version)}?</h1>\n");
+    b.push_str(f"<p class=\"t-lead\">Its line leaves the index, and its source archive, README and docs leave the registry. This cannot be undone, and {esc(version)} cannot be published again: a fix goes out as a new version.</p>\n");
+    b.push_str("<p>A project that already locked this version stops resolving it. To keep those building and only stop new ones, yank it instead.</p>\n");
+    b.push_str(f"<div class=\"actions\">{delete_form(csrf, name, version, true, f"Delete {name} {version}")} <a class=\"btn-2 btn-sm\" href=\"/me#versions\">Cancel</a></div>\n");
+    page(site, path, f"Delete {name} {version}?", b.to_str(), 200)
+}
+
+/// `yyyy-mm-dd hh:mm UTC` of a unix time.
+pub fn stamp(t: i64) -> str {
+    let p2 = |x: i64| if x < 10i64 { f"0{x}" } else { f"{x}" };
+    let s = t % 86400i64;
+    f"{date(t)} {p2(s / 3600i64)}:{p2((s / 60i64) % 60i64)} UTC"
 }
 
 /// The account's sessions, this one first, each with Log out, and Log
@@ -168,6 +212,7 @@ pub fn event_text(e: Event) -> str {
         "trusted-remove" => f"removed trusted publisher {d}",
         "token-create" => f"created token {d}",
         "token-revoke" => f"revoked token {d}",
+        "delete" => f"deleted {d}",
         _ => f"{e.action} {d}".trim(),
     }
 }
@@ -356,6 +401,13 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
             try remove_owner(cfg, a, admin, package, who, id) catch e { return message(site, r.path, e.status, "Owner not removed", e.msg); };
         }
         return redirect("/me", []);
+    }
+    if r.path == "/me/versions/delete" {
+        let package = (f.get("package") ?? "").trim();
+        let version = (f.get("version") ?? "").trim();
+        if (f.get("confirm") ?? "") != "yes" { return confirm_delete(site, r.path, s.csrf, package, version); }
+        try delete::delete_version(cfg, a, admin, package, version, f"{a.login} <{a.id}+{a.login}@users.noreply.github.com>", List::new()) catch e { return message(site, r.path, e.status, "Version not deleted", e.msg); };
+        return redirect("/me#versions", []);
     }
     if r.path == "/me/trusted" {
         let p = TrustedPublisher { package: (f.get("package") ?? "").trim(), repository: (f.get("repository") ?? "").trim(), workflow: (f.get("workflow") ?? "").trim(), environment: (f.get("environment") ?? "").trim() };
