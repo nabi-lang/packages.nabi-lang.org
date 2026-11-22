@@ -18,6 +18,9 @@ pub const EXCHANGES: i64 = 20i64;
 /// Reads that cost work, a minute per address: searches and package 404
 /// pages (both scan every name), and API reads (the data file, archives).
 pub const READS: i64 = 300i64;
+/// CSP violation reports logged a minute per address; the rest are
+/// dropped.
+pub const REPORTS: i64 = 30i64;
 
 struct Window {
     start: i64;

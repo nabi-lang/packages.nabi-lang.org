@@ -94,7 +94,12 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     if p.starts_with("/api/") { return api_route(cfg, r, client); }
     if p == http::REPORT_PATH {
         if r.method != "POST" { return Resp { status: 405, headers: ["Content-Type: text/plain; charset=utf-8", "Cache-Control: no-store"], body: "POST only\n", file: "" }; }
-        if let line: str = http::csp_report(r.body) { eprintln(line); }
+        // Anyone may send one: past REPORTS a minute an address's go
+        // unlogged, answered alike so a sender learns nothing. csp_report
+        // reads at most MAX_REPORT bytes and logs at most 400 characters.
+        if r.body.len() <= http::MAX_REPORT && limit::allow("csp:" + client, limit::REPORTS) {
+            if let line: str = http::csp_report(r.body) { eprintln(line); }
+        }
         return Resp { status: 204, headers: ["Cache-Control: no-store"], body: "", file: "" };
     }
     if p == http::SPECULATION_PATH && (r.method == "GET" || r.method == "HEAD") {

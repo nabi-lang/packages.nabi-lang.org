@@ -197,6 +197,19 @@ expect_body 'href="/login">Log in' "login button with a dead session"
 [ "$(header cache-control)" = "public, max-age=0, must-revalidate, s-maxage=86400" ] || fail "dead session cache: $(header cache-control)"
 ok "static files"
 
+# CSP reports: anyone may send them, so an address's past 30 a minute
+# are answered alike and not logged.
+report='{"csp-report":{"effective-directive":"script-src","blocked-uri":"https://csp-flood.test/x","document-uri":"https://packages.test/"}}'
+for _ in $(seq 35); do
+    req POST /_csp -H "Content-Type: application/csp-report" --data "$report"
+    expect_code 204 "csp report"
+done
+n=$(grep -c 'csp: script-src blocked https://csp-flood.test/x' "$T/server.log")
+[ "$n" = 30 ] || fail "csp reports logged: $n, want 30"
+req GET /_csp
+expect_code 405 "csp report GET"
+ok "csp reports"
+
 login user
 expect_body "Publishing is not open yet" "non-admin page"
 expect_body 'come from your GitHub account' "profile note"
