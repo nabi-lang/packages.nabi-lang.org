@@ -26,8 +26,8 @@ pub fn cache_for(site: Site, path: str, f: str, query: str) -> str {
         let drawn = try fs::read_to_str(f + ".v") catch _ { "" };
         return if !v.is_empty() && v == drawn.trim() { IMMUTABLE } else { HTML_CACHE };
     }
-    // The kit's fonts: unversioned names, so checked like a page.
-    if path.starts_with("/fonts/") { return HTML_CACHE; }
+    // The kit's fonts change only under a new name (web::http::FONTS).
+    if path.starts_with("/fonts/") { return IMMUTABLE; }
     let want = layout::asset_version(site, path[1:]);
     if !want.is_empty() { return if v == want { IMMUTABLE } else { HTML_CACHE }; }
     HTML_CACHE
