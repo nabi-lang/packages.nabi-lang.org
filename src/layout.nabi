@@ -812,6 +812,13 @@ fn count_deps(v: Version, kind: str) -> usize {
     n
 }
 
+/// An SPDX expression for a narrow cell: `MIT OR Apache-2.0` as
+/// `MIT/Apache-2.0`, the expression itself in its title.
+fn license_short(l: str) -> str {
+    let s = l.replace(" OR ", "/");
+    if s == l { esc(l) } else { f"<span title=\"{esc(l)}\">{esc(s)}</span>" }
+}
+
 fn commit_link(v: Version) -> str {
     let tree = packages::tree_link(v.url, v.rev);
     if tree.is_empty() { f"<code title=\"{esc(v.rev)}\">{short(v.rev)}</code>" } else { f"<a href=\"{esc(tree)}\" title=\"{esc(v.rev)}\"><code>{short(v.rev)}</code></a>" }
@@ -1301,13 +1308,14 @@ pub fn versions_page(site: Site, s: Package) -> str {
             if pb.is_empty() { none_yet } else if a.via is none { pb } else { f"<span class=\"via\" title=\"{esc(actor_text(a))}\">{pb}</span>" }
         } else { none_yet };
         let sz = if let n: i64 = v.meta.size { size(n) } else { "<span class=\"muted\">unknown</span>" };
-        let tc = if v.nabi_version.is_empty() { "<span class=\"muted\">any</span>" } else { esc(packages::admits(v.nabi_version)) };
-        let dl = if counted { f"<td title=\"{count_text(v.recent)} in the last 90 days\">{count_text(v.downloads)}</td>" } else { "" };
-        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{if v.license.is_empty() { "<span class=\"muted\">none</span>" } else { esc(v.license) }}</td><td>{sz}</td>{dl}<td>{tc}</td><td>{docs_cell(site, s, v.version)}</td><td class=\"mono\">{commit_link(v)}</td><td class=\"mono\"><code title=\"{esc(v.tree)}\">{short(v.tree)}</code></td></tr>");
+        let tc = if v.nabi_version.is_empty() { "<span class=\"muted\">any</span>" } else { f"<span title=\"{esc(packages::admits(v.nabi_version))}\">{esc(v.nabi_version)}+</span>" };
+        let lic = if v.license.is_empty() { "<span class=\"muted\">none</span>" } else { license_short(v.license) };
+        let dl = if counted { f"<td class=\"num\" title=\"{count_text(v.recent)} in the last 90 days\">{count_text(v.downloads)}</td>" } else { "" };
+        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td class=\"ver\"><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{lic}</td><td class=\"num\">{sz}</td>{dl}<td>{tc}</td><td>{docs_cell(site, s, v.version)}</td><td class=\"mono\">{commit_link(v)}</td></tr>");
     }
     let body = f"<h2 class=\"t-h3\">{plural(s.versions.len(), "version", "versions")}</h2>
-<p class=\"t-ui muted\">Newest first. Published is when the version's line was added to the index (UTC); size is the package as <code class=\"ic\">nabi publish</code> packed it{if counted { "; downloads are of its source archive, all time (hover for the last 90 days)" } else { "" }}. A yanked version stays in the index for the projects that pinned it; new resolves skip it.</p>
-<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">Version</th><th scope=\"col\">Published</th><th scope=\"col\">By</th><th scope=\"col\">License</th><th scope=\"col\">Size</th>{if counted { "<th scope=\"col\">Downloads</th>" } else { "" }}<th scope=\"col\">Requires</th><th scope=\"col\">Docs</th><th scope=\"col\">Commit</th><th scope=\"col\">Tree hash</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>
+<details class=\"about t-ui\"><summary>Newest first, times in UTC. About these columns</summary><p class=\"muted\">Published is when the version's line was added to the index. Size is the package as <code class=\"ic\">nabi publish</code> packed it{if counted { "; downloads are of its source archive, all time (hover for the last 90 days)" } else { "" }}. Nabi is the oldest toolchain it builds with: <code class=\"ic\">0.1.0+</code> means 0.1.0 or a later 0.1.x. The commit's title holds its full hash; the version's page has its tree hash. A yanked version stays in the index for the projects that pinned it; new resolves skip it.</p></details>
+<div class=\"table-wrap\"><table class=\"tbl vtbl\"><thead><tr><th scope=\"col\">Version</th><th scope=\"col\">Published</th><th scope=\"col\">By</th><th scope=\"col\">License</th><th scope=\"col\" class=\"num\">Size</th>{if counted { "<th scope=\"col\" class=\"num\">Downloads</th>" } else { "" }}<th scope=\"col\">Nabi</th><th scope=\"col\">Docs</th><th scope=\"col\">Commit</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>
 ";
     package_frame(site, s, "versions", body)
 }

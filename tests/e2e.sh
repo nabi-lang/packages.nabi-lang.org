@@ -910,8 +910,8 @@ for _ in $(seq 50); do
     sleep 0.2
 done
 expect_body '<td class="by"><span class="via" title="acme via GitHub Actions (acme/geom, publish.yml)"><a class="who" href="https://github.com/acme"><img class="av" src="https://avatars.githubusercontent.com/u/4242?s=32&v=4" width="16" height="16" alt="" loading="lazy" decoding="async"><span>acme</span></a></span></td>' "trusted publisher on the versions page"
-expect_body '<td>4.0 KiB</td><td title="[0-9,]* in the last 90 days">[0-9,]*</td><td>nabi 0.2.0 or a later 0.2.x</td>' "size, downloads and nabi_version on the versions page"
-expect_body '<th scope="col">Downloads</th>' "downloads column"
+expect_body '<td class="num">4.0 KiB</td><td class="num" title="[0-9,]* in the last 90 days">[0-9,]*</td><td><span title="nabi 0.2.0 or a later 0.2.x">0.2.0+</span></td>' "size, downloads and nabi_version on the versions page"
+expect_body '<th scope="col" class="num">Downloads</th>' "downloads column"
 req GET /packages/geom/0.0.9
 expect_body '<dt>Published</dt><dd><time datetime="[0-9T:Z-]*">[0-9-]* [0-9:]* UTC</time> by <a class="who" href="https://github.com/acme"><img class="av" src="https://avatars.githubusercontent.com/u/4242?s=32&v=4" width="16" height="16" alt="" loading="lazy" decoding="async"><span>acme</span></a> via GitHub Actions (<a href="https://github.com/acme/geom">acme/geom</a>, <a href="https://github.com/acme/geom/actions/runs/777"' "trusted publisher on the version page"
 req GET /packages/geom

@@ -44,6 +44,13 @@ button{font:inherit}
 .people{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px;font-size:14px;line-height:24px}
 .people li{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
 .tbl .by,.tbl time{white-space:nowrap}
+.vtbl td,.vtbl th{white-space:nowrap}
+.vtbl td.num,.vtbl th.num{text-align:right;font-variant-numeric:tabular-nums}
+.vtbl .ver .tag{margin-left:6px}
+.vtbl .by .who{max-width:160px}
+.about{margin:0 0 12px;color:var(--ink-3)}
+.about summary{cursor:pointer}
+.about p{margin:8px 0 0}
 .profile{display:flex;align-items:center;gap:20px}
 .profile p{margin:0}
 
