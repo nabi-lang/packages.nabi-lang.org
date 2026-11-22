@@ -209,7 +209,7 @@ pub fn page_desc(site: Site, out: str, title: str, about: str, body: str, img: s
 <div class=\"frame in\">
 <a class=\"brand\" href=\"/\">{web::chrome::wordmark("Nabi")}<span class=\"sl\" aria-hidden=\"true\">/</span><span class=\"site\">packages</span></a>
 {search_box()}
-<nav id=\"nav\" class=\"nav\" aria-label=\"Registry\"><a href=\"/packages\"{browse}>Browse</a><a href=\"/publishing\"{publish}>Publishing</a><a href=\"{esc(site.docs)}/latest\">Docs</a></nav>
+<nav id=\"nav\" class=\"nav\" aria-label=\"Registry\"><a href=\"/packages\"{browse}>Browse</a><a href=\"/publishing\"{publish}>Publishing</a><a href=\"{esc(site.docs)}/latest\" title=\"The guide, the language reference and the standard library, on docs.nabi-lang.org\">Nabi docs</a></nav>
 {chrome::theme_button(false)}
 {LOGIN_BUTTON}
 <button class=\"ib menu\" type=\"button\" aria-label=\"Menu\" aria-expanded=\"false\" aria-controls=\"nav\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M4 7h16M4 12h16M4 17h16\"/></svg></button>
