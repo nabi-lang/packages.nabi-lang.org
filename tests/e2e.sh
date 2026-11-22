@@ -703,8 +703,8 @@ expect_code 200 "trusted yank"
 req POST /api/v1/yank "${auth[@]}" --data-binary 'Yank { name: "geom", version: "0.0.9", undo: true }'
 expect_code 200 "trusted unyank"
 req GET /api/v1/packages/geom
-expect_body 'version: "0.0.9", yanked: false, yank_message: none, removed: none, deps: \[\], meta: { description: "Shapes" }, has_readme: false, archive: Archive { sha256: "[0-9a-f]*", size: [0-9]*, url: "https://packages.test/api/v1/packages/geom/0.0.9/download" }, downloads: 0, recent_downloads: 0, published_by: Actor { id: 0, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom", workflow: "publish.yml", ref: "refs/tags/v1", run_id: "777", run_attempt: "1", owner_id: 4242 } }' "trusted publisher recorded"
-expect_body 'yanked_by: Actor { id: 0, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom"' "trusted yank recorded"
+expect_body 'version: "0.0.9", yanked: false, yank_message: none, removed: none, deps: \[\], meta: { description: "Shapes" }, has_readme: false, archive: Archive { sha256: "[0-9a-f]*", size: [0-9]*, url: "https://packages.test/api/v1/packages/geom/0.0.9/download" }, downloads: 0, recent_downloads: 0, published_by: Actor { id: 4242, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom", workflow: "publish.yml", ref: "refs/tags/v1", run_id: "777", run_attempt: "1", owner_id: 4242 } }' "trusted publisher recorded"
+expect_body 'yanked_by: Actor { id: 4242, login: "acme", at: [0-9]*, via: Via { repository: "acme/geom"' "trusted yank recorded"
 
 # A version a maintainer wrote with `nabi publish --index-dir` has no metadata:
 # publishing it again from the same tree fills it in.
@@ -952,6 +952,7 @@ expect_code 200 "publish from the organization"
 [ "$(git -C "$T/remote.git" show HEAD:un/it/units | sent)" = "${uline% \}}, official: true }" ] || fail "official line: $(git -C "$T/remote.git" show HEAD:un/it/units)"
 req GET /api/v1/packages/units
 expect_body 'unyanked_by: none, official: true }\], official: true, downloads: 0, recent_downloads: 0 }' "official in the api"
+expect_body 'published_by: Actor { id: 5151, login: "nabi-lang"' "an official version is the organization's"
 sed -n '/name: "units",/,/^        Release {/p' "$T/data/db.nabion" | grep -q 'official: true' || fail "official release record"
 # An admin's publish is not the organization's.
 auth=("${aauth[@]}")
