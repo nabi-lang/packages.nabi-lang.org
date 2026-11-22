@@ -1593,6 +1593,105 @@ req GET /api/v1/me -H "Authorization: Bearer $mtok"
 expect_code 200 "token after a second start"
 ok "migration from db.nabion"
 
+# Chinese: Simplified at /zh-hans/.., Traditional (Taiwan) at
+# /zh-hant/.., as the Korean pages are: chrome in the language, every
+# language in the menu and the hreflang links, the sitemap and
+# robots.txt, login back to the account page in the same language. Last,
+# on a fresh server: the logins before would pass the login limit.
+for zh in hans hant; do
+    dir="zh-$zh"
+    if [ "$zh" = hans ]; then
+        tag=zh-Hans; home="Nabi 包"; browse="浏览"; install="安装"; versions="版本"; by="发布者"
+        nomatch="没有名为 nope 的包"; lost="找不到页面"; guide="使用和发布包"; account="账户"; sessions="会话"
+        badlife="令牌有效期无效"; noowner="未能添加所有者"; login='<span class="wide">使用 GitHub </span>登录'; menu="alice 的账户菜单"
+        search='个包与 <q>geom</q> 匹配'
+    else
+        tag=zh-Hant; home="Nabi 套件"; browse="瀏覽"; install="安裝"; versions="版本"; by="發布者"
+        nomatch="沒有名為 nope 的套件"; lost="找不到頁面"; guide="使用與發布套件"; account="帳戶"; sessions="工作階段"
+        badlife="權杖有效期無效"; noowner="無法新增擁有者"; login='<span class="wide">使用 GitHub </span>登入'; menu="alice 的帳戶選單"
+        search='個套件符合 <q>geom</q>'
+    fi
+    req GET "/$dir"
+    expect_code 200 "$dir home"
+    expect_body "<html lang=\"$tag\" class=\"nb lt\">" "$dir lang"
+    expect_body "<h1 class=\"t-h1\">$home</h1>" "$dir home title"
+    expect_body "<a href=\"/$dir/packages\">$browse</a>" "$dir nav"
+    expect_body "<a href=\"https://nabi-lang.org/$dir\" title=\"nabi-lang.org\">" "$dir home link"
+    expect_body "<meta property=\"og:locale\" content=\"zh_$( [ $zh = hans ] && echo CN || echo TW )\">" "$dir og:locale"
+    for l in en ko zh-Hans zh-Hant; do
+        grep -q "<link rel=\"alternate\" hreflang=\"$l\" href=" "$T/b" || fail "$dir hreflang $l"
+    done
+    expect_body '<link rel="alternate" hreflang="x-default" href="https://packages.nabi-lang.org/">' "$dir hreflang x-default"
+    [ "$(grep -o '<li><a href="[^"]*" hreflang=' "$T/b" | wc -l | tr -d ' ')" = 3 ] || fail "$dir language menu: three other languages"
+    expect_body "<span aria-current=\"true\" lang=\"$tag\">" "$dir language menu marks the page"
+    expect_body "href=\"/$dir/login\">$login</a>" "$dir login button"
+    expect_body "<footer class=\"foot\" lang=\"$tag\">" "$dir footer"
+    req GET /
+    expect_body "<a href=\"/$dir\" hreflang=\"$tag\" lang=\"$tag\">" "language menu to $dir"
+    req GET "/$dir/packages/geom"
+    expect_code 200 "$dir package page"
+    expect_body "<h2 class=\"t-label\">$install</h2>" "$dir install label"
+    expect_body "<a href=\"/$dir/packages/geom/versions\">$versions<span class=\"ct\">" "$dir tab"
+    expect_body '<article class="prose md readme" lang="en">' "$dir readme as written"
+    expect_body "action=\"/$dir/packages\"" "$dir search box"
+    expect_body "<link rel=\"canonical\" href=\"https://packages.nabi-lang.org/$dir/packages/geom\">" "$dir canonical"
+    req GET "/$dir/packages/geom/versions"
+    expect_body "<th scope=\"col\">$by</th>" "$dir versions table"
+    req GET "/$dir/packages?q=geom"
+    expect_code 200 "$dir search"
+    expect_body "$search" "$dir search note"
+    expect_body '<a href="/packages?q=geom" hreflang="en" lang="en">' "$dir language menu keeps the search"
+    req GET "/$dir/packages/nope"
+    expect_code 404 "$dir missing package"
+    expect_body "$nomatch" "$dir missing package body"
+    req GET "/$dir/nope"
+    expect_code 404 "$dir 404"
+    expect_body "$lost" "$dir 404 body"
+    for page in publishing api policy categories keywords advisories; do
+        req GET "/$dir/$page"
+        expect_code 200 "$dir $page"
+        expect_body "<html lang=\"$tag\"" "$dir $page lang"
+    done
+    req GET "/$dir/publishing"
+    expect_body "<h1 class=\"t-h1\">$guide</h1>" "$dir guide"
+    req GET "/$dir/privacy"
+    expect_code 301 "$dir privacy"
+    [ "$(header location)" = "https://nabi-lang.org/$dir/privacy" ] || fail "$dir privacy location: $(header location)"
+    grep -Eq "<loc>https://packages.nabi-lang.org/$dir/packages/geom</loc><lastmod>" "$T/site/public/sitemap.xml" || fail "$dir page in the sitemap"
+    grep -qx "Disallow: /$dir/me" "$T/site/public/robots.txt" || fail "$dir account pages kept out of robots"
+    req GET "/$dir/login"
+    expect_code 303 "$dir login"
+    state=$(cookie_of __Host-pkg_state)
+    curl -s -o /dev/null "$(header location)&as=admin"
+    req GET "/auth/github/callback?code=admin&state=$state" -H "Cookie: __Host-pkg_state=$state"
+    expect_code 303 "$dir callback"
+    [ "$(header location)" = "/$dir/me" ] || fail "$dir login location: $(header location)"
+    zh_sess=$(cookie_of __Host-pkg_session)
+    req GET "/$dir/me" -H "Cookie: __Host-pkg_session=$zh_sess"
+    expect_code 200 "$dir account page"
+    expect_body "<h1 class=\"t-h1\">$account</h1>" "$dir account title"
+    expect_body "action=\"/$dir/me/tokens\"" "$dir token form"
+    expect_body "<h2 class=\"t-h3\" id=\"sessions\">$sessions</h2>" "$dir sessions"
+    zh_csrf=$(sed -n 's/.*name="csrf" value="\([0-9a-f]*\)".*/\1/p' "$T/b" | head -1)
+    req POST "/$dir/me/tokens" -H "Cookie: __Host-pkg_session=$zh_sess" --data "csrf=$zh_csrf&name=zh&days=400"
+    expect_code 400 "$dir form refusal"
+    expect_body "$badlife" "$dir refusal title"
+    req POST "/$dir/me/owners" -H "Cookie: __Host-pkg_session=$zh_sess" --data "csrf=$zh_csrf&package=geom&login=a/b/c"
+    expect_code 400 "$dir refusal of an api message"
+    expect_body "$noowner" "$dir title over the api message"
+    expect_body "<a href=\"/$dir\">" "$dir way back"
+    req GET "/$dir" -H "Cookie: __Host-pkg_session=$zh_sess"
+    expect_body "aria-label=\"$menu\"" "$dir account menu"
+    expect_body "<a href=\"/$dir/me\">$account</a><form method=\"post\" action=\"/$dir/logout\">" "$dir account menu links"
+    req POST "/$dir/logout" -H "Cookie: __Host-pkg_session=$zh_sess" --data "csrf=$zh_csrf"
+    expect_code 303 "$dir logout"
+    [ "$(header location)" = "/$dir" ] || fail "$dir logout location: $(header location)"
+    req GET "/$dir/me"
+    expect_code 303 "$dir account page logged out"
+    [ "$(header location)" = "/$dir/login" ] || fail "$dir account page login location: $(header location)"
+done
+ok "chinese pages"
+
 grep -q "code=" "$T/server.log" && fail "OAuth code in the log"
 grep -q "test-secret\|gho_" "$T/server.log" && fail "secret in the log"
 grep -q "pkt_\|eyJ" "$T/server.log" && fail "trusted token or OIDC token in the log"
