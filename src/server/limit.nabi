@@ -5,7 +5,7 @@ use pkg::index;
 use pkg::index::ApiError;
 use pkg::server::Cfg;
 use pkg::server::store::now_secs;
-use std::net::TcpStream;
+use std::net::{IpAddr, Ipv6Addr, TcpStream};
 use web::http::Request;
 
 /// Logins (the OAuth redirect and its callback) a minute per address.
@@ -55,20 +55,40 @@ pub fn check(key: str, per_min: i64) throws (ApiError) {
     if !allow(key, per_min) { throw index::err(429, "too many requests; wait a minute and try again"); }
 }
 
-/// The client's address. Without PACKAGES_CLIENT_HEADER the TCP peer, so
-/// a client cannot forge it; with it, that header as the trusted proxy
-/// set it (the last entry of a list: a client may prepend, not append).
+/// The client's address as a rate limit key (client_key). Without
+/// PACKAGES_CLIENT_HEADER the TCP peer, so a client cannot forge it;
+/// with it, that header as the trusted proxy set it (the last entry of a
+/// list: a client may prepend, not append).
 pub fn client_of(cfg: Cfg, s: TcpStream, r: Request) -> str {
     if !cfg.client_header.is_empty() {
         let v = r.header(cfg.client_header);
         if !v.is_empty() {
-            if let k: usize = v.rfind(",") { return v[k + 1:].trim(); }
-            return v.trim();
+            if let k: usize = v.rfind(",") { return client_key(v[k + 1:].trim()); }
+            return client_key(v.trim());
         }
     }
     let a = try s.peer_addr() catch _ { return "?"; };
-    let t = f"{a}";
-    if let k: usize = t.rfind(":") { t[:k] } else { t }
+    client_key(f"{a.ip()}")
+}
+
+/// The key of address `addr`: an IPv4 address whole, an IPv6 one by its
+/// /64 (`2001:db8:0:0::/64`), since one subscriber gets a /64 and can
+/// pick any address in it; IPv4-mapped IPv6 as the IPv4 address. Anything
+/// else as it is.
+pub fn client_key(addr: str) -> str {
+    let t = addr.strip_prefix("[") ?? addr;
+    t = t.strip_suffix("]") ?? t;
+    let ip = try t.parse::<IpAddr>() catch _ { return addr; };
+    match ip {
+        IpAddr::V4(a) => f"{a}",
+        IpAddr::V6(a) => {
+            let g = a.segments();
+            if g[0] == 0u16 && g[1] == 0u16 && g[2] == 0u16 && g[3] == 0u16 && g[4] == 0u16 && g[5] == 65535u16 {
+                return f"{g[6] >> 8u16}.{g[6] & 255u16}.{g[7] >> 8u16}.{g[7] & 255u16}";
+            }
+            f"{Ipv6Addr::new(g[0], g[1], g[2], g[3], 0u16, 0u16, 0u16, 0u16)}/64"
+        },
+    }
 }
 
 #[test]
@@ -80,4 +100,14 @@ fn windows() {
     let s = 0;
     try check(key, 3i64) catch e { s = e.status; };
     assert(s == 429, "429");
+}
+
+#[test]
+fn client_keys() {
+    let a = client_key("2001:db8::1");
+    assert(a == "2001:db8::/64" && client_key("2001:db8:0:0:ffff::2") == a && client_key("2001:0DB8:0000:0000:1:2:3:4") == a && client_key("[2001:db8::5]") == a, a);
+    assert(client_key("2001:db8:0:1::1") == "2001:db8:0:1::/64", "another /64");
+    assert(client_key("203.0.113.7") == "203.0.113.7" && client_key("203.0.113.8") == "203.0.113.8", "IPv4 whole");
+    assert(client_key("::ffff:cb00:7107") == "203.0.113.7", "IPv4-mapped");
+    assert(client_key("?") == "?" && client_key("unknown") == "unknown", "not an address");
 }
