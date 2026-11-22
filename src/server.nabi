@@ -347,8 +347,24 @@ pub fn page(site: Site, path: str, title: str, body: str, status: i32) -> Resp {
     html(status, layout::page(site, path[1:], title, f"<div class=\"frame acct\">\n{body}\n</div>"))
 }
 
-pub fn message(site: Site, path: str, status: i32, title: str, text: str) -> Resp {
-    page(site, path, title, f"<h1 class=\"t-h1\">{esc(title)}</h1>\n<p class=\"t-lead\">{esc(text)}</p>\n<p><a href=\"/\">Back to the package registry</a></p>", status)
+/// Whether request path `path` is a Korean page (`/ko`, `/ko/..`).
+pub fn ko_path(path: str) -> bool { path == "/ko" || path.starts_with("/ko/") }
+
+/// A page that says what happened and what to do: `title` and `text`,
+/// or on a Korean page `ko_title` and `ko_text` when given. `detail` is
+/// an API message, shown as written (in English) under the Korean text.
+pub fn message(site: Site, path: str, status: i32, title: str, text: str, ko_title: str = "", ko_text: str = "", detail: str = "") -> Resp {
+    let ko = ko_path(path) && !ko_title.is_empty();
+    let (t, x) = if ko { (ko_title, if ko_text.is_empty() { text } else { ko_text }) } else { (title, text) };
+    let more = if detail.is_empty() || detail == x { "" } else { f"<p lang=\"en\">{esc(detail)}</p>\n" };
+    let back = if ko_path(path) { "<p><a href=\"/ko\">패키지 레지스트리로 돌아가기</a></p>" } else { "<p><a href=\"/\">Back to the package registry</a></p>" };
+    page(site, path, t, f"<h1 class=\"t-h1\">{esc(t)}</h1>\n<p class=\"t-lead\">{esc(x)}</p>\n{more}{back}", status)
+}
+
+/// message for a refused form: on a Korean page the Korean title and
+/// `ko_text`, then the API's own message `msg`; in English `msg` alone.
+pub fn refusal(site: Site, path: str, status: i32, title: str, ko_title: str, msg: str, ko_text: str = "요청을 처리하지 못했습니다. 아래 내용을 확인한 뒤 다시 시도하십시오.") -> Resp {
+    if ko_path(path) { message(site, path, status, title, msg, ko_title, ko_text, msg) } else { message(site, path, status, title, msg) }
 }
 
 const HTML_TYPE: str = "Content-Type: text/html; charset=utf-8";
@@ -363,7 +379,7 @@ fn handle(s: TcpStream, cfg: Cfg, site: Site) {
     let client = pkg::server::limit::client_of(cfg, s, r);
     let resp = try route(cfg, site, r, client) catch e {
         eprintln(f"{r.method} {r.path}: {e}");
-        message(site, r.path, 500, "Server error", "Something went wrong.")
+        message(site, r.path, 500, "Server error", "Something went wrong on the registry's side. Try again in a moment; if it keeps failing, write to security@nabi-lang.org.", "서버 에러", "레지스트리 쪽에서 문제가 생겼습니다. 잠시 뒤 다시 시도하십시오. 계속 실패하면 security@nabi-lang.org로 알려 주십시오.")
     };
     if resp.headers.contains(HTML_TYPE) {
         if let v: Viewer = viewer(cfg, r) { resp = signed_in(site, r, resp, v); }
@@ -373,7 +389,7 @@ fn handle(s: TcpStream, cfg: Cfg, site: Site) {
         if let data: List<u8> = read_page(site, r.path, resp.file) {
             sent = respond(cfg, s, r, 200, resp.headers, data);
         } else {
-            resp = message(site, r.path, 503, "Try again", "The site is being rebuilt. Reload the page in a moment.");
+            resp = message(site, r.path, 503, "Try again", "The site is being rebuilt. Reload the page in a moment.", "다시 시도하십시오", "사이트를 다시 만드는 중입니다. 잠시 뒤 페이지를 새로 고치십시오.");
             resp.headers.push("Retry-After: 1");
             sent = respond(cfg, s, r, resp.status, resp.headers, resp.body.as_bytes().to_list());
         }

@@ -964,7 +964,12 @@ expect_body '<td class="num">4.0 KiB</td><td class="num" title="[0-9,]* in the l
 expect_body '<th scope="col" class="num">Downloads</th>' "downloads column"
 req GET /packages/geom/0.0.9
 expect_body '<dt>Published</dt><dd><time datetime="[0-9T:Z-]*">[0-9-]* [0-9:]* UTC</time> by <a class="who" href="https://github.com/acme"><img class="av" src="https://avatars.githubusercontent.com/u/4242?s=32&v=4" width="16" height="16" alt="" loading="lazy" decoding="async"><span>acme</span></a> via GitHub Actions (<a href="https://github.com/acme/geom">acme/geom</a>, <a href="https://github.com/acme/geom/actions/runs/777"' "trusted publisher on the version page"
-req GET /packages/geom
+# The refused push above asked for a rebuild from the reset checkout.
+for _ in $(seq 100); do
+    req GET /packages/geom
+    grep -q '<dt>Category</dt>' "$T/b" && break
+    sleep 0.1
+done
 expect_body '<dt>Category</dt><dd class="kws"><a href="/categories/mathematics">mathematics</a></dd>' "categories on the page"
 expect_body '<p>Shapes, <strong>fast</strong>.</p>' "published README rendered"
 req GET /packages/geom/dependencies
@@ -996,7 +1001,12 @@ expect_code 200 "badge"
 expect_body '<title>geom: v[0-9.]* on packages.nabi-lang.org</title>' "badge title"
 req GET /packages/geom
 expect_body '<dt>Badge</dt><dd class="badge"><img src="/packages/geom/badge.svg"' "badge on the page"
-req GET /categories
+# A rebuild may be under way: ask again until the category is there.
+for _ in $(seq 100); do
+    req GET /categories
+    grep -q 'href="/categories/mathematics"' "$T/b" && break
+    sleep 0.1
+done
 expect_code 200 "categories"
 expect_body '<a href="/categories/mathematics">Mathematics</a><span class="ct">' "category count"
 req GET /categories/mathematics
@@ -1072,6 +1082,89 @@ expect_code 404 "unsigned image address"
 req GET /packages/pics
 header content-security-policy | grep -q "img-src 'self' data: https://avatars.githubusercontent.com;" || fail "page csp with the proxy: $(header content-security-policy)"
 ok "image proxy"
+
+# Korean: every page at /ko/.., its chrome in Korean, the package's own
+# text as written; a language menu to the same page, hreflang links,
+# the sitemap; login and the account pages under /ko.
+req GET /ko
+expect_code 200 "korean home"
+expect_body '<html lang="ko" class="nb lt">' "korean lang"
+expect_body '<h1 class="t-h1">Nabi 패키지</h1>' "korean home title"
+expect_body '<a href="/ko/packages">둘러보기</a>' "korean nav"
+expect_body '<a href="https://nabi-lang.org/ko" title="nabi-lang.org">홈</a>' "home link"
+expect_body '<details class="lang-menu"><summary class="ib" aria-label="언어"' "korean language menu"
+expect_body '<a href="/" hreflang="en" lang="en">' "language menu to english"
+expect_body '<link rel="alternate" hreflang="en" href="https://packages.nabi-lang.org/">' "hreflang en"
+expect_body '<link rel="alternate" hreflang="ko" href="https://packages.nabi-lang.org/ko">' "hreflang ko"
+expect_body '<link rel="alternate" hreflang="x-default" href="https://packages.nabi-lang.org/">' "hreflang x-default"
+expect_body 'href="/ko/login"><span class="wide">GitHub로 </span>로그인</a>' "korean login button"
+expect_body '<footer class="foot" lang="ko">' "korean footer"
+req GET /
+expect_body '<a href="/ko" hreflang="ko" lang="ko">' "language menu to korean"
+expect_body '<a href="https://nabi-lang.org" title="nabi-lang.org">Home</a>' "english home link"
+req GET /ko/packages/geom
+expect_code 200 "korean package page"
+expect_body '<h2 class="t-label">설치</h2>' "korean install label"
+expect_body '<a href="/ko/packages/geom/versions">버전<span class="ct">' "korean tab"
+expect_body '<article class="prose md readme" lang="en">' "readme as written"
+expect_body 'action="/ko/packages"' "korean search box"
+expect_body '<link rel="canonical" href="https://packages.nabi-lang.org/ko/packages/geom">' "korean canonical"
+expect_body '<a href="/packages/geom" hreflang="en" lang="en">' "same page in english"
+req GET /ko/packages/geom/versions
+expect_code 200 "korean versions tab"
+expect_body '<th scope="col">공개한 사람</th>' "korean versions table"
+req GET "/ko/packages?q=geom"
+expect_code 200 "korean search"
+expect_body '<q>geom</q>에 맞는 패키지' "korean search note"
+expect_body '<a href="/packages?q=geom" hreflang="en" lang="en">' "language menu keeps the search"
+req GET /ko/packages/nope
+expect_code 404 "korean missing package"
+expect_body 'nope(이)라는 패키지가 없습니다' "korean missing package body"
+req GET /ko/nope
+expect_code 404 "korean 404"
+expect_body '페이지를 찾을 수 없습니다' "korean 404 body"
+for page in publishing api policy categories keywords; do
+    req GET "/ko/$page"
+    expect_code 200 "korean $page"
+    expect_body '<html lang="ko"' "korean $page lang"
+done
+req GET /ko/publishing
+expect_body '<h1 class="t-h1">패키지 사용과 공개</h1>' "korean guide"
+grep -Eq '<loc>https://packages.nabi-lang.org/ko/packages/geom</loc><lastmod>' "$T/site/public/sitemap.xml" || fail "korean page in the sitemap"
+# Logging in from a Korean page comes back to the Korean account page.
+req GET /ko/login
+expect_code 303 "korean login"
+state=$(cookie_of __Host-pkg_state)
+curl -s -o /dev/null "$(header location)&as=admin"
+req GET "/auth/github/callback?code=admin&state=$state" -H "Cookie: __Host-pkg_state=$state"
+expect_code 303 "korean callback"
+[ "$(header location)" = "/ko/me" ] || fail "korean login location: $(header location)"
+ko_sess=$(cookie_of __Host-pkg_session)
+req GET /ko/me -H "Cookie: __Host-pkg_session=$ko_sess"
+expect_code 200 "korean account page"
+expect_body '<h1 class="t-h1">계정</h1>' "korean account title"
+expect_body 'action="/ko/me/tokens"' "korean token form"
+expect_body '<h2 class="t-h3" id="sessions">세션</h2>' "korean sessions"
+ko_csrf=$(sed -n 's/.*name="csrf" value="\([0-9a-f]*\)".*/\1/p' "$T/b" | head -1)
+req POST /ko/me/tokens -H "Cookie: __Host-pkg_session=$ko_sess" --data "csrf=$ko_csrf&name=ko&days=400"
+expect_code 400 "korean form refusal"
+expect_body '잘못된 토큰 기간' "korean refusal title"
+req POST /ko/me/owners -H "Cookie: __Host-pkg_session=$ko_sess" --data "csrf=$ko_csrf&package=geom&login=a/b/c"
+expect_code 400 "korean refusal of an api message"
+expect_body '소유자를 추가하지 못했습니다' "korean title over the api message"
+req POST /ko/me/notices -H "Cookie: __Host-pkg_session=$ko_sess" --data "csrf=$ko_csrf&notify=on&kind-yank=on&kind-owners=on&kind-trusted=on&kind-token=on"
+expect_code 303 "korean notices"
+[ "$(header location)" = "/ko/me#notices" ] || fail "korean notices location: $(header location)"
+req GET /ko -H "Cookie: __Host-pkg_session=$ko_sess"
+expect_body 'aria-label="alice 계정 메뉴"' "korean account menu"
+expect_body '<a href="/ko/me">계정</a><form method="post" action="/ko/logout">' "korean account menu links"
+req POST /ko/logout -H "Cookie: __Host-pkg_session=$ko_sess" --data "csrf=$ko_csrf"
+expect_code 303 "korean logout"
+[ "$(header location)" = "/ko" ] || fail "korean logout location: $(header location)"
+req GET /ko/me
+expect_code 303 "korean account page logged out"
+[ "$(header location)" = "/ko/login" ] || fail "korean account page login location: $(header location)"
+ok "korean pages"
 
 # Sources the server will not fetch, and commits a repository does not
 # hold on a branch or tag (as GitHub serves a fork's commits through the

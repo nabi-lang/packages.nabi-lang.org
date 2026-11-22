@@ -322,77 +322,84 @@ fn main() throws {
     for s in all {
         if s.latest.date > newest { newest = s.latest.date; }
     }
-    let guide = markdown::render(try fs::read_to_str("pages/publishing.md"), layout::md(|h| h));
-    guide.html = web::chrome::align_classes(guide.html);
-    files.insert("index.html", layout::page(site, "index.html", site.title, layout::landing(all)));
-    files.insert("publishing.html", layout::page_desc(site, "publishing.html", "Using and publishing packages", "How to add a package as a dependency, and how a version gets into the index.", layout::guide(guide)));
-    let api = markdown::render(try fs::read_to_str("pages/api.md"), layout::md(|h| h));
-    api.html = web::chrome::align_classes(api.html);
-    files.insert("api.html", layout::page_desc(site, "api.html", "Registry API", "The public API of the Nabi package registry: package info, READMEs, source archives and docs, in NABION or JSON.", layout::guide(api, "Registry API")));
-    files.insert("404.html", layout::page(site, "404.html", "Not found", layout::not_found()));
-    // The policies, in English at /<name> and Korean at /ko/<name>.
-    let policies: List<(str, str, str, str)> = [
-        ("policy", "Usage policy", "이용 정책", "What may be published in the Nabi package registry, and how reports are handled."),
-    ];
-    for (slug, en, ko, about) in policies {
-        for korean in [false, true] {
-            let doc = markdown::render(try fs::read_to_str(if korean { f"pages/ko/{slug}.md" } else { f"pages/{slug}.md" }), layout::md(|h| h));
-            doc.html = web::chrome::align_classes(doc.html);
-            let out = if korean { f"ko/{slug}.html" } else { f"{slug}.html" };
-            let other = if korean { "/" + slug } else { "/ko/" + slug };
-            files.insert(out, layout::page_desc(site, out, if korean { ko } else { en }, about, layout::legal(doc, other, korean), "", "", if korean { "ko" } else { "en" }));
-        }
-    }
     let rows: List<layout::Row> = List::new();
     for s in all { rows.push(layout::row_of(s)); }
-    let (list_title, list_body) = layout::list_page(rows, "", "");
-    files.insert("packages/index.html", layout::page(site, "packages/index.html", list_title, list_body));
-    for s in all {
-        let out = layout::package_out(s.name);
-        // A standard library tier: one page, no versions or tabs.
-        if s.library {
-            files.insert(out, layout::page_desc(site, out, s.name, s.desc, layout::library_page(site, s)));
-            continue;
+    // Every page twice: in English at <page>, in Korean at ko/<page>.
+    for ko in [false, true] {
+        let tr = |en: str, kr: str| if ko { kr } else { en };
+        let o = |out: str| layout::in_lang(out, ko);
+        files.insert(o("index.html"), layout::page(site, o("index.html"), site.title, layout::landing(all, ko)));
+        // The guides: pages/ko/<name>.md in Korean.
+        let guides: List<(str, str, str, str, str)> = [
+            ("publishing", "Using and publishing packages", "패키지 사용과 공개", "How to add a package as a dependency, and how a version gets into the index.", "패키지를 의존성으로 추가하는 방법과, 버전이 index에 들어가는 과정입니다."),
+            ("api", "Registry API", "레지스트리 API", "The public API of the Nabi package registry: package info, READMEs, source archives and docs, in NABION or JSON.", "Nabi 패키지 레지스트리의 공개 API입니다. 패키지 정보, README, 소스 보관본, 문서를 NABION이나 JSON으로 답합니다."),
+        ];
+        for (slug, en, kr, about, about_ko) in guides {
+            let doc = markdown::render(try fs::read_to_str(if ko { f"pages/ko/{slug}.md" } else { f"pages/{slug}.md" }), layout::md(|h| h));
+            doc.html = web::chrome::align_classes(doc.html);
+            files.insert(o(slug + ".html"), layout::page_desc(site, o(slug + ".html"), tr(en, kr), tr(about, about_ko), layout::guide(doc, tr(en, kr), ko)));
         }
-        let about = if s.desc.is_empty() { f"{s.name} {s.latest.version}, a Nabi package" } else { s.desc };
-        // Until render.ts draws this card, link previews get the site card.
-        let (og, alt) = if drawn(site, "og/" + s.name + ".png", og_v[s.name]) {
-            (site.base_url + "/og/" + s.name + ".png?v=" + og_v[s.name], f"{s.name} {s.latest.version}: {about}")
-        } else { ("", "") };
-        files.insert(out, layout::page_desc(site, out, s.name, about, layout::package_page(site, s), og, alt, "en", layout::package_ld(site, s, "readme")));
-        let vo = layout::tab_out(s.name, "versions");
-        files.insert(vo, layout::page_desc(site, vo, f"Versions of {s.name}", about, layout::versions_page(site, s), og, alt, "en", layout::package_ld(site, s, "versions")));
-        let dpo = layout::tab_out(s.name, "dependencies");
-        files.insert(dpo, layout::page_desc(site, dpo, f"Dependencies of {s.name}", about, layout::deps_page(site, s, have), og, alt, "en", layout::package_ld(site, s, "dependencies")));
-        let rdo = layout::tab_out(s.name, "dependents");
-        files.insert(rdo, layout::page_desc(site, rdo, f"Dependents of {s.name}", about, layout::dependents_page(site, s), og, alt, "en", layout::package_ld(site, s, "dependents")));
-        for o in [out, vo, dpo, rdo] { lastmod.insert(o, s.latest.date); }
-        for v in s.views {
-            let vabout = if v.desc.is_empty() { f"{s.name} {v.at}, a Nabi package" } else { v.desc };
-            let po = layout::ver_out(s.name, v.at);
-            files.insert(po, layout::page_desc(site, po, f"{s.name} {v.at}", vabout, layout::package_page(site, v), og, alt, "en", layout::package_ld(site, v, "readme")));
-            lastmod.insert(po, v.latest.date);
+        files.insert(o("404.html"), layout::page(site, o("404.html"), tr("Not found", "페이지 없음"), layout::not_found(ko)));
+        // The policies, in English at /<name> and Korean at /ko/<name>.
+        let policies: List<(str, str, str, str, str)> = [
+            ("policy", "Usage policy", "이용 정책", "What may be published in the Nabi package registry, and how reports are handled.", "Nabi 패키지 레지스트리에 공개할 수 있는 것과, 신고를 처리하는 방법입니다."),
+        ];
+        for (slug, en, kr, about, about_ko) in policies {
+            let doc = markdown::render(try fs::read_to_str(if ko { f"pages/ko/{slug}.md" } else { f"pages/{slug}.md" }), layout::md(|h| h));
+            doc.html = web::chrome::align_classes(doc.html);
+            files.insert(o(slug + ".html"), layout::page_desc(site, o(slug + ".html"), tr(en, kr), tr(about, about_ko), layout::legal(doc)));
         }
-    }
-
-    // Browsing by category and keyword.
-    for cats in [true, false] {
-        let ts = layout::topics(all, cats);
-        let index_out = if cats { "categories/index.html" } else { "keywords/index.html" };
-        let (title, body) = layout::topics_page(ts, cats);
-        files.insert(index_out, layout::page_desc(site, index_out, title, if cats { "Nabi packages by category." } else { "Nabi packages by keyword." }, body));
-        let index_crumb = if cats { ("Categories", "/categories") } else { ("Keywords", "/keywords") };
-        lastmod.insert(index_out, newest);
-        for t in ts {
-            let out = layout::topic_out(cats, t.slug);
-            let (tt, about, tb) = layout::topic_page(t, cats);
-            files.insert(out, layout::page_desc(site, out, tt, about, tb, "", "", "en", layout::breadcrumb_ld(site, [index_crumb, (t.label, layout::url(out))])));
-            let last = "";
-            for p in t.packages {
-                if p.latest.date > last { last = p.latest.date; }
+        let (list_title, list_body) = layout::list_page(rows, "", "", ko);
+        files.insert(o("packages/index.html"), layout::page(site, o("packages/index.html"), list_title, list_body));
+        for s in all {
+            let out = layout::package_out(s.name);
+            // A standard library tier: one page, no versions or tabs.
+            if s.library {
+                files.insert(o(out), layout::page_desc(site, o(out), s.name, if ko { layout::library_desc_ko(s.name) } else { s.desc }, layout::library_page(site, s, ko)));
+                continue;
             }
-            lastmod.insert(out, last);
+            let about = if !s.desc.is_empty() { s.desc } else { tr(f"{s.name} {s.latest.version}, a Nabi package", f"{s.name} {s.latest.version}, Nabi 패키지") };
+            // Until render.ts draws this card, link previews get the site card.
+            let (og, alt) = if drawn(site, "og/" + s.name + ".png", og_v[s.name]) {
+                (site.base_url + "/og/" + s.name + ".png?v=" + og_v[s.name], f"{s.name} {s.latest.version}: {about}")
+            } else { ("", "") };
+            let tab = |t: str, title: str, body: str| {
+                let to = if t == "readme" { out } else { layout::tab_out(s.name, t) };
+                files.insert(o(to), layout::page_desc(site, o(to), title, about, body, og, alt, layout::package_ld(site, s, t, ko)));
+                lastmod.insert(o(to), s.latest.date);
+            };
+            tab("readme", s.name, layout::package_page(site, s, ko));
+            tab("versions", tr(f"Versions of {s.name}", f"{s.name}의 버전"), layout::versions_page(site, s, ko));
+            tab("dependencies", tr(f"Dependencies of {s.name}", f"{s.name}의 의존성"), layout::deps_page(site, s, have, ko));
+            tab("dependents", tr(f"Dependents of {s.name}", f"{s.name}에 의존하는 패키지"), layout::dependents_page(site, s, ko));
+            for v in s.views {
+                let vabout = if !v.desc.is_empty() { v.desc } else { tr(f"{s.name} {v.at}, a Nabi package", f"{s.name} {v.at}, Nabi 패키지") };
+                let po = o(layout::ver_out(s.name, v.at));
+                files.insert(po, layout::page_desc(site, po, f"{s.name} {v.at}", vabout, layout::package_page(site, v, ko), og, alt, layout::package_ld(site, v, "readme", ko)));
+                lastmod.insert(po, v.latest.date);
+            }
         }
+
+        // Browsing by category and keyword.
+        for cats in [true, false] {
+            let ts = layout::topics(all, cats);
+            let index_out = o(if cats { "categories/index.html" } else { "keywords/index.html" });
+            let (title, body) = layout::topics_page(ts, cats, ko);
+            files.insert(index_out, layout::page_desc(site, index_out, title, if cats { tr("Nabi packages by category.", "카테고리별 Nabi 패키지입니다.") } else { tr("Nabi packages by keyword.", "키워드별 Nabi 패키지입니다.") }, body));
+            lastmod.insert(index_out, newest);
+            for t in ts {
+                let out = o(layout::topic_out(cats, t.slug));
+                let (tt, about, tb) = layout::topic_page(t, cats, ko);
+                files.insert(out, layout::page_desc(site, out, tt, about, tb, "", "", layout::breadcrumb_ld(site, [(title, layout::url(index_out)), (t.label, layout::url(out))])));
+                let last = "";
+                for p in t.packages {
+                    if p.latest.date > last { last = p.latest.date; }
+                }
+                lastmod.insert(out, last);
+            }
+        }
+        lastmod.insert(o("index.html"), newest);
+        lastmod.insert(o("packages/index.html"), newest);
     }
 
     // Search index: every package, its latest version, description and keywords.
@@ -411,11 +418,9 @@ fn main() throws {
     let out_root = site.out + ".new";
     if fs::exists(out_root) { try fs::remove_dir_all(out_root); }
     for out in files.keys() { try write(out_root, out, files[out]); }
-    lastmod.insert("index.html", newest);
-    lastmod.insert("packages/index.html", newest);
     let outs: List<str> = List::new();
     for out in files.keys() {
-        if out != "404.html" { outs.push(out); }
+        if out != "404.html" && out != "ko/404.html" { outs.push(out); }
     }
     outs.sort_by(|a: str, b: str| layout::url(a).cmp(layout::url(b)));
     let map = StrBuf::new();
@@ -427,7 +432,7 @@ fn main() throws {
     }
     map.push_str("</urlset>\n");
     try write(out_root, "sitemap.xml", map.to_str());
-    try write(out_root, "robots.txt", f"User-agent: *\nDisallow: /me\nSitemap: {site.base_url}/sitemap.xml\n");
+    try write(out_root, "robots.txt", f"User-agent: *\nDisallow: /me\nDisallow: /ko/me\nSitemap: {site.base_url}/sitemap.xml\n");
     try write(out_root, "search-index.json", sx.to_str());
     for s in all {
         if s.library { continue; }
@@ -440,8 +445,7 @@ fn main() throws {
         if !s.library { statics.insert(layout::badge_out(s.name)); }
     }
     // Served by `serve`, not files.
-    statics.insert("login");
-    statics.insert("me");
+    for p in ["login", "me", "ko/login", "ko/me"] { statics.insert(p); }
     // The kit's files (web/, built in), its fonts, then static/.
     for f in kit::files() {
         try fs::write(out_root + "/" + f.name, f.data);

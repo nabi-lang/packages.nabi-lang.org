@@ -628,7 +628,12 @@ fn publish(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
         }
     }
     if !staged.is_empty() && fs::exists(staged) { try fs::remove_file(staged) catch _ {}; }
-    if let x: ApiError = failed { throw x; }
+    if let x: ApiError = failed {
+        // A rebuild may have read the checkout while the refused line was
+        // in it: build again from the state it was reset to.
+        STALE.store(1);
+        throw x;
+    }
     if filled { warnings.push(Value::Str(f"{e.name} {e.version} was already in the index from this tree; its missing metadata is filled in")); }
     if unsaved { warnings.push(Value::Str(f"{e.name} {e.version} is in the index, but the registry could not record its metadata and README; run the same `nabi publish` again to fill them in")); }
     // Docs, from the source just checked, outside every lock: a failure

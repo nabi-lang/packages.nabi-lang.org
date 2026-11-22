@@ -55,6 +55,12 @@ Serve over HTTP (the search index is loaded with `fetch`). Links are root-relati
 python3 -m http.server -d public 8000
 ```
 
+## Languages
+
+Every page is built twice: in English at its address and in Korean under `/ko` (`/ko`, `/ko/packages/json`, `/ko/packages/json/versions`, `/ko/categories`, `/ko/publishing`, `/ko/api`, `/ko/policy`, ..). `serve` answers the Korean form of every route too: the search (`/ko/packages?q=`), the 404s (a missing package or version, any page), login (`/ko/login`, which comes back to `/ko/me`), the account page and its forms (`/ko/me`, `/ko/me/tokens`, `/ko/logout`, .., which lead back under `/ko`), and the pages that say what went wrong. The header, the footer (`web::chrome::site_cols`, `legal_links`), the nav, buttons, labels and dates are Korean there, in 합니다체 as nabi-lang.org/ko writes; a package's own text (its README, description, keywords, authors) stays as written, the README marked `lang="en"`. The guide and the API reference come from `pages/ko/publishing.md` and `pages/ko/api.md`, the policy from `pages/ko/policy.md`. What stays English on a Korean page: the API's own messages (an account form that the shared owners code refuses shows a Korean title and sentence, then the API's message), the mail notices, and the descriptions in the header search's index.
+
+The header has a language menu (`web::chrome::lang_menu`) that opens the same page in the other language, the search's query kept; nothing is remembered, it is a link. Each page names both with `<link rel="alternate" hreflang>` (`en`, `ko`, and `x-default` the English), the sitemap lists the Korean pages beside the English ones, and `robots.txt` keeps `/ko/me` out as well as `/me`. The header also links the Nabi home (nabi-lang.org, `/ko` from a Korean page). `layout::tr`, `layout::lp` (a path under `/ko`) and `layout::in_lang` (an output file under `ko/`) are how a page picks its words and links; `static/search.tsx` reads `<html lang>` for its text and sends a Korean page's results to `/ko/packages/<name>`.
+
 ## Search and browse
 
 `/packages?q=` (served by `serve`, works without JS) and the header's search box (`static/search.tsx`, over `/search-index.json`) match alike: every term must be in the name, the description or a keyword; exact name first, then name prefix, name, keyword, the rest, official packages first among equals. When nothing matches, each term found nowhere is replaced by the nearest name, part of a name (split at `-` / `_`) or keyword within a few edits (1 for 3 to 4 characters, 2 up to 8, 3 beyond; `names::edits`, which counts a swap of two neighbours as one), and the page shows those results under "Showing results for ..": `?q=jsn` shows `json`, `?q=lnalg` shows `linalg`.
@@ -230,11 +236,11 @@ Edit `site.nabion` (NABION). Key fields: `title`, `tagline`, `description`, `ind
 | `src/packages.nabi` | Reads the index, semver ordering, dependents, version dates, README and source tree fetching |
 | `src/apidoc.nabi` | Docs tab: public items and `///` docs scanned from a package's sources; the install box's `use` line |
 | `src/docs.nabi`   | Each version's docs: made at publish in a bounded process of its own, kept with the data, their status |
-| `src/layout.nabi` | Page frame, home, package list and search, category and keyword pages, publishing guide, package pages and their tabs (Readme, Docs, Versions, Dependencies, Dependents) |
+| `src/layout.nabi` | Page frame (in English and Korean), home, package list and search, category and keyword pages, publishing guide, package pages and their tabs (Readme, Docs, Versions, Dependencies, Dependents), structured data |
 | `tests/`         | `e2e.sh` and the fake GitHub it runs (OAuth with PKCE, `/user`, `/user/emails`, `/repos`, an OIDC issuer that signs test tokens, AWS's IMDSv2 and SES SendEmail, and images for the proxy) |
 | `pages/publishing.md` | Publishing guide text |
 | `pages/api.md` | The public API's reference, at `/api` |
-| `pages/{terms,privacy,policy}.md`, `pages/ko/` | Terms of use, privacy notice and usage policy (drafts, not yet reviewed), at `/terms`, `/privacy`, `/policy` and in Korean under `/ko/` |
+| `pages/policy.md`, `pages/ko/` | The usage policy (a draft, not yet reviewed) at `/policy`, and the Korean guide, API reference and policy under `/ko/`; terms and privacy are nabi-lang.org's (`/terms`, `/privacy` redirect there) |
 | `pages/publish.yml` | The trusted publishing workflow for a package's repository |
 | `static/`        | `style.css`, `search.tsx` and its `ui/*.tsx` components, `og.png` |
 | `web/`           | the web kit (submodule): `nabi.css`, `theme.js`, `keys.js`, marks and icons, and the `web` library (HTTP, addresses, header and footer markup) |

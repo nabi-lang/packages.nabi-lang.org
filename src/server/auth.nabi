@@ -12,7 +12,7 @@ use pkg::server::admin::{Audit, audit};
 use pkg::server::github::{cq, curl, github_user};
 use pkg::server::routes::read_page;
 use pkg::server::store::{Account, Db, Locked, MAX_SESSIONS, SEEN_SECS, SESSION_COOKIE, SESSION_SECS, Session, STATE_COOKIE, account_of, load_db, lock_of, now_secs, save_db, session_cookie, session_of};
-use pkg::server::{Cfg, Resp, cookie, counts, LOCK, message, nabion_resp, page, redirect};
+use pkg::server::{Cfg, Resp, cookie, counts, ko_path, LOCK, message, nabion_resp, page, redirect, refusal};
 use pkg::trust;
 use pkg::trust::{TrustedPublisher, TrustToken};
 use markdown::esc;
@@ -43,6 +43,9 @@ const PENDING_MAX: usize = 4096;
 struct Pending {
     verifier: str;
     expires: i64;
+    /// Started from a Korean page: the callback answers in Korean and
+    /// goes on to /ko/me.
+    ko: bool = false;
 }
 
 /// Logins in progress by the SHA-256 of their state. In memory: a login
@@ -55,7 +58,7 @@ pub fn pkce_challenge(verifier: str) -> str {
 }
 
 /// Keep `verifier` for `state`; false when too many logins are open.
-fn remember(state: str, verifier: str) -> bool {
+fn remember(state: str, verifier: str, ko: bool) -> bool {
     let now = now_secs();
     using g = PENDING.lock() {
         let d = g.get();
@@ -68,7 +71,7 @@ fn remember(state: str, verifier: str) -> bool {
             g.set(d);
         }
         if d.len() >= PENDING_MAX { return false; }
-        d.insert(secret::sha256_hex(state), Pending { verifier: verifier, expires: now + STATE_SECS });
+        d.insert(secret::sha256_hex(state), Pending { verifier: verifier, expires: now + STATE_SECS, ko: ko });
     }
     true
 }
@@ -86,12 +89,22 @@ fn take(state: str) -> str | none {
     }
 }
 
+/// Whether the login of `state` started from a Korean page; false when
+/// there is none. Only picks the language: take() checks the login.
+fn ko_of(state: str) -> bool {
+    using g = PENDING.lock() {
+        if let p: Pending = g.get().get(secret::sha256_hex(state)) { return p.ko; }
+    }
+    false
+}
+
+/// `/login` (`/ko/login`: back to `/ko/me`).
 pub fn login(cfg: Cfg, site: Site, path: str) throws -> Resp {
     let state = try secret::random_hex(16);
     // 64 hex digits: within RFC 7636's 43 to 128 unreserved characters.
     let verifier = try secret::random_hex(32);
-    if !remember(state, verifier) {
-        let m = message(site, path, 503, "Too many logins", "Too many logins are in progress. Wait a minute, then log in again.");
+    if !remember(state, verifier, ko_path(path)) {
+        let m = message(site, path, 503, "Too many logins", "Too many logins are in progress. Wait a minute, then log in again.", "로그인이 너무 많습니다", "진행 중인 로그인이 너무 많습니다. 1분 기다린 뒤 다시 로그인하십시오.");
         m.headers.push("Retry-After: 60");
         return m;
     }
@@ -103,20 +116,21 @@ pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
     let q = http::form(r.query);
     let state = q.get("state") ?? "";
     let want = http::cookie(r, STATE_COOKIE);
-    let expired = "The login expired or did not start here. Log in again.";
-    if want.is_empty() || !secret::same(state, want) {
-        return message(site, r.path, 400, "Login failed", expired);
-    }
-    let verifier = take(state) ?? { return message(site, r.path, 400, "Login failed", expired); };
+    let ko = ko_of(state);
+    // The pages it answers with are the login's, in its language.
+    let at = if ko { "/ko/login" } else { r.path };
+    let expired = || message(site, at, 400, "Login failed", "The login expired or did not start here. Log in again.", "로그인하지 못했습니다", "로그인이 만료되었거나 여기서 시작되지 않았습니다. 다시 로그인하십시오.");
+    if want.is_empty() || !secret::same(state, want) { return expired(); }
+    let verifier = take(state) ?? { return expired(); };
     let code = q.get("code") ?? "";
     if code.is_empty() {
-        return message(site, r.path, 400, "Login cancelled", "GitHub did not authorize the login. Log in again and authorize the app on GitHub.");
+        return message(site, at, 400, "Login cancelled", "GitHub did not authorize the login. Log in again and authorize the app on GitHub.", "로그인이 취소되었습니다", "GitHub가 로그인을 승인하지 않았습니다. 다시 로그인한 뒤 GitHub에서 앱을 승인하십시오.");
     }
     let u = try github_user(cfg, code, verifier) catch e {
-        return message(site, r.path, e.status, "Login failed", e.msg);
+        return refusal(site, at, e.status, "Login failed", "로그인하지 못했습니다", e.msg, "GitHub에서 계정을 확인하지 못했습니다. 다시 로그인하십시오.");
     };
     let gh = u.account;
-    if cfg.require_2fa && !u.two_factor { return no_two_factor(site, r.path, gh.login); }
+    if cfg.require_2fa && !u.two_factor { return no_two_factor(site, at, gh.login); }
     let id = gh.id;
     let sid = try secret::random_hex(32);
     let csrf = try secret::random_hex(16);
@@ -127,7 +141,7 @@ pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
     using g = LOCK.lock() {
         let db = try load_db(cfg);
         if let l: Locked = lock_of(db, id) {
-            return message(site, r.path, 403, "Account locked", f"The registry admins locked this account: {l.reason}. To appeal, write to the address in SECURITY.md.");
+            return message(site, at, 403, "Account locked", f"The registry admins locked this account: {l.reason}. To appeal, write to the address in SECURITY.md.", "계정이 잠겼습니다", f"레지스트리 관리자가 이 계정을 잠갔습니다: {l.reason}. 이의가 있으면 SECURITY.md의 주소로 알려 주십시오.");
         }
         let seen = false;
         for i in 0..db.accounts.len() {
@@ -157,7 +171,7 @@ pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
         db.sessions = kept;
         try save_db(cfg, db);
         audit(cfg, Audit { at: now, by: id, action: "login", target: gh.login });
-        out = redirect("/me", [cookie(SESSION_COOKIE, sid, SESSION_SECS), cookie(STATE_COOKIE, "", 0i64)]);
+        out = redirect(if ko { "/ko/me" } else { "/me" }, [cookie(SESSION_COOKIE, sid, SESSION_SECS), cookie(STATE_COOKIE, "", 0i64)]);
     }
     out
 }
@@ -166,6 +180,13 @@ pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
 /// authentication, with the way to turn it on.
 fn no_two_factor(site: Site, path: str, login: str) -> Resp {
     let b = StrBuf::new();
+    if ko_path(path) {
+        b.push_str("<h1 class=\"t-h1\">2단계 인증을 켜십시오</h1>\n");
+        b.push_str(f"<p class=\"t-lead\">레지스트리는 2단계 인증을 켠 GitHub 계정의 로그인만 받습니다. <strong>{esc(login)}</strong> 계정은 2단계 인증이 꺼져 있습니다.</p>\n");
+        b.push_str("<ol>\n<li>GitHub 설정의 <a href=\"https://github.com/settings/security\">Password and authentication</a>에서 <em>Enable two-factor authentication</em>으로 켭니다.</li>\n<li>돌아와서 <a href=\"/ko/login\">다시 로그인</a>합니다.</li>\n</ol>\n");
+        b.push_str("<p class=\"t-small muted\">저장된 것은 없습니다. 로그인에 성공하기 전에는 계정도 세션도 만들지 않습니다.</p>\n");
+        return page(site, path, "2단계 인증이 필요합니다", b.to_str(), 403);
+    }
     b.push_str("<h1 class=\"t-h1\">Turn on two-factor authentication</h1>\n");
     b.push_str(f"<p class=\"t-lead\">The registry takes logins only from GitHub accounts with two-factor authentication, and <strong>{esc(login)}</strong> has it off.</p>\n");
     b.push_str("<ol>\n<li>Turn it on in GitHub's settings: <a href=\"https://github.com/settings/security\">Password and authentication</a>, then <em>Enable two-factor authentication</em>.</li>\n<li>Come back and <a href=\"/login\">log in again</a>.</li>\n</ol>\n");
@@ -348,6 +369,6 @@ fn pkce() {
     // RFC 7636, appendix B.
     assert(pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "S256");
     let st = try! secret::random_hex(16);
-    assert(remember(st, "v1"), "kept");
+    assert(remember(st, "v1", true) && ko_of(st) && !ko_of("x" + st), "kept, with its language");
     assert((take("x" + st) ?? "") == "" && (take(st) ?? "") == "v1" && take(st) is none, "used once");
 }
