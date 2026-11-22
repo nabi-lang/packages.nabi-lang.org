@@ -18,20 +18,19 @@ use web::url;
 
 /// An OG card asked for by the version render.ts drew it from (the `.v`
 /// beside it), and a stylesheet or script asked for by its content
-/// version (layout::asset), never change: cache them for good. Bare,
-/// stale or unrendered card addresses stay short; pages are cached for a
-/// minute; everything else revalidates.
+/// version (layout::asset), never change: cache them for good. Pages and
+/// everything else are checked on every load (HTML_CACHE).
 pub fn cache_for(site: Site, path: str, f: str, query: str) -> str {
     let v = http::form(query).get("v") ?? "";
     if path == "/og.png" || (path.starts_with("/og/") && path.ends_with(".png")) {
         let drawn = try fs::read_to_str(f + ".v") catch _ { "" };
-        return if !v.is_empty() && v == drawn.trim() { IMMUTABLE } else { "public, max-age=3600" };
+        return if !v.is_empty() && v == drawn.trim() { IMMUTABLE } else { HTML_CACHE };
     }
-    // The kit's fonts: unversioned names, so a day and the ETag.
-    if path.starts_with("/fonts/") { return "public, max-age=86400"; }
+    // The kit's fonts: unversioned names, so checked like a page.
+    if path.starts_with("/fonts/") { return HTML_CACHE; }
     let want = layout::asset_version(site, path[1:]);
-    if !want.is_empty() { return if v == want { IMMUTABLE } else { "no-cache" }; }
-    if f.ends_with(".html") { HTML_CACHE } else { "no-cache" }
+    if !want.is_empty() { return if v == want { IMMUTABLE } else { HTML_CACHE }; }
+    HTML_CACHE
 }
 
 /// `public/.packages.nabion` (main.nabi); empty when it cannot be read.

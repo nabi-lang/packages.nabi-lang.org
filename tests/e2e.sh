@@ -161,20 +161,20 @@ code=$(curl -s -o /dev/null -w '%{http_code}' --path-as-is "$base/%2e%2e/site.na
 v=$(sed -n 's|.*property="og:image" content="[^"]*/og.png?v=\([0-9a-f]\{10\}\)".*|\1|p' "$T/site/public/index.html")
 [ -n "$v" ] || fail "no versioned og:image"
 req GET /og.png
-[ "$(header cache-control)" = "public, max-age=3600" ] || fail "bare og.png cache: $(header cache-control)"
+[ "$(header cache-control)" = "public, max-age=0, must-revalidate, s-maxage=86400" ] || fail "bare og.png cache: $(header cache-control)"
 echo "$v" > "$T/site/public/og.png.v"
 req GET "/og.png?v=$v"
 [ "$(header cache-control)" = "public, max-age=31536000, immutable" ] || fail "versioned og.png cache: $(header cache-control)"
 req GET "/og.png?v=0000000000"
-[ "$(header cache-control)" = "public, max-age=3600" ] || fail "stale og.png cache: $(header cache-control)"
+[ "$(header cache-control)" = "public, max-age=0, must-revalidate, s-maxage=86400" ] || fail "stale og.png cache: $(header cache-control)"
 req GET /style.css
-[ "$(header cache-control)" = "no-cache" ] || fail "css cache: $(header cache-control)"
+[ "$(header cache-control)" = "public, max-age=0, must-revalidate, s-maxage=86400" ] || fail "css cache: $(header cache-control)"
 css=$(grep -o '/style.css?v=[0-9a-f]\{10\}' "$T/site/public/index.html" | head -1)
 [ -n "$css" ] || fail "no versioned style.css"
 req GET "$css"
 [ "$(header cache-control)" = "public, max-age=31536000, immutable" ] || fail "versioned css cache: $(header cache-control)"
 req GET /publishing
-[ "$(header cache-control)" = "public, max-age=60, must-revalidate" ] || fail "page cache: $(header cache-control)"
+[ "$(header cache-control)" = "public, max-age=0, must-revalidate, s-maxage=86400" ] || fail "page cache: $(header cache-control)"
 etag=$(header etag)
 [ -n "$etag" ] || fail "no etag"
 rm -f "$T/b"
@@ -184,7 +184,7 @@ expect_code 304 "if-none-match"
 req GET /fonts/Geist-Variable.woff2
 expect_code 200 "font"
 [ "$(header content-type)" = "font/woff2" ] || fail "font type: $(header content-type)"
-[ "$(header cache-control)" = "public, max-age=86400" ] || fail "font cache: $(header cache-control)"
+[ "$(header cache-control)" = "public, max-age=0, must-revalidate, s-maxage=86400" ] || fail "font cache: $(header cache-control)"
 req GET /fonts/pretendard.css
 [ "$(header content-type)" = "text/css; charset=utf-8" ] || fail "pretendard.css type: $(header content-type)"
 grep -q 'googleapis\|jsdelivr' "$T/site/public/index.html" && fail "third-party fonts"
@@ -194,7 +194,7 @@ expect_body 'href="/login">Log in' "login button logged out"
 [ "$(header vary)" = "Cookie" ] || fail "html vary: $(header vary)"
 req GET / -H "Cookie: __Host-pkg_session=$(printf 'ab%.0s' $(seq 32))"
 expect_body 'href="/login">Log in' "login button with a dead session"
-[ "$(header cache-control)" = "public, max-age=60, must-revalidate" ] || fail "dead session cache: $(header cache-control)"
+[ "$(header cache-control)" = "public, max-age=0, must-revalidate, s-maxage=86400" ] || fail "dead session cache: $(header cache-control)"
 ok "static files"
 
 login user
