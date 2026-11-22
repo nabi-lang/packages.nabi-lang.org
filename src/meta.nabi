@@ -147,8 +147,8 @@ pub struct Release {
     /// Why it was yanked (`Yank { message }`); `""` when not given or
     /// unyanked.
     pub yank_message: str = "";
-    /// Downloads counted by the server. Always 0: clients fetch the git
-    /// source; the archive below is the registry's own copy of it.
+    /// Unused: downloads are counted in `downloads.nabion`
+    /// (server::downloads). Kept so older data files still read.
     pub downloads: i64 = 0i64;
     /// SHA-256 of the source archive kept at publish (`archive_file`);
     /// "" when none was kept.

@@ -1002,6 +1002,7 @@ fn side(site: Site, s: Package) -> str {
         let who = if pb.is_empty() { "" } else { f"{if when.is_empty() { "by" } else { " by" }} {pb}" };
         kv.push_str(f"<dt>Published</dt><dd>{when}{who}</dd>");
     }
+    kv.push_str(downloads_kv(s));
     if !m.license.is_empty() { kv.push_str(f"<dt>License</dt><dd>{esc(m.license)}</dd>"); }
     if !l.nabi_version.is_empty() { kv.push_str(f"<dt>Requires</dt><dd>{esc(packages::admits(l.nabi_version))}</dd>"); }
     if !m.links.is_empty() { kv.push_str(f"<dt>Links</dt><dd title=\"The native library it links\"><code class=\"ic\">{esc(m.links)}</code></dd>"); }
@@ -1060,6 +1061,27 @@ fn side(site: Site, s: Package) -> str {
 {owners_box(s)}{publishers_box(s)}<section class=\"vers\"><h2 class=\"t-label\">Versions</h2><ul>{vb.to_str()}</ul>{dates_note(s)}{more}</section>
 </aside>
 "
+}
+
+/// A count of downloads, grouped by thousands.
+fn count_text(n: i64) -> str { grouped(if n < 0i64 { 0usize } else { n as usize }) }
+
+/// The side panel's Downloads: every version's on the package's pages,
+/// the version's own on a version page; "" when none were counted.
+fn downloads_kv(s: Package) -> str {
+    let (total, recent) = if s.at.is_empty() {
+        let t = -1i64;
+        let r = 0i64;
+        for v in s.versions {
+            if v.downloads < 0i64 { continue; }
+            t = if t < 0i64 { v.downloads } else { t + v.downloads };
+            r += v.recent;
+        }
+        (t, r)
+    } else { (s.latest.downloads, s.latest.recent) };
+    if total < 0i64 { return ""; }
+    let what = if s.at.is_empty() { "Downloads of the source archive, every version" } else { "Downloads of this version's source archive" };
+    f"<dt>Downloads</dt><dd title=\"{what}\">{count_text(total)} <span class=\"muted\">· {count_text(recent)} in the last 90 days</span></dd>"
 }
 
 /// An address without `https://` and `.git`.
@@ -1203,6 +1225,10 @@ fn docs_cell(site: Site, s: Package, v: str) -> str {
 
 pub fn versions_page(site: Site, s: Package) -> str {
     let b = StrBuf::new();
+    let counted = false;
+    for v in s.versions {
+        if v.downloads >= 0i64 { counted = true; }
+    }
     for v in sorted_versions(s) {
         let tags = StrBuf::new();
         if v.version == s.latest.version && !v.yanked { tags.push_str("<span class=\"tag acc\">latest</span>"); }
@@ -1222,11 +1248,12 @@ pub fn versions_page(site: Site, s: Package) -> str {
         } else { none_yet };
         let sz = if let n: i64 = v.meta.size { size(n) } else { "<span class=\"muted\">unknown</span>" };
         let tc = if v.nabi_version.is_empty() { "<span class=\"muted\">any</span>" } else { esc(packages::admits(v.nabi_version)) };
-        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{if v.license.is_empty() { "<span class=\"muted\">none</span>" } else { esc(v.license) }}</td><td>{sz}</td><td>{tc}</td><td>{docs_cell(site, s, v.version)}</td><td class=\"mono\">{commit_link(v)}</td><td class=\"mono\"><code title=\"{esc(v.tree)}\">{short(v.tree)}</code></td></tr>");
+        let dl = if counted { f"<td title=\"{count_text(v.recent)} in the last 90 days\">{count_text(v.downloads)}</td>" } else { "" };
+        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{if v.license.is_empty() { "<span class=\"muted\">none</span>" } else { esc(v.license) }}</td><td>{sz}</td>{dl}<td>{tc}</td><td>{docs_cell(site, s, v.version)}</td><td class=\"mono\">{commit_link(v)}</td><td class=\"mono\"><code title=\"{esc(v.tree)}\">{short(v.tree)}</code></td></tr>");
     }
     let body = f"<h2 class=\"t-h3\">{plural(s.versions.len(), "version", "versions")}</h2>
-<p class=\"t-ui muted\">Newest first. Published is when the version's line was added to the index (UTC); size is the package as <code class=\"ic\">nabi publish</code> packed it. A yanked version stays in the index for the projects that pinned it; new resolves skip it.</p>
-<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">Version</th><th scope=\"col\">Published</th><th scope=\"col\">By</th><th scope=\"col\">License</th><th scope=\"col\">Size</th><th scope=\"col\">Requires</th><th scope=\"col\">Docs</th><th scope=\"col\">Commit</th><th scope=\"col\">Tree hash</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>
+<p class=\"t-ui muted\">Newest first. Published is when the version's line was added to the index (UTC); size is the package as <code class=\"ic\">nabi publish</code> packed it{if counted { "; downloads are of its source archive, all time (hover for the last 90 days)" } else { "" }}. A yanked version stays in the index for the projects that pinned it; new resolves skip it.</p>
+<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">Version</th><th scope=\"col\">Published</th><th scope=\"col\">By</th><th scope=\"col\">License</th><th scope=\"col\">Size</th>{if counted { "<th scope=\"col\">Downloads</th>" } else { "" }}<th scope=\"col\">Requires</th><th scope=\"col\">Docs</th><th scope=\"col\">Commit</th><th scope=\"col\">Tree hash</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>
 ";
     package_frame(site, s, "versions", body)
 }

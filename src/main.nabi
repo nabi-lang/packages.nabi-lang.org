@@ -271,6 +271,11 @@ fn main() throws {
             if x.version.is_empty() { removed.insert(x.name); }
         }
         for r in server::store::fill_owner_ids(db) { data.releases.insert(r.name + "@" + r.version, r); }
+        let counts = try server::downloads::read(data_dir) catch e {
+            eprintln(f"downloads: {e}; pages show none");
+            List::new()
+        };
+        data.downloads = server::downloads::sums(counts, server::downloads::today());
         for a in db.accounts {
             if !a.name.is_empty() { data.names.insert(a.id, a.name); }
         }

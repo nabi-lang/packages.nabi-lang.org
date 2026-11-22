@@ -15,6 +15,7 @@ use pkg::meta::{Release, Actor};
 use pkg::packages;
 use pkg::server::admin::admin_route;
 use pkg::server::auth::exchange;
+use pkg::server::downloads;
 use pkg::server::limit;
 use pkg::server::names;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, remove_owner, remove_trusted};
@@ -118,6 +119,8 @@ fn package_info(cfg: Cfg, db: Db, native: bool, name: str) throws (ApiError) -> 
     let list: List<Value> = List::new();
     // The package is official when its latest version is (pick_latest).
     let vs: List<packages::Version> = List::new();
+    let total = 0i64;
+    let total_recent = 0i64;
     for line in lines {
         let v = if let Value::Str(x) = line.get("version") ?? Value::None { x } else { "" };
         let yanked = line.get("yanked") == Value::Bool(true);
@@ -144,7 +147,11 @@ fn package_info(cfg: Cfg, db: Db, native: bool, name: str) throws (ApiError) -> 
         f.insert("meta", meta::to_value(rel.meta));
         f.insert("has_readme", Value::Bool(fs::exists(meta::readme_file(cfg.data, k, v))));
         f.insert("archive", archive);
-        f.insert("downloads", Value::Int(Int::from(rel.downloads)));
+        let (dl, recent) = if native { (0i64, 0i64) } else { downloads::of(k, v) };
+        total += dl;
+        total_recent += recent;
+        f.insert("downloads", Value::Int(Int::from(dl)));
+        f.insert("recent_downloads", Value::Int(Int::from(recent)));
         f.insert("published_by", actor_value(rel.published_by));
         f.insert("yanked_by", actor_value(rel.yanked_by));
         f.insert("unyanked_by", actor_value(rel.unyanked_by));
@@ -154,7 +161,7 @@ fn package_info(cfg: Cfg, db: Db, native: bool, name: str) throws (ApiError) -> 
         vs.push(packages::Version { version: v, deps: List::new(), url: "", rev: "", tree: "", yanked: yanked, features: List::new(), official: official });
     }
     let official = !native && packages::pick_latest(vs).official;
-    nabion_resp(200, "Package", [("name", Value::Str(name)), ("native", Value::Bool(native)), ("owners", Value::List(owners)), ("orgs", Value::List(orgs)), ("versions", Value::List(list)), ("official", Value::Bool(official))])
+    nabion_resp(200, "Package", [("name", Value::Str(name)), ("native", Value::Bool(native)), ("owners", Value::List(owners)), ("orgs", Value::List(orgs)), ("versions", Value::List(list)), ("official", Value::Bool(official)), ("downloads", Value::Int(Int::from(total))), ("recent_downloads", Value::Int(Int::from(total_recent)))])
 }
 
 /// One version in `GET /api/v1/docs`: its commit and the state of its
@@ -255,6 +262,7 @@ fn download(cfg: Cfg, db: Db, name: str, version: str) throws (ApiError) -> Resp
         headers: ["Content-Type: application/gzip", f"Content-Disposition: attachment; filename=\"{name}-{version}.tar.gz\"", "Cache-Control: public, max-age=86400"],
         body: "",
         file: p,
+        count: k + "@" + version,
     }
 }
 

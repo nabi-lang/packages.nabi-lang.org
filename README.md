@@ -31,7 +31,7 @@ nabi test                  # unit tests
 tests/e2e.sh              # end-to-end test of serve
 ```
 
-`fixtures/` holds a sample index (`--demo`) with more packages and edge cases than the real one, a sample `db.nabion` (`fixtures/data`), plus READMEs and source trees for some of them, for checking the site without git or network. Each package's latest commit is fetched into `.cache/git`: its README is rendered untrusted (HTML shown as text, non-http(s)/mailto links dropped), its tree is counted for the side panel (files, size, non-blank lines of `.nabi`). Each version's public items are its Docs tab (see Docs). Version dates are the commit dates of the index commits that added each version's line.
+`fixtures/` holds a sample index (`--demo`) with more packages and edge cases than the real one, a sample `db.nabion` and `downloads.nabion` (`fixtures/data`), plus READMEs and source trees for some of them, for checking the site without git or network. Each package's latest commit is fetched into `.cache/git`: its README is rendered untrusted (HTML shown as text, non-http(s)/mailto links dropped), its tree is counted for the side panel (files, size, non-blank lines of `.nabi`). Each version's public items are its Docs tab (see Docs). Version dates are the commit dates of the index commits that added each version's line.
 
 ## Scripts
 
@@ -74,7 +74,7 @@ Settings live in `.env` (copy `.env.example`; process env wins over the file):
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | The GitHub OAuth app |
 | `PACKAGES_ADMINS` | Comma-separated numeric GitHub user ids (the `id` of `https://api.github.com/users/<login>`) that may create publish tokens, add trusted publishers, publish, yank and moderate. A login is refused: logins change hands, ids do not |
 | `PACKAGES_OPEN_PUBLISHING` | `1` lets every account do what the admins do with their own packages; unset (default), other accounts only log in and their tokens authorize nothing |
-| `PACKAGES_DATA` | Directory of `db.nabion` (accounts, tokens, owners, each version's metadata and publisher), `readme/<name>/<version>.md` (READMEs sent with a publish), `docs/<name>/<version>/` (docs made at publish) and `sources/` |
+| `PACKAGES_DATA` | Directory of `db.nabion` (accounts, tokens, owners, each version's metadata and publisher), `downloads.nabion` (download counts), `readme/<name>/<version>.md` (READMEs sent with a publish), `docs/<name>/<version>/` (docs made at publish) and `sources/` |
 | `PACKAGES_INDEX` | Index checkout the server commits to and pushes from |
 | `PACKAGES_TRUSTED` | Optional bootstrap file of trusted publishers (see Trusted publishing) |
 | `PACKAGES_AUDIENCE` | The `aud` an OIDC token must carry (default: the host of `PACKAGES_URL`) |
@@ -91,9 +91,9 @@ Login is GitHub OAuth only (`read:user`) and open to anyone: the header always o
 | `GET /api/v1/me` | account + publish flag |
 | `POST /api/v1/publish` | `Publish { entry: Package { .. }, meta: { .. } }`: the index entry `nabi publish` prints and the package's metadata; answers `Published { name, version, file, warnings }`. A version already in the index from the same tree that was not published through the API (written by a maintainer with `nabi publish --index-dir`) gets the metadata and README it lacks instead of a 409 |
 | `POST /api/v1/yank` | `Yank { name, version, undo, native, message }`; `message` (at most 512 bytes) is the reason, cleared by an unyank |
-| `GET /api/v1/packages/<name>` | no token: `owners` (accounts), `orgs` (organisations and teams on record), and each `Version { version, yanked, yank_message, deps, meta, has_readme, downloads, published_by, yanked_by, unyanked_by, official }`, and `official` (its latest version's); each actor is `Actor { id, login, at }`, plus `via` for trusted publishing; `deps` is as in the index line |
+| `GET /api/v1/packages/<name>` | no token: `owners` (accounts), `orgs` (organisations and teams on record), and each `Version { version, yanked, yank_message, deps, meta, has_readme, archive, downloads, recent_downloads, published_by, yanked_by, unyanked_by, official }`, then `official` (its latest version's) and the package's `downloads` and `recent_downloads` (every version's); each actor is `Actor { id, login, at }`, plus `via` for trusted publishing; `deps` is as in the index line |
 | `GET /api/v1/packages/<name>/<version>/readme` | no token: the README sent with that version, `text/markdown`; 404 when none was sent |
-| `GET /api/v1/packages/<name>/<version>/download` | no token: the source archive kept at publish (`application/gzip`, every path under `<name>-<version>/`); its SHA-256 and size are the version's `archive` |
+| `GET /api/v1/packages/<name>/<version>/download` | no token: the source archive kept at publish (`application/gzip`, every path under `<name>-<version>/`); its SHA-256 and size are the version's `archive`. Counted as a download (see Downloads) |
 | `GET /api/v1/native/<name>` | the same for a native package (and `/<version>/readme`) |
 | `POST /api/v1/trusted-publishing/token` | no token: `TrustedPublishing { jwt: ".." }` (or `{"jwt": ".."}`), a GitHub Actions OIDC token; answers `TrustedToken { token, expires, packages }` |
 | `GET /api/v1/trusted-publishers` | the trusted publishers of the packages the account owns (admins: all) |
@@ -133,7 +133,11 @@ The job sends its OIDC token to `POST /api/v1/trusted-publishing/token`. The ser
 
 A version is official exactly when a trusted publisher in a repository of the nabi-lang organization publishes it: the OIDC token's `repository_owner_id` is `PACKAGES_OFFICIAL_ORG`. The server then appends `official: true` to its index line and records `official` with the release; a publish that sends `official` itself is refused. A package is official when its latest version is: the pages show an **Official** mark (a word, not a colour alone) on the package, in lists and in the header search, the home page lists them, `official:yes` (or `official:no`) in a search filters on it, and official packages come first among results that match equally well. To make another package official, move its repository into the organization and add the organization's workflow as its trusted publisher; its next version is official, earlier ones keep their line, and its owners stay.
 
-A publish keeps the source: `git archive` of the published commit in `PACKAGES_DATA/archives/<key>/<version>.tar.gz` (at most 64 MiB), its SHA-256 in the version's record and written into the index line after `tree` (`archive`), served at `/download`. `nabi` downloads the archive and checks it against that line, so a version outlives its repository; it fetches the git source only for a version without `archive`. `downloads` stays 0: nothing counts the archive's downloads yet.
+A publish keeps the source: `git archive` of the published commit in `PACKAGES_DATA/archives/<key>/<version>.tar.gz` (at most 64 MiB), its SHA-256 in the version's record and written into the index line after `tree` (`archive`), served at `/download`. `nabi` downloads the archive and checks it against that line, so a version outlives its repository; it fetches the git source only for a version without `archive`.
+
+### Downloads
+
+Each `GET .../<version>/download` answered with the whole archive (a 200, not a HEAD, a 304 or an error) counts one download of that version on that day (UTC), in memory (`src/server/downloads.nabi`). Once a minute, when any changed, the counts are written whole to `PACKAGES_DATA/downloads.nabion` (`Count { name, version, day, n }`, `day` in days since 1970-01-01) in one rename, so a crash loses at most a minute of them; days before the last 90 are folded into one count per version (`day: 0`), so the file grows with the versions, not with time. A file that cannot be read at start is kept as `downloads.nabion.bad` and the counting starts over. The API answers the live counts: each version's `downloads` (all) and `recent_downloads` (the last 90 days, today included), and the package's sums. The pages show the counts of their last build (`--data` reads the file): the side panel every version's on a package page and the version's own on a version page, the Versions table a column; new downloads alone ask for a rebuild at most once an hour.
 
 The side panel's Repository is always the source the commit was fetched from, never the manifest's `repository` (shown apart as "Stated repository" when it differs). It is marked **verified** when GitHub Actions in that very repository published the version (trusted publishing), and **not verified** otherwise: the fetch shows only that the commit is on a branch or tag there. README links carry `rel="nofollow ugc"`, and README images load lazily with no referrer.
 
@@ -183,6 +187,7 @@ Edit `site.nabion` (NABION). Key fields: `title`, `tagline`, `description`, `ind
 | `src/server/github.nabi` | GitHub API calls over curl |
 | `src/server/admin.nabi` | Moderation for the admins: locks, takedowns, approved names, the audit file |
 | `src/server/limit.nabi` | Rate limits per address, account and token |
+| `src/server/downloads.nabi` | Download counts: counted in memory, written once a minute |
 | `src/server/names.nabi` | Reserved names and the look-alike check for new ones |
 | `src/index.nabi`  | API entry and metadata checks, index commits and pushes |
 | `src/meta.nabi`   | Per-version metadata and publisher records kept in `db.nabion` |

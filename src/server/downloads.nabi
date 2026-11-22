@@ -1,0 +1,180 @@
+// Archive downloads (GET /api/v1/packages/<name>/<version>/download) per
+// version per day. Counted in memory and written whole to
+// `PACKAGES_DATA/downloads.nabion` at most once a minute, replacing the
+// old file in one rename: a crash loses at most that minute. Days before
+// the last RECENT are folded into one count per version (day 0), so the
+// file grows with the versions, not with time.
+
+use pkg::server::STALE;
+use pkg::server::store::now_secs;
+use std::fs;
+use std::nabion;
+use std::thread;
+
+/// One version's downloads on one day.
+#[derive(Nabion)]
+pub struct Count {
+    /// `index::key`.
+    pub name: str;
+    pub version: str;
+    /// Days since 1970-01-01 (UTC); 0: every day before the last RECENT.
+    pub day: i64;
+    pub n: i64;
+}
+
+/// Days whose downloads are "recent", today included.
+pub const RECENT: i64 = 90i64;
+
+/// Seconds between writes of the file.
+const FLUSH_SECS: i64 = 60i64;
+
+/// Seconds between site rebuilds asked for by new downloads alone: the
+/// pages show the counts of their last build.
+const REBUILD_SECS: i64 = 3600i64;
+
+/// Downloads by `name@version`, by day.
+static COUNTS: Mutex<Dict<str, Dict<i64, i64>>> = Mutex::new(Dict::new());
+static DIRTY: Atomic<i32> = Atomic::new(0);
+
+pub fn today() -> i64 { now_secs() / 86400i64 }
+
+pub fn file_of(dir: str) -> str { dir + "/downloads.nabion" }
+
+/// `dir/downloads.nabion`; empty when there is none.
+pub fn read(dir: str) throws -> List<Count> {
+    let p = file_of(dir);
+    if !fs::exists(p) { return List::new(); }
+    try nabion::from_str(try fs::read_to_str(p))
+}
+
+/// `cs` with each version's days before the last RECENT (counting back
+/// from `today`) summed into its day 0, empty counts dropped; by name,
+/// version and day.
+pub fn fold(cs: List<Count>, today: i64) -> List<Count> {
+    let by: Dict<str, Dict<i64, i64>> = Dict::new();
+    for c in cs { add(by, c.name + "@" + c.version, if c.day > today - RECENT { c.day } else { 0i64 }, c.n); }
+    flat(by)
+}
+
+fn add(by: Dict<str, Dict<i64, i64>>, k: str, day: i64, n: i64) {
+    let days = by.get(k) ?? Dict::new();
+    days.insert(day, (days.get(day) ?? 0i64) + n);
+    by.insert(k, days);
+}
+
+fn flat(by: Dict<str, Dict<i64, i64>>) -> List<Count> {
+    let out: List<Count> = List::new();
+    for k in by.keys() {
+        let (name, version) = k.split_once("@") ?? (k, "");
+        let days = by[k];
+        for d in days.keys() {
+            if days[d] > 0i64 { out.push(Count { name: name, version: version, day: d, n: days[d] }); }
+        }
+    }
+    out.sort_by(|a: Count, b: Count| if a.name != b.name { a.name.cmp(b.name) } else if a.version != b.version { a.version.cmp(b.version) } else { a.day.cmp(b.day) });
+    out
+}
+
+/// Total and recent downloads by `name@version`.
+pub fn sums(cs: List<Count>, today: i64) -> Dict<str, (i64, i64)> {
+    let out: Dict<str, (i64, i64)> = Dict::new();
+    for c in cs {
+        let k = c.name + "@" + c.version;
+        let (t, r) = out.get(k) ?? (0i64, 0i64);
+        out.insert(k, (t + c.n, if c.day > today - RECENT { r + c.n } else { r }));
+    }
+    out
+}
+
+/// Load the counts and write them once a minute while any changed. A
+/// file that cannot be read is kept as `downloads.nabion.bad` and the
+/// counting starts over.
+pub fn start(dir: str) {
+    let cs = try read(dir) catch e {
+        eprintln(f"downloads: {file_of(dir)}: {e}; kept as {file_of(dir)}.bad, counting from 0");
+        try fs::rename(file_of(dir), file_of(dir) + ".bad") catch _ {};
+        List::new()
+    };
+    using g = COUNTS.lock() {
+        let by: Dict<str, Dict<i64, i64>> = Dict::new();
+        for c in fold(cs, today()) { add(by, c.name + "@" + c.version, c.day, c.n); }
+        g.set(by);
+    }
+    let t = thread::spawn(|| {
+        let asked = now_secs();
+        let pending = false;
+        loop {
+            thread::sleep(Duration::secs(FLUSH_SECS));
+            if DIRTY.swap(0) == 1 {
+                try flush(dir) catch e {
+                    eprintln(f"downloads: {e}");
+                    DIRTY.store(1);
+                };
+                pending = true;
+            }
+            if pending && now_secs() - asked >= REBUILD_SECS {
+                STALE.store(1);
+                asked = now_secs();
+                pending = false;
+            }
+        }
+        0
+    });
+    t.detach();
+}
+
+/// Count one download of `version` of `k` (`index::key`).
+pub fn count(k: str, version: str) {
+    using g = COUNTS.lock() {
+        let by = g.get();
+        add(by, k + "@" + version, today(), 1i64);
+        g.set(by);
+    }
+    DIRTY.store(1);
+}
+
+fn snapshot() -> List<Count> {
+    using g = COUNTS.lock() { fold(flat(g.get()), today()) }
+}
+
+/// Total and recent downloads of `version` of `k`, as counted so far.
+pub fn of(k: str, version: str) -> (i64, i64) {
+    let t = today();
+    using g = COUNTS.lock() {
+        let total = 0i64;
+        let recent = 0i64;
+        if let days: Dict<i64, i64> = g.get().get(k + "@" + version) {
+            for d in days.keys() {
+                total += days[d];
+                if d > t - RECENT { recent += days[d]; }
+            }
+        }
+        (total, recent)
+    }
+}
+
+/// Write the counts, folded, to `dir/downloads.nabion` in one rename.
+pub fn flush(dir: str) throws {
+    try fs::write_atomic(file_of(dir), (try nabion::to_str(snapshot())) + "\n");
+}
+
+#[test]
+fn folding() {
+    let cs = [Count { name: "json", version: "1.0.0", day: 1000i64, n: 2i64 }, Count { name: "json", version: "1.0.0", day: 10i64, n: 3i64 }, Count { name: "json", version: "1.0.0", day: 0i64, n: 1i64 }, Count { name: "geom", version: "0.1.0", day: 999i64, n: 0i64 }];
+    let f = fold(cs, 1000i64);
+    assert(f.len() == 2 && f[0].day == 0i64 && f[0].n == 4i64 && f[1].day == 1000i64 && f[1].n == 2i64, "folded");
+    let s = sums(cs, 1000i64);
+    assert(s["json@1.0.0"] == (6i64, 2i64) && s["geom@0.1.0"] == (0i64, 0i64), "sums");
+    assert(sums(f, 1000i64)["json@1.0.0"] == (6i64, 2i64), "folding keeps the sums");
+    // The oldest recent day is today - RECENT + 1.
+    assert(sums([Count { name: "a", version: "1", day: 911i64, n: 1i64 }, Count { name: "a", version: "1", day: 910i64, n: 1i64 }], 1000i64)["a@1"] == (2i64, 1i64), "window");
+    let dir = f"{std::env::temp_dir()}/nabi-packages-downloads-{std::process::id()}";
+    try fs::create_dir_all(dir) catch e { panic(f"{e}"); };
+    count("x", "1.0.0");
+    count("x", "1.0.0");
+    assert(of("x", "1.0.0") == (2i64, 2i64) && of("x", "2.0.0") == (0i64, 0i64), "counted");
+    try flush(dir) catch e { panic(f"{e}"); };
+    let back = try read(dir) catch e { panic(f"{e}"); };
+    try fs::remove_dir_all(dir) catch _ {};
+    assert(back.len() == 1 && back[0].name == "x" && back[0].n == 2i64 && back[0].day == today(), "written");
+}
