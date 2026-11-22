@@ -157,6 +157,79 @@ fn package_info(cfg: Cfg, db: Db, native: bool, name: str) throws (ApiError) -> 
     nabion_resp(200, "Package", [("name", Value::Str(name)), ("native", Value::Bool(native)), ("owners", Value::List(owners)), ("orgs", Value::List(orgs)), ("versions", Value::List(list)), ("official", Value::Bool(official))])
 }
 
+/// One version in `GET /api/v1/docs`: its commit and the state of its
+/// docs (docs::Status: `ok`, `nolib`, `failed`; `""` when none are kept).
+#[derive(Nabion)]
+pub struct DocsVersion {
+    pub version: str;
+    pub yanked: bool;
+    pub repository: str;
+    pub rev: str;
+    pub docs: str;
+}
+
+#[derive(Nabion)]
+pub struct DocsPackage {
+    pub name: str;
+    pub description: str;
+    /// The newest version's normal dependencies, by package name.
+    pub deps: List<str>;
+    pub official: bool;
+    /// Oldest first, as the index lists them.
+    pub versions: List<DocsVersion>;
+}
+
+/// `GET /api/v1/docs`: every package and its versions, with where each
+/// version's source is and whether its docs were made, for the docs site
+/// (docs.nabi-lang.org/packages), which then asks for the docs of each
+/// version it has not got yet. No token needed.
+fn docs_index(cfg: Cfg, db: Db) throws (ApiError) -> Resp {
+    let out: List<DocsPackage> = List::new();
+    let store = cfg.data + "/docs";
+    for name in try index::names(cfg.index, false) {
+        let k = index::key(name);
+        if removal_of(db, k, "") is Removal { continue; }
+        let text = try fs::read_to_str(cfg.index + "/" + packages::shard(name)) catch _ { continue; };
+        let p = DocsPackage { name: name, description: "", deps: List::new(), official: false, versions: List::new() };
+        let all: List<packages::Version> = List::new();
+        for line in text.split("\n") {
+            if line.trim().is_empty() { continue; }
+            let (n, v) = try packages::parse_line(line) catch _ { continue; };
+            if n != name || removal_of(db, k, v.version) is Removal { continue; }
+            let st = if let d: docs::Docs = docs::stored(store, k, v.version) { d.status.state } else { "" };
+            p.versions.push(DocsVersion { version: v.version, yanked: v.yanked, repository: v.url, rev: v.rev, docs: st });
+            all.push(v);
+        }
+        if all.is_empty() { continue; }
+        let latest = packages::pick_latest(all);
+        p.official = latest.official;
+        for d in latest.deps {
+            if d.kind == "normal" && d.registry.is_empty() { p.deps.push(packages::real(d)); }
+        }
+        for r in fill_owner_ids(db) {
+            if r.name == k && r.version == latest.version { p.description = r.meta.description; }
+        }
+        out.push(p);
+    }
+    let text = try nabion::to_str(out) catch e { throw index::err(500, f"docs index: {e}"); };
+    Resp { status: 200, headers: ["Content-Type: application/nabion; charset=utf-8", "Cache-Control: no-store"], body: text + "\n", file: "" }
+}
+
+/// `GET /api/v1/packages/<name>/<version>/docs`: the docs the registry
+/// made of that version (web::apidoc::Module, as `nabi doc` lays them
+/// out) and their status, for the docs site to render.
+fn docs_of(cfg: Cfg, db: Db, name: str, version: str) throws (ApiError) -> Resp {
+    if !packages::is_name(name) || !index::is_version(version) { throw index::err(404, "no such package version"); }
+    let k = index::key(name);
+    try gone(db, k, name, version);
+    let d = docs::dir_of(cfg.data + "/docs", k, version);
+    let st = try fs::read_to_str(d + "/status.nabion") catch _ { throw index::err(404, f"{name} {version} has no docs yet"); };
+    let api = if fs::exists(d + "/api.nabion") { try fs::read_to_str(d + "/api.nabion") catch e { throw index::err(500, f"docs: {e}"); } } else { "[]" };
+    let body = f"PackageDocs {{ name: \"{name}\", version: \"{version}\", status: {st.trim()}, api: {api.trim()} }}\n";
+    // A version's docs change only when the scan's generation does.
+    Resp { status: 200, headers: ["Content-Type: application/nabion; charset=utf-8", "Cache-Control: public, max-age=3600"], body: body, file: "" }
+}
+
 /// `GET /api/v1/packages/<name>/<version>/readme`: the README text sent
 /// with that version, as Markdown.
 fn readme_of(cfg: Cfg, db: Db, native: bool, name: str, version: str) throws (ApiError) -> Resp {
@@ -485,6 +558,12 @@ fn yank(cfg: Cfg, db: Db, auth: Auth, body: str) throws (ApiError) -> Resp {
 }
 
 fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
+    if r.path == "/api/v1/docs" {
+        if r.method != "GET" && r.method != "HEAD" { throw index::err(405, "use GET /api/v1/docs"); }
+        try limit::check("read:" + client, limit::READS);
+        let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
+        return try docs_index(cfg, db);
+    }
     for (prefix, native) in [("/api/v1/packages/", false), ("/api/v1/native/", true)] {
         if let rest: str = r.path.strip_prefix(prefix) {
             let parts: List<str> = List::new();
@@ -495,6 +574,7 @@ fn api(cfg: Cfg, r: Request, client: str) throws (ApiError) -> Resp {
             let db = try load_db(cfg) catch e { throw index::err(500, f"data: {e}"); };
             if parts.len() == 3 && parts[2] == "readme" { return try readme_of(cfg, db, native, parts[0], parts[1]); }
             if parts.len() == 3 && parts[2] == "download" && !native { return try download(cfg, db, parts[0], parts[1]); }
+            if parts.len() == 3 && parts[2] == "docs" && !native { return try docs_of(cfg, db, parts[0], parts[1]); }
             if parts.len() != 1 { throw index::err(404, "no such API route"); }
             return try package_info(cfg, db, native, parts[0]);
         }
