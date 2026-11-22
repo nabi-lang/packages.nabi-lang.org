@@ -106,18 +106,29 @@ cookie_of() { grep -i "^set-cookie: $1=" "$T/h" | head -1 | sed -e "s/^[^=]*=//"
 expect_code() { [ "$code" = "$1" ] || fail "$2: HTTP $code, want $1: $(head -c 300 "$T/b")"; }
 expect_body() { grep -q -- "$1" "$T/b" || fail "$2: body lacks $1: $(head -c 300 "$T/b")"; }
 
-# login CODE: logs in through the callback; sets $sess and $csrf.
-login() {
+# authorize CODE: starts a login and has the fake GitHub authorize it as
+# CODE, which keeps the PKCE challenge for the token exchange; sets $state.
+authorize() {
     req GET /login
     expect_code 303 "login redirect"
-    local loc state
+    local loc back
     loc=$(header location)
     state=$(cookie_of __Host-pkg_state)
     case "$loc" in
-        "http://127.0.0.1:$gh_port/login/oauth/authorize?client_id=test-client&"*"state=$state&scope=read:user") ;;
+        "http://127.0.0.1:$gh_port/login/oauth/authorize?client_id=test-client&"*"&state=$state&code_challenge="*"&code_challenge_method=S256&scope=read:user") ;;
         *) fail "authorize url: $loc" ;;
     esac
     header set-cookie | grep -q "^__Host-pkg_state=[0-9a-f]*; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax" || fail "state cookie flags: $(header set-cookie)"
+    back=$(curl -s -o /dev/null -w '%{redirect_url}' "$loc&as=$1")
+    case "$back" in
+        *"?code=$1&state=$state") ;;
+        *) fail "authorize: $back" ;;
+    esac
+}
+
+# login CODE: logs in through the callback; sets $sess and $csrf.
+login() {
+    authorize "$1"
     req GET "/auth/github/callback?code=$1&state=$state" -H "Cookie: __Host-pkg_state=wrong"
     expect_code 400 "state mismatch"
     req GET "/auth/github/callback?code=$1&state=$state" -H "Cookie: __Host-pkg_state=$state"
@@ -221,6 +232,20 @@ ok "csp reports"
 # HEAD /me answers as GET does: logged out, the way to log in.
 code=$(curl -s -I -o /dev/null -w '%{http_code}' "$base/me")
 [ "$code" = 303 ] || fail "HEAD /me logged out: $code, want 303"
+
+# PKCE: the token exchange sends the verifier of its own login. The fake
+# keeps the latest challenge for a code, so an older login's is refused,
+# and a verifier is used once.
+authorize user
+first=$state
+authorize user
+req GET "/auth/github/callback?code=user&state=$first" -H "Cookie: __Host-pkg_state=$first"
+expect_code 400 "an older login's verifier"
+expect_body "GitHub refused the login" "pkce mismatch body"
+req GET "/auth/github/callback?code=user&state=$first" -H "Cookie: __Host-pkg_state=$first"
+expect_code 400 "a verifier used twice"
+expect_body "The login expired" "used verifier body"
+ok "pkce"
 
 login user
 expect_body "Publishing is not open yet" "non-admin page"
@@ -823,8 +848,7 @@ req POST /api/v1/admin/lock "${auth[@]}" --data-binary 'Lock { id: 1002, reason:
 expect_code 200 "lock an account"
 req GET /me -H "Cookie: __Host-pkg_session=$bob_sess"
 expect_code 303 "a locked account's session ends"
-req GET /login
-state=$(cookie_of __Host-pkg_state)
+authorize user
 req GET "/auth/github/callback?code=user&state=$state" -H "Cookie: __Host-pkg_state=$state"
 expect_code 403 "a locked account cannot log in"
 expect_body "locked this account: spam" "locked login body"

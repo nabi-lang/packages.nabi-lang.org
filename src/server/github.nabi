@@ -68,10 +68,11 @@ pub fn display_name(raw: str) -> str {
     out.to_str()
 }
 
-/// The GitHub account behind an OAuth `code`.
-pub fn github_user(cfg: Cfg, code: str) throws (ApiError) -> Account {
+/// The GitHub account behind an OAuth `code`, its PKCE `verifier` sent
+/// along.
+pub fn github_user(cfg: Cfg, code: str, verifier: str) throws (ApiError) -> Account {
     let callback = cfg.url + "/auth/github/callback";
-    let data = f"client_id={http::pct_encode(cfg.client_id)}&client_secret={http::pct_encode(cfg.client_secret)}&code={http::pct_encode(code)}&redirect_uri={http::pct_encode(callback)}";
+    let data = f"client_id={http::pct_encode(cfg.client_id)}&client_secret={http::pct_encode(cfg.client_secret)}&code={http::pct_encode(code)}&redirect_uri={http::pct_encode(callback)}&code_verifier={http::pct_encode(verifier)}";
     let ua = "header = " + cq("User-Agent: packages.nabi-lang.org") + "\n";
     let tok = json::fields(try curl(f"url = {cq(cfg.oauth + "/login/oauth/access_token")}\n{ua}header = {cq("Accept: application/json")}\ndata = {cq(data)}\n"));
     let access = tok.get("access_token") ?? "";

@@ -15,7 +15,9 @@ use pkg::server::store::{Account, Db, Locked, MAX_SESSIONS, SESSION_COOKIE, Sess
 use pkg::server::{Cfg, Resp, cookie, counts, LOCK, message, nabion_resp, redirect};
 use pkg::trust;
 use pkg::trust::{TrustedPublisher, TrustToken};
+use core::crypto::HashAlgorithm;
 use core::crypto::rsa::PublicKey;
+use core::encoding::base64;
 use std::env;
 use std::fs;
 use std::nabion;
@@ -31,24 +33,87 @@ const SESSION_SECS: i64 = 2592000;
 /// The body of a token exchange; GitHub's OIDC tokens are about 1 KiB.
 const MAX_EXCHANGE: usize = 16384;
 
-pub fn login(cfg: Cfg) throws -> Resp {
+/// How long a login may take between /login and the callback.
+const STATE_SECS: i64 = 600i64;
+
+/// Logins in progress, at most this many at once.
+const PENDING_MAX: usize = 4096;
+
+/// A login in progress: its PKCE code verifier, kept here and never sent
+/// to the browser, and when it lapses.
+struct Pending {
+    verifier: str;
+    expires: i64;
+}
+
+/// Logins in progress by the SHA-256 of their state. In memory: a login
+/// cut by a restart is started again.
+static PENDING: Mutex<Dict<str, Pending>> = Mutex::new(Dict::new());
+
+/// The PKCE (RFC 7636) S256 code challenge of `verifier`.
+pub fn pkce_challenge(verifier: str) -> str {
+    base64::encode(HashAlgorithm::Sha256.digest(verifier), base64::URL_SAFE_NO_PAD)
+}
+
+/// Keep `verifier` for `state`; false when too many logins are open.
+fn remember(state: str, verifier: str) -> bool {
+    let now = now_secs();
+    using g = PENDING.lock() {
+        let d = g.get();
+        if d.len() >= PENDING_MAX {
+            let keep: Dict<str, Pending> = Dict::new();
+            for (k, p) in d.iter() {
+                if p.expires > now { keep.insert(k, p); }
+            }
+            d = keep;
+            g.set(d);
+        }
+        if d.len() >= PENDING_MAX { return false; }
+        d.insert(secret::sha256_hex(state), Pending { verifier: verifier, expires: now + STATE_SECS });
+    }
+    true
+}
+
+/// The verifier kept for `state`, used up; none when the login lapsed
+/// or did not start here.
+fn take(state: str) -> str | none {
+    let k = secret::sha256_hex(state);
+    using g = PENDING.lock() {
+        let d = g.get();
+        let p = d.get(k) ?? { return none; };
+        d.remove(k);
+        if p.expires <= now_secs() { return none; }
+        return p.verifier;
+    }
+}
+
+pub fn login(cfg: Cfg, site: Site, path: str) throws -> Resp {
     let state = try secret::random_hex(16);
-    let to = f"{cfg.oauth}/login/oauth/authorize?client_id={http::pct_encode(cfg.client_id)}&redirect_uri={http::pct_encode(cfg.url + "/auth/github/callback")}&state={state}&scope=read:user";
-    redirect(to, [cookie(STATE_COOKIE, state, 600i64)])
+    // 64 hex digits: within RFC 7636's 43 to 128 unreserved characters.
+    let verifier = try secret::random_hex(32);
+    if !remember(state, verifier) {
+        let m = message(site, path, 503, "Too many logins", "Too many logins are in progress. Wait a minute, then log in again.");
+        m.headers.push("Retry-After: 60");
+        return m;
+    }
+    let to = f"{cfg.oauth}/login/oauth/authorize?client_id={http::pct_encode(cfg.client_id)}&redirect_uri={http::pct_encode(cfg.url + "/auth/github/callback")}&state={state}&code_challenge={pkce_challenge(verifier)}&code_challenge_method=S256&scope=read:user";
+    redirect(to, [cookie(STATE_COOKIE, state, STATE_SECS)])
 }
 
 pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
     let q = http::form(r.query);
     let state = q.get("state") ?? "";
     let want = http::cookie(r, STATE_COOKIE);
+    let expired = "The login expired or did not start here. Log in again.";
     if want.is_empty() || !secret::same(state, want) {
-        return message(site, r.path, 400, "Login failed", "The login expired or did not start here. Log in again.");
+        return message(site, r.path, 400, "Login failed", expired);
     }
+    let verifier = take(state) ?? { return message(site, r.path, 400, "Login failed", expired); };
     let code = q.get("code") ?? "";
     if code.is_empty() {
-        return message(site, r.path, 400, "Login cancelled", "GitHub did not authorize the login.");
+        return message(site, r.path, 400, "Login cancelled", "GitHub did not authorize the login. Log in again and authorize the app on GitHub.");
     }
-    let gh = try github_user(cfg, code) catch e {
+    let gh = try github_user(cfg, code, verifier) catch e {
         return message(site, r.path, e.status, "Login failed", e.msg);
     };
     let id = gh.id;
@@ -218,4 +283,13 @@ pub fn signed_in(site: Site, r: Request, resp: Resp, v: Viewer) -> Resp {
     }
     headers.push("Cache-Control: no-store");
     Resp { status: resp.status, headers: headers, body: layout::signed_in(text, v.account.login, v.account.id, v.csrf), file: "" }
+}
+
+#[test]
+fn pkce() {
+    // RFC 7636, appendix B.
+    assert(pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "S256");
+    let st = try! secret::random_hex(16);
+    assert(remember(st, "v1"), "kept");
+    assert((take("x" + st) ?? "") == "" && (take(st) ?? "") == "v1" && take(st) is none, "used once");
 }

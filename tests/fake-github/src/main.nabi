@@ -3,7 +3,10 @@
 //
 //   fake_github <addr> <client secret>
 //
-// Code `admin` logs in as `alice` (id 1001), `user` as `Bob` (id 1002).
+// `GET /login/oauth/authorize?..&as=<code>` keeps the PKCE challenge for
+// that code and redirects back with it; the token exchange then wants the
+// matching code_verifier. Code `admin` logs in as `alice` (id 1001),
+// `user` as `Bob` (id 1002).
 // Repositories of `acme` exist, owned by id 4242, and of `nabi-lang`,
 // owned by id 5151; `/users/` knows the organisations `acme` and
 // `nabi-lang` and the user `carol` (id 3003). The issuer is
@@ -63,7 +66,15 @@ fn jwks() -> str {
     f"{{\"keys\":[{{\"kty\":\"RSA\",\"alg\":\"RS256\",\"use\":\"sig\",\"kid\":\"e2e\",\"n\":\"{b64(n)}\",\"e\":\"{b64(e)}\"}}]}}"
 }
 
-fn answer(s: TcpStream, secret: str, addr: str) throws {
+/// Parameter `key` of a query or form body, as sent.
+fn param(q: str, key: str) -> str {
+    for kv in q.split("&") {
+        if let v: str = kv.strip_prefix(key + "=") { return v; }
+    }
+    ""
+}
+
+fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>) throws {
     let data: List<u8> = List::new();
     let buf: List<u8> = List::with_capacity(4096);
     for _ in 0..4096 { buf.push(0u8); }
@@ -85,10 +96,25 @@ fn answer(s: TcpStream, secret: str, addr: str) throws {
     let body = (text.split_once("\r\n\r\n") ?? ("", "")).1;
     let out = "{\"message\":\"Not Found\"}";
     let status = "404 Not Found";
-    if line.0.starts_with("POST /login/oauth/access_token ") && text.contains("\r\nAccept: application/json\r\n") {
+    let extra = "";
+    if let rest: str = line.0.strip_prefix("GET /login/oauth/authorize?") {
+        let q = (rest.split_once(" ") ?? (rest, "")).0;
+        let code = param(q, "as");
+        status = "400 Bad Request";
+        if param(q, "code_challenge_method") == "S256" && !param(q, "code_challenge").is_empty() && !code.is_empty() {
+            pkce.insert(code, param(q, "code_challenge"));
+            status = "302 Found";
+            out = "";
+            extra = f"Location: https://packages.test/auth/github/callback?code={code}&state={param(q, "state")}\r\n";
+        }
+    } else if line.0.starts_with("POST /login/oauth/access_token ") && text.contains("\r\nAccept: application/json\r\n") {
         status = "200 OK";
         out = "{\"error\":\"bad_verification_code\"}";
-        if body.contains(f"client_secret={secret}") && body.contains("redirect_uri=") {
+        let code = param(body, "code");
+        let want = pkce.get(code) ?? "";
+        pkce.remove(code);
+        let verifier = param(body, "code_verifier");
+        if body.contains(f"client_secret={secret}") && body.contains("redirect_uri=") && !want.is_empty() && b64(HashAlgorithm::Sha256.digest(verifier)) == want {
             if body.contains("code=admin&") { out = "{\"access_token\":\"gho_alice\",\"token_type\":\"bearer\",\"scope\":\"read:user\"}"; }
             if body.contains("code=user&") { out = "{\"access_token\":\"gho_bob\",\"token_type\":\"bearer\",\"scope\":\"read:user\"}"; }
         }
@@ -138,14 +164,15 @@ fn answer(s: TcpStream, secret: str, addr: str) throws {
             out = "{\"login\":\"Bob\",\"id\":1002,\"type\":\"User\"}";
         }
     }
-    try s.write_all(f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {out.len()}\r\nConnection: close\r\n\r\n{out}");
+    try s.write_all(f"HTTP/1.1 {status}\r\n{extra}Content-Type: application/json\r\nContent-Length: {out.len()}\r\nConnection: close\r\n\r\n{out}");
 }
 
 fn main() throws {
     let args = env::args();
+    let pkce: Dict<str, str> = Dict::new();
     using l = try net::tcp_listen(args[1]) {
         try for s in l.incoming() {
-            try answer(s, args[2], args[1]) catch e { eprintln(f"fake github: {e}"); };
+            try answer(s, args[2], args[1], pkce) catch e { eprintln(f"fake github: {e}"); };
             try s.close() catch _ {};
         }
     }
