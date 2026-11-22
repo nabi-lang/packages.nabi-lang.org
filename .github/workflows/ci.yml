@@ -1,10 +1,14 @@
 # Every commit of a pull request is signed off (CONTRIBUTING.md, Sign your
-# work).
-name: CI / DCO sign-off
+# work), and the registry builds and passes its checks: the unit tests,
+# the demo site with no broken link, and the end-to-end test of serve.
+name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
   merge_group:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,11 +18,52 @@ jobs:
     name: DCO
     uses: nabi-lang/.github/.github/workflows/reusable-dco.yml@v1.0.3
 
+  build:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: packages.nabi-lang.org
+    steps:
+      # This repository and the packages it builds with, side by side as
+      # nabi.nabion names them.
+      - uses: actions/checkout@v4
+        with:
+          path: packages.nabi-lang.org
+          submodules: true
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with: { repository: nabi-lang/markdown, path: markdown, persist-credentials: false }
+      - uses: actions/checkout@v4
+        with: { repository: nabi-lang/nabi-syntax, path: nabi-syntax, persist-credentials: false }
+      - name: Install the toolchain
+        run: |
+          curl -fsSL https://nabi.sh | sh
+          echo "$HOME/.nabi/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages.nabi-lang.org/package-lock.json
+      # The kit's scripts are built into the program, so they come first.
+      - name: Page scripts
+        run: |
+          npm ci
+          npm run build
+          npm run check
+      - name: Tests
+        run: nabi test
+      - name: Demo site
+        run: nabi run -- check --demo --offline
+      - name: End-to-end
+        run: tests/e2e.sh
+
   # The one required check (rulesets/main.json): passes when every job
   # passed or was skipped.
   ci-gate:
     name: CI gate
-    needs: [dco]
+    needs: [dco, build]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
