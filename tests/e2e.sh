@@ -126,6 +126,8 @@ login() {
     [ ${#sess} = 64 ] || fail "session cookie"
     req GET /me -H "Cookie: __Host-pkg_session=$sess"
     expect_code 200 "/me"
+    code=$(curl -s -I -o /dev/null -w '%{http_code}' -H "Cookie: __Host-pkg_session=$sess" "$base/me")
+    [ "$code" = 200 ] || fail "HEAD /me: $code, want 200"
     csrf=$(sed -n 's/.*name="csrf" value="\([0-9a-f]*\)".*/\1/p' "$T/b" | head -1)
     [ -n "$csrf" ] || fail "no csrf token on /me"
 }
@@ -209,6 +211,10 @@ n=$(grep -c 'csp: script-src blocked https://csp-flood.test/x' "$T/server.log")
 req GET /_csp
 expect_code 405 "csp report GET"
 ok "csp reports"
+
+# HEAD /me answers as GET does: logged out, the way to log in.
+code=$(curl -s -I -o /dev/null -w '%{http_code}' "$base/me")
+[ "$code" = 303 ] || fail "HEAD /me logged out: $code, want 303"
 
 login user
 expect_body "Publishing is not open yet" "non-admin page"

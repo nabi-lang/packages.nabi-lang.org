@@ -169,9 +169,9 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
     let db = try load_db(cfg);
     let s = session_of(db, r) ?? Session { hash: "", account: 0i64, csrf: "", expires: 0i64 };
     if s.hash.is_empty() {
-        return if r.method == "GET" { redirect("/login", []) } else { message(site, r.path, 401, "Not logged in", "Log in first.") };
+        return if r.method == "GET" || r.method == "HEAD" { redirect("/login", []) } else { message(site, r.path, 401, "Not logged in", "Log in first.") };
     }
-    if r.method == "GET" { return me_page(cfg, site, r.path, db, s, ""); }
+    if r.method == "GET" || r.method == "HEAD" { return me_page(cfg, site, r.path, db, s, ""); }
     if !limit::allow("ip:" + client, 2i64 * cfg.rate) || !limit::allow(f"acct:{s.account}", cfg.rate) {
         let m = message(site, r.path, 429, "Too many changes", "Wait a minute, then send the form again.");
         m.headers.push("Retry-After: 60");
