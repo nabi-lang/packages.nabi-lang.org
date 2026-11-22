@@ -218,6 +218,7 @@ html:not(.js) .ipanel+.ipanel{border-top:1px solid var(--line)}
 .vers a.v[aria-current]{font-weight:600}
 .tbl a.v{font-family:var(--mono);color:var(--ink)}
 .kws a{margin-right:8px}
+.kv dd.badge{display:flex;align-items:center;gap:8px}
 .vers .tag{margin-left:0}
 .vers .c{margin-left:auto;font-size:13px;line-height:18px;color:var(--ink-3)}
 .vers>.t-small{color:var(--ink-3)}

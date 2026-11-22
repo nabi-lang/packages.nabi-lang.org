@@ -61,6 +61,8 @@ python3 -m http.server -d public 8000
 
 `/categories` and `/keywords` list every category and keyword the packages' latest versions name, with how many packages have each; `/categories/<slug>` and `/keywords/<slug>` list those packages, official first, then by name. The slug is the word in lowercase ASCII letters and digits, each run of anything else one `-` (`Linear Algebra` is `/keywords/linear-algebra`); a word with no letter or digit in ASCII has no page and its chip searches for it instead. The side panel's keyword and category chips link these pages; on an old version's page, whose words may have changed since, they search. They are in the sitemap like every page.
 
+Each package has a badge at `/packages/<name>/badge.svg` for its README: a flat, shields-style `nabi | v<latest>` (blue; orange for a pre-release, grey and `yanked` when every version is), with a `<title>` and `aria-label` naming the package and version. It is written with the site, so it changes with each build, and is served like a page (`web::http::FRESH`: checked on every load, kept a day by the CDN). The side panel shows it with its Markdown to copy.
+
 ## Server
 
 `nabi run -- serve` serves `public/` and the API over plain HTTP on `PACKAGES_ADDR` (TLS ends at a reverse proxy). Run it from this directory (reads `site.nabion` and `.env`). At start and after each index commit it rebuilds the site in the background. `GET /api/health` answers `ok`, `nabi <release>` (the toolchain the footer names) and `packages <count>`, one a line, or a 503 `failing` while the package list cannot be read.

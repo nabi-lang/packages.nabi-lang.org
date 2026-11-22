@@ -773,6 +773,13 @@ req GET "/packages?q=gemo"
 expect_code 200 "typo search"
 expect_body 'Showing results for <a class="fixed" href="/packages?q=geom"><q>geom</q></a>' "typo corrected"
 expect_body '<b class="nm"><mark>geom</mark></b>' "typo results"
+req GET /packages/geom/badge.svg
+expect_code 200 "badge"
+[ "$(header content-type)" = "image/svg+xml" ] || fail "badge type: $(header content-type)"
+[ "$(header cache-control)" = "public, max-age=0, s-maxage=86400, stale-if-error=86400" ] || fail "badge cache: $(header cache-control)"
+expect_body '<title>geom: v[0-9.]* on packages.nabi-lang.org</title>' "badge title"
+req GET /packages/geom
+expect_body '<dt>Badge</dt><dd class="badge"><img src="/packages/geom/badge.svg"' "badge on the page"
 req GET /categories
 expect_code 200 "categories"
 expect_body '<a href="/categories/mathematics">Mathematics</a><span class="ct">' "category count"

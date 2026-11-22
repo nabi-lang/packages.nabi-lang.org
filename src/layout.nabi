@@ -1038,6 +1038,7 @@ fn side(site: Site, s: Package) -> str {
     }
     if !m.homepage.is_empty() { kv.push_str(f"<dt>Homepage</dt><dd><a href=\"{esc(m.homepage)}\">{esc(bare(m.homepage))}</a></dd>"); }
     if !m.documentation.is_empty() { kv.push_str(f"<dt>Documentation</dt><dd><a href=\"{esc(m.documentation)}\">{esc(bare(m.documentation))}</a></dd>"); }
+    kv.push_str(badge_kv(site, s));
     if let f: packages::Facts = s.facts {
         kv.push_str(f"<dt>Size</dt><dd>{size(f.bytes)} in {plural(f.files, "file", "files")}</dd>");
         if f.nabi_files > 0 { kv.push_str(f"<dt>Nabi code</dt><dd title=\"Lines that are not blank, in .nabi files\">{plural(f.nabi_lines, "line", "lines")} in {plural(f.nabi_files, "file", "files")}</dd>"); }
@@ -1061,6 +1062,58 @@ fn side(site: Site, s: Package) -> str {
 {owners_box(s)}{publishers_box(s)}<section class=\"vers\"><h2 class=\"t-label\">Versions</h2><ul>{vb.to_str()}</ul>{dates_note(s)}{more}</section>
 </aside>
 "
+}
+
+// Badges: `/packages/<name>/badge.svg`, the latest version as a flat
+// shields-style badge for READMEs.
+
+/// The badge of package `name`.
+pub fn badge_out(name: str) -> str { f"packages/{name}/badge.svg" }
+
+/// About how wide `text` is in 11px Verdana, as the badge draws it.
+fn text_px(text: str) -> i64 {
+    let w = 0i64;
+    for c in text.chars() {
+        w += match c {
+            'i' | 'l' | 'j' | '|' | '\'' => 30i64,
+            '.' | ',' | ':' | ' ' | 'f' => 39i64,
+            't' => 43i64,
+            'r' | '-' | '(' | ')' => 46i64,
+            'm' => 107i64,
+            'w' => 89i64,
+            'M' | 'W' => 99i64,
+            x => if x >= 'A' && x <= 'Z' { 75i64 } else if x >= '0' && x <= '9' { 70i64 } else { 65i64 },
+        };
+    }
+    (w + 9i64) / 10i64
+}
+
+/// The flat badge of `s`: `nabi | v<latest>`, blue; orange for a
+/// pre-release, grey when every version is yanked. Its title and
+/// aria-label say the same for screen readers.
+pub fn badge(s: Package) -> str {
+    let l = s.latest;
+    let (value, color) = if l.yanked { ("yanked", "#9f9f9f") } else if packages::is_pre(l.version) { ("v" + l.version, "#fe7d37") } else { ("v" + l.version, "#007ec6") };
+    let label = "nabi";
+    let lw = text_px(label) + 10i64;
+    let vw = text_px(value) + 10i64;
+    let w = lw + vw;
+    let title = esc(f"{s.name}: {value} on packages.nabi-lang.org");
+    let lx = lw * 5i64;
+    let vx = lw * 10i64 + vw * 5i64;
+    let lt = (lw - 10i64) * 10i64;
+    let vt = (vw - 10i64) * 10i64;
+    let v = esc(value);
+    f"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"20\" role=\"img\" aria-label=\"{title}\"><title>{title}</title><linearGradient id=\"s\" x2=\"0\" y2=\"100%\"><stop offset=\"0\" stop-color=\"#bbb\" stop-opacity=\".1\"/><stop offset=\"1\" stop-opacity=\".1\"/></linearGradient><clipPath id=\"r\"><rect width=\"{w}\" height=\"20\" rx=\"3\" fill=\"#fff\"/></clipPath><g clip-path=\"url(#r)\"><rect width=\"{lw}\" height=\"20\" fill=\"#555\"/><rect x=\"{lw}\" width=\"{vw}\" height=\"20\" fill=\"{color}\"/><rect width=\"{w}\" height=\"20\" fill=\"url(#s)\"/></g><g fill=\"#fff\" text-anchor=\"middle\" font-family=\"Verdana,Geneva,DejaVu Sans,sans-serif\" text-rendering=\"geometricPrecision\" font-size=\"110\"><text aria-hidden=\"true\" x=\"{lx}\" y=\"150\" fill=\"#010101\" fill-opacity=\".3\" transform=\"scale(.1)\" textLength=\"{lt}\">{label}</text><text x=\"{lx}\" y=\"140\" transform=\"scale(.1)\" fill=\"#fff\" textLength=\"{lt}\">{label}</text><text aria-hidden=\"true\" x=\"{vx}\" y=\"150\" fill=\"#010101\" fill-opacity=\".3\" transform=\"scale(.1)\" textLength=\"{vt}\">{v}</text><text x=\"{vx}\" y=\"140\" transform=\"scale(.1)\" fill=\"#fff\" textLength=\"{vt}\">{v}</text></g></svg>\n"
+}
+
+/// The side panel's badge: the image and its Markdown to copy.
+fn badge_kv(site: Site, s: Package) -> str {
+    if !s.at.is_empty() && s.at != s.top { return ""; }
+    let page = site.base_url + url(package_out(s.name));
+    let src = url(badge_out(s.name));
+    let md = f"[![{s.name} on packages.nabi-lang.org]({site.base_url}{src})]({page})";
+    f"<dt>Badge</dt><dd class=\"badge\"><img src=\"{esc(src)}\" alt=\"{esc(s.name)} {esc(if s.latest.yanked { "yanked" } else { "v" + s.latest.version })}\" height=\"20\" loading=\"lazy\">{chrome::copy_button(md, false)}</dd>"
 }
 
 /// A count of downloads, grouped by thousands.
@@ -1435,4 +1488,17 @@ fn browse_pages() {
     assert(title == "Categories" && body.contains("<a href=\"/categories/science\">Science</a><span class=\"ct\">3</span>") && body.contains("2 categories"), body);
     let (tt, _about, tb) = topic_page(ts[1], true);
     assert(tt == "Category: Science" && tb.contains("3 packages") && tb.contains("href=\"/packages/c\""), tb);
+}
+
+#[test]
+fn badges() {
+    let v = Version { version: "1.2.0", deps: List::new(), url: "", rev: "", tree: "", yanked: false, features: List::new() };
+    let s = Package { name: "json", file: "", versions: [v], latest: v, time: 0i64, date: "", readme: "", desc: "", rdeps: List::new(), facts: none, api: List::new(), api_none: "", import: "", meta: packages::no_meta() };
+    let b = badge(s);
+    assert(b.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"") && b.contains("role=\"img\" aria-label=\"json: v1.2.0 on packages.nabi-lang.org\"><title>json: v1.2.0 on packages.nabi-lang.org</title>") && b.contains("fill=\"#007ec6\"") && b.contains(">v1.2.0</text>"), b);
+    s.latest.version = "2.0.0-rc.1";
+    assert(badge(s).contains("fill=\"#fe7d37\""), "pre-release");
+    s.latest.yanked = true;
+    assert(badge(s).contains(">yanked</text>") && badge(s).contains("fill=\"#9f9f9f\""), "yanked");
+    assert(text_px("v1.2.0") > text_px("v1") && text_px("mmm") > text_px("iii"), "widths");
 }

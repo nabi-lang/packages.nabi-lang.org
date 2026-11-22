@@ -403,9 +403,16 @@ fn main() throws {
     try write(out_root, "sitemap.xml", map.to_str());
     try write(out_root, "robots.txt", f"User-agent: *\nDisallow: /me\nSitemap: {site.base_url}/sitemap.xml\n");
     try write(out_root, "search-index.json", sx.to_str());
+    for s in all {
+        if s.library { continue; }
+        try write(out_root, layout::badge_out(s.name), layout::badge(s));
+    }
     try write(out_root, ".packages.nabion", (try nabion::to_str(rows)) + "\n");
     let statics: Set<str> = Set::new();
     statics.insert("search-index.json");
+    for s in all {
+        if !s.library { statics.insert(layout::badge_out(s.name)); }
+    }
     // Served by `serve`, not files.
     statics.insert("login");
     statics.insert("me");
