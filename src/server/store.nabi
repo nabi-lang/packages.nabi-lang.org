@@ -7,6 +7,7 @@
 use pkg::index;
 use pkg::meta;
 use pkg::meta::{Release, Actor};
+use pkg::osv::Advisory;
 use pkg::secret;
 use pkg::server::Cfg;
 use pkg::server::tables;
@@ -209,7 +210,8 @@ pub struct Event {
     pub who: str;
     /// `publish`, `yank`, `unyank`, `owner-invite`, `owner-add`,
     /// `owner-decline`, `owner-remove`, `trusted-add`, `trusted-remove`,
-    /// `token-create`, `token-revoke`.
+    /// `token-create`, `token-revoke`, `advisory-draft`, `advisory-edit`,
+    /// `advisory-publish`, `advisory-withdraw`.
     pub action: str;
     pub detail: str = "";
 }
@@ -238,6 +240,8 @@ pub struct Db {
     pub approved: List<str> = List::new();
     /// What was done to each package, oldest first (record).
     pub events: List<Event> = List::new();
+    /// Security advisories, drafts included (osv.nabi).
+    pub advisories: List<Advisory> = List::new();
 }
 
 /// Keep `e` in `db`, past EVENTS_KEPT of its package the oldest going.

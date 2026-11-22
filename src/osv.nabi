@@ -1,0 +1,644 @@
+// Security advisories in the OSV format (https://ossf.github.io/osv-schema/):
+// the record, its checks, which versions it affects, its OSV JSON both
+// ways, and its pages and banners.
+//
+// An advisory is a draft (an owner's, or an admin's), published (by an
+// admin; public, and on the pages of the versions it affects) or
+// withdrawn (still public, with `withdrawn` set, as OSV keeps them, but
+// on no version's page). The NABION form is the registry's own: OSV's
+// `type` is `kind` there, and the state and who did what come along.
+
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::json;
+use pkg::packages;
+use pkg::server::account::date;
+use markdown::esc;
+
+pub const ECOSYSTEM: str = "Nabi";
+/// The OSV schema version the JSON follows.
+pub const SCHEMA: str = "1.6.0";
+
+pub const DRAFT: str = "draft";
+pub const PUBLISHED: str = "published";
+pub const WITHDRAWN: str = "withdrawn";
+
+const SUMMARY_MAX: usize = 200;
+const DETAILS_MAX: usize = 65536;
+const LIST_MAX: usize = 32;
+
+#[derive(Nabion)]
+pub struct Advisory {
+    /// `NABI-<year>-<number>`, given by the server.
+    pub id: str = "";
+    /// The same vulnerability elsewhere: `CVE-..`, `GHSA-..`.
+    pub aliases: List<str> = List::new();
+    pub summary: str = "";
+    /// Markdown.
+    pub details: str = "";
+    pub severity: List<Severity> = List::new();
+    pub affected: List<Affected> = List::new();
+    pub references: List<Reference> = List::new();
+    pub credits: List<Credit> = List::new();
+    /// RFC 3339, UTC; "" while a draft.
+    pub published: str = "";
+    pub modified: str = "";
+    /// When it was withdrawn; "" when it is not.
+    pub withdrawn: str = "";
+    /// DRAFT, PUBLISHED or WITHDRAWN.
+    pub state: str = DRAFT;
+    /// GitHub ids of who drafted, published and withdrew it.
+    pub drafted_by: i64 = 0i64;
+    pub published_by: i64 = 0i64;
+    pub withdrawn_by: i64 = 0i64;
+    pub withdrawn_reason: str = "";
+}
+
+#[derive(Nabion)]
+pub struct Severity {
+    /// `CVSS_V3` or `CVSS_V4`.
+    pub kind: str;
+    /// The CVSS vector, `CVSS:3.1/AV:N/..`.
+    pub score: str;
+}
+
+#[derive(Nabion)]
+pub struct Affected {
+    pub package: AffectedPackage;
+    pub ranges: List<Range> = List::new();
+    /// Versions affected besides the ranges.
+    pub versions: List<str> = List::new();
+}
+
+#[derive(Nabion)]
+pub struct AffectedPackage {
+    pub ecosystem: str = ECOSYSTEM;
+    pub name: str;
+}
+
+#[derive(Nabion)]
+pub struct Range {
+    pub kind: str = "SEMVER";
+    pub events: List<RangeEvent>;
+}
+
+/// One of the four, the others "".
+#[derive(Nabion)]
+pub struct RangeEvent {
+    pub introduced: str = "";
+    pub fixed: str = "";
+    pub last_affected: str = "";
+    pub limit: str = "";
+}
+
+#[derive(Nabion)]
+pub struct Reference {
+    /// ADVISORY, ARTICLE, DETECTION, DISCUSSION, REPORT, FIX, INTRODUCED,
+    /// GIT, PACKAGE, EVIDENCE or WEB.
+    pub kind: str;
+    pub url: str;
+}
+
+#[derive(Nabion)]
+pub struct Credit {
+    pub name: str;
+    pub contact: List<str> = List::new();
+    /// FINDER, REPORTER, ANALYST, COORDINATOR, REMEDIATION_DEVELOPER,
+    /// REMEDIATION_REVIEWER, REMEDIATION_VERIFIER, TOOL, SPONSOR, OTHER;
+    /// "" for none.
+    pub kind: str = "";
+}
+
+fn reference_kinds() -> List<str> { ["ADVISORY", "ARTICLE", "DETECTION", "DISCUSSION", "REPORT", "FIX", "INTRODUCED", "GIT", "PACKAGE", "EVIDENCE", "WEB"] }
+
+fn credit_kinds() -> List<str> { ["FINDER", "REPORTER", "ANALYST", "COORDINATOR", "REMEDIATION_DEVELOPER", "REMEDIATION_REVIEWER", "REMEDIATION_VERIFIER", "TOOL", "SPONSOR", "OTHER"] }
+
+/// `2026-11-22T09:05:00Z` of a unix time.
+pub fn rfc3339(t: i64) -> str {
+    let p2 = |x: i64| if x < 10i64 { f"0{x}" } else { f"{x}" };
+    let s = t % 86400i64;
+    f"{date(t)}T{p2(s / 3600i64)}:{p2((s / 60i64) % 60i64)}:{p2(s % 60i64)}Z"
+}
+
+/// The next free id of the year of `now`: `NABI-2026-0001` after none.
+pub fn next_id(all: List<Advisory>, now: i64) -> str {
+    let year = date(now)[:4];
+    let prefix = f"NABI-{year}-";
+    let top = 0i64;
+    for a in all {
+        if let n: str = a.id.strip_prefix(prefix) {
+            let k = try n.parse::<i64>() catch _ { 0i64 };
+            if k > top { top = k; }
+        }
+    }
+    let n = f"{top + 1i64}";
+    prefix + (if n.len() < 4 { "0".repeat(4 - n.len()) } else { "" }) + n
+}
+
+/// Whether `id` is shaped as the server gives them.
+pub fn is_id(id: str) -> bool {
+    let parts: List<str> = List::new();
+    for p in id.split("-") { parts.push(p); }
+    if parts.len() != 3 || parts[0] != "NABI" || parts[1].len() != 4 || parts[2].len() < 4 { return false; }
+    for p in [parts[1], parts[2]] {
+        for c in p.chars() {
+            if !c.is_ascii_digit() { return false; }
+        }
+    }
+    true
+}
+
+/// Public: published or withdrawn, not a draft.
+pub fn public(a: Advisory) -> bool { a.state == PUBLISHED || a.state == WITHDRAWN }
+
+/// Published and not withdrawn: shown on the versions it affects.
+pub fn live(a: Advisory) -> bool { a.state == PUBLISHED }
+
+/// The packages `a` names, as `index::key`s, once each.
+pub fn packages_of(a: Advisory) -> List<str> {
+    let out: List<str> = List::new();
+    for x in a.affected {
+        let k = index::key(x.package.name);
+        if !out.contains(k) { out.push(k); }
+    }
+    out
+}
+
+/// `a`'s package names as written, once each.
+pub fn names_of(a: Advisory) -> List<str> {
+    let out: List<str> = List::new();
+    for x in a.affected {
+        if !out.contains(x.package.name) { out.push(x.package.name); }
+    }
+    out
+}
+
+fn at_least(v: str, floor: str) -> bool { floor == "0" || packages::cmp_vers(v, floor) != Ordering::Less }
+
+/// Whether `r` covers `v`, as OSV evaluates a SEMVER range: from each
+/// `introduced` on, up to a `fixed` or past a `last_affected`, never
+/// from a `limit` on.
+pub fn in_range(r: Range, v: str) -> bool {
+    let es = r.events;
+    let key = |e: RangeEvent| if !e.introduced.is_empty() { e.introduced } else if !e.fixed.is_empty() { e.fixed } else if !e.last_affected.is_empty() { e.last_affected } else { e.limit };
+    let sorted: List<RangeEvent> = List::new();
+    for e in es { sorted.push(e); }
+    sorted.sort_by(|a: RangeEvent, b: RangeEvent| {
+        let ka = key(a);
+        let kb = key(b);
+        if ka == "0" && kb == "0" { Ordering::Equal } else if ka == "0" { Ordering::Less } else if kb == "0" { Ordering::Greater } else { packages::cmp_vers(ka, kb) }
+    });
+    let hit = false;
+    for e in sorted {
+        if !e.introduced.is_empty() && at_least(v, e.introduced) {
+            hit = true;
+        } else if !e.fixed.is_empty() && at_least(v, e.fixed) {
+            hit = false;
+        } else if !e.last_affected.is_empty() && packages::cmp_vers(v, e.last_affected) == Ordering::Greater {
+            hit = false;
+        } else if !e.limit.is_empty() && at_least(v, e.limit) {
+            return false;
+        }
+    }
+    hit
+}
+
+/// Whether `a` affects `version` of `name` (any spelling of the key).
+pub fn affects(a: Advisory, name: str, version: str) -> bool {
+    let k = index::key(name);
+    for x in a.affected {
+        if index::key(x.package.name) != k { continue; }
+        if x.versions.contains(version) { return true; }
+        for r in x.ranges {
+            if in_range(r, version) { return true; }
+        }
+    }
+    false
+}
+
+/// The live advisories of `xs` that affect `version` of `name`.
+pub fn affecting(xs: List<Advisory>, name: str, version: str) -> List<Advisory> {
+    let out: List<Advisory> = List::new();
+    for a in xs {
+        if live(a) && affects(a, name, version) { out.push(a); }
+    }
+    out
+}
+
+fn bad(msg: str) -> ApiError { index::err(400, msg) }
+
+fn version_or_zero(v: str, what: str) throws (ApiError) {
+    if v == "0" || index::is_version(v) { return; }
+    throw bad(f"`{v}` in {what} is not a version: write a semver version such as `1.2.3`, or `0` for every version from the first");
+}
+
+/// Refuse what OSV or the registry would not take, saying what to write.
+pub fn check(a: Advisory) throws (ApiError) {
+    let s = a.summary.trim();
+    if s.is_empty() || s.len() > SUMMARY_MAX || s.contains("\n") { throw bad(f"give a `summary` of one line, 1 to {SUMMARY_MAX} bytes: what the vulnerability is, such as `Path traversal in unpack`"); }
+    if a.details.len() > DETAILS_MAX { throw bad(f"`details` is at most {DETAILS_MAX} bytes of Markdown"); }
+    if a.affected.is_empty() { throw bad("name at least one package in `affected`: `{\"package\": {\"ecosystem\": \"Nabi\", \"name\": \"..\"}, \"ranges\": [{\"type\": \"SEMVER\", \"events\": [{\"introduced\": \"0\"}, {\"fixed\": \"1.2.3\"}]}]}`"); }
+    for l in [a.aliases.len(), a.affected.len(), a.references.len(), a.credits.len(), a.severity.len()] {
+        if l > LIST_MAX { throw bad(f"at most {LIST_MAX} each of aliases, affected, references, credits and severity"); }
+    }
+    for al in a.aliases {
+        if al.is_empty() || al.len() > 64 || al.contains(" ") { throw bad(f"alias `{al}` is not an id: write one such as `CVE-2026-12345` or `GHSA-xxxx-xxxx-xxxx`"); }
+    }
+    for x in a.affected {
+        if x.package.ecosystem != ECOSYSTEM { throw bad(f"`ecosystem` is `{ECOSYSTEM}`, not `{x.package.ecosystem}`: this registry has advisories on its own packages only"); }
+        if !packages::is_name(x.package.name) { throw bad(f"`{x.package.name}` is not a package name"); }
+        if x.ranges.is_empty() && x.versions.is_empty() { throw bad(f"say which versions of {x.package.name} are affected: a `ranges` entry or a `versions` list"); }
+        for v in x.versions {
+            if !index::is_version(v) { throw bad(f"`{v}` in `versions` is not a version such as `1.2.3`"); }
+        }
+        for r in x.ranges {
+            if r.kind != "SEMVER" { throw bad(f"a range's `type` is `SEMVER` (Nabi versions are semver), not `{r.kind}`"); }
+            if r.events.is_empty() { throw bad("a range needs `events`, such as `[{\"introduced\": \"0\"}, {\"fixed\": \"1.2.3\"}]`"); }
+            let opened = false;
+            for e in r.events {
+                let n = 0;
+                for v in [e.introduced, e.fixed, e.last_affected, e.limit] {
+                    if !v.is_empty() { n += 1; }
+                }
+                if n != 1 { throw bad("each event has exactly one of `introduced`, `fixed`, `last_affected` and `limit`"); }
+                if !e.introduced.is_empty() {
+                    try version_or_zero(e.introduced, "`introduced`");
+                    opened = true;
+                }
+                for v in [e.fixed, e.last_affected, e.limit] {
+                    if !v.is_empty() && !index::is_version(v) { throw bad(f"`{v}` in a range is not a version such as `1.2.3`"); }
+                }
+            }
+            if !opened { throw bad("a range starts with an `introduced` event: `{\"introduced\": \"0\"}` for every version from the first"); }
+        }
+    }
+    for r in a.references {
+        if !reference_kinds().contains(r.kind) { throw bad(f"a reference's `type` is one of {reference_kinds().join(", ")}, not `{r.kind}`"); }
+        if !r.url.starts_with("https://") || r.url.len() > 2048 || r.url.contains(" ") { throw bad(f"a reference's `url` is an https address, not `{r.url}`"); }
+    }
+    for c in a.credits {
+        if c.name.trim().is_empty() || c.name.len() > 200 { throw bad("a credit has a `name` of 1 to 200 bytes"); }
+        if !c.kind.is_empty() && !credit_kinds().contains(c.kind) { throw bad(f"a credit's `type` is one of {credit_kinds().join(", ")}, not `{c.kind}`"); }
+        for u in c.contact {
+            if !(u.starts_with("https://") || u.starts_with("mailto:")) { throw bad(f"a credit's `contact` is an https or mailto address, not `{u}`"); }
+        }
+    }
+    for sv in a.severity {
+        let ok = (sv.kind == "CVSS_V3" && (sv.score.starts_with("CVSS:3.0/") || sv.score.starts_with("CVSS:3.1/"))) || (sv.kind == "CVSS_V4" && sv.score.starts_with("CVSS:4.0/"));
+        if !ok || sv.score.len() > 200 { throw bad(f"`severity` is `{{\"type\": \"CVSS_V3\", \"score\": \"CVSS:3.1/AV:N/AC:L/..\"}}` (or CVSS_V4 with a CVSS:4.0 vector), not `{sv.kind}` `{sv.score}`"); }
+    }
+}
+
+// OSV JSON in. json.nabi reads members as text; each level is read again.
+
+fn string_of(raw: str) -> str | none {
+    if !raw.trim().starts_with("\"") { return none; }
+    for (_, v, quoted) in json::members("{\"v\":" + raw + "}") {
+        if quoted { return v; }
+    }
+    none
+}
+
+fn want_str(raw: str, what: str) throws (ApiError) -> str {
+    string_of(raw) ?? { throw bad(f"`{what}` is a string"); }
+}
+
+fn want_strs(raw: str, what: str) throws (ApiError) -> List<str> {
+    if !raw.trim().starts_with("[") { throw bad(f"`{what}` is a list of strings"); }
+    let out: List<str> = List::new();
+    for x in json::items(raw) { out.push(try want_str(x, what)); }
+    out
+}
+
+fn objects(raw: str, what: str) throws (ApiError) -> List<str> {
+    if !raw.trim().starts_with("[") { throw bad(f"`{what}` is a list of objects"); }
+    let out: List<str> = List::new();
+    for x in json::items(raw) {
+        if !x.trim().starts_with("{") { throw bad(f"each of `{what}` is an object"); }
+        out.push(x);
+    }
+    out
+}
+
+fn only(raw: str, known: List<str>, what: str) throws (ApiError) {
+    for (k, _, _) in json::members(raw) {
+        if !known.contains(k) { throw bad(f"{what} has no field `{k}`; it has {known.join(", ")}"); }
+    }
+}
+
+/// An advisory from OSV JSON. The server's own fields (`id`,
+/// `published`, `modified`, `withdrawn`, `schema_version`,
+/// `database_specific`) are taken and ignored.
+pub fn from_json(text: str) throws (ApiError) -> Advisory {
+    if !text.trim().starts_with("{") { throw bad("the body is an OSV advisory in JSON: `{\"summary\": \"..\", \"details\": \"..\", \"affected\": [..]}`"); }
+    try only(text, ["id", "schema_version", "published", "modified", "withdrawn", "database_specific", "aliases", "related", "summary", "details", "severity", "affected", "references", "credits"], "an advisory");
+    let a = Advisory {};
+    for (k, v, quoted) in json::members(text) {
+        if k == "aliases" { a.aliases = try want_strs(v, k); }
+        else if k == "summary" || k == "details" {
+            if !quoted { throw bad(f"`{k}` is a string"); }
+            if k == "summary" { a.summary = v; } else { a.details = v; }
+        }
+        else if k == "severity" {
+            for o in try objects(v, k) {
+                try only(o, ["type", "score"], "a severity");
+                let f = json::fields(o);
+                a.severity.push(Severity { kind: f.get("type") ?? "", score: f.get("score") ?? "" });
+            }
+        } else if k == "references" {
+            for o in try objects(v, k) {
+                try only(o, ["type", "url"], "a reference");
+                let f = json::fields(o);
+                a.references.push(Reference { kind: f.get("type") ?? "", url: f.get("url") ?? "" });
+            }
+        } else if k == "credits" {
+            for o in try objects(v, k) {
+                try only(o, ["name", "contact", "type"], "a credit");
+                let f = json::fields(o);
+                let contact = if let c: str = json::member(o, "contact") { try want_strs(c, "contact") } else { List::<str>::new() };
+                a.credits.push(Credit { name: f.get("name") ?? "", contact: contact, kind: f.get("type") ?? "" });
+            }
+        } else if k == "affected" {
+            for o in try objects(v, k) {
+                try only(o, ["package", "ranges", "versions", "ecosystem_specific", "database_specific"], "an affected entry");
+                let p = json::member(o, "package") ?? { throw bad("an affected entry has a `package`: `{\"ecosystem\": \"Nabi\", \"name\": \"..\"}`"); };
+                try only(p, ["ecosystem", "name", "purl"], "a package");
+                let pf = json::fields(p);
+                let x = Affected { package: AffectedPackage { ecosystem: pf.get("ecosystem") ?? "", name: pf.get("name") ?? "" } };
+                if let vs: str = json::member(o, "versions") { x.versions = try want_strs(vs, "versions"); }
+                if let rs: str = json::member(o, "ranges") {
+                    for ro in try objects(rs, "ranges") {
+                        try only(ro, ["type", "events", "repo", "database_specific"], "a range");
+                        let r = Range { kind: json::fields(ro).get("type") ?? "", events: List::new() };
+                        let evs = json::member(ro, "events") ?? "[]";
+                        for eo in try objects(evs, "events") {
+                            try only(eo, ["introduced", "fixed", "last_affected", "limit"], "an event");
+                            let ef = json::fields(eo);
+                            r.events.push(RangeEvent { introduced: ef.get("introduced") ?? "", fixed: ef.get("fixed") ?? "", last_affected: ef.get("last_affected") ?? "", limit: ef.get("limit") ?? "" });
+                        }
+                        x.ranges.push(r);
+                    }
+                }
+                a.affected.push(x);
+            }
+        }
+    }
+    a
+}
+
+// OSV JSON out.
+
+fn strs(xs: List<str>) -> str {
+    let q: List<str> = List::new();
+    for x in xs { q.push(json::quote(x)); }
+    "[" + q.join(",") + "]"
+}
+
+/// `a` as OSV JSON on one line; `base` is the registry's URL, whose
+/// page of the advisory is its first reference.
+pub fn to_json(a: Advisory, base: str) -> str {
+    let f: List<str> = [f"\"schema_version\":{json::quote(SCHEMA)}", f"\"id\":{json::quote(a.id)}", f"\"modified\":{json::quote(a.modified)}"];
+    if !a.published.is_empty() { f.push(f"\"published\":{json::quote(a.published)}"); }
+    if !a.withdrawn.is_empty() { f.push(f"\"withdrawn\":{json::quote(a.withdrawn)}"); }
+    if !a.aliases.is_empty() { f.push(f"\"aliases\":{strs(a.aliases)}"); }
+    f.push(f"\"summary\":{json::quote(a.summary)}");
+    f.push(f"\"details\":{json::quote(a.details)}");
+    if !a.severity.is_empty() {
+        let ss: List<str> = List::new();
+        for s in a.severity { ss.push(f"{{\"type\":{json::quote(s.kind)},\"score\":{json::quote(s.score)}}}"); }
+        f.push(f"\"severity\":[{ss.join(",")}]");
+    }
+    let afs: List<str> = List::new();
+    for x in a.affected {
+        let rs: List<str> = List::new();
+        for r in x.ranges {
+            let es: List<str> = List::new();
+            for e in r.events {
+                let (k, v) = if !e.introduced.is_empty() { ("introduced", e.introduced) } else if !e.fixed.is_empty() { ("fixed", e.fixed) } else if !e.last_affected.is_empty() { ("last_affected", e.last_affected) } else { ("limit", e.limit) };
+                es.push(f"{{{json::quote(k)}:{json::quote(v)}}}");
+            }
+            rs.push(f"{{\"type\":{json::quote(r.kind)},\"events\":[{es.join(",")}]}}");
+        }
+        let parts: List<str> = [f"\"package\":{{\"ecosystem\":{json::quote(x.package.ecosystem)},\"name\":{json::quote(x.package.name)}}}"];
+        if !rs.is_empty() { parts.push(f"\"ranges\":[{rs.join(",")}]"); }
+        if !x.versions.is_empty() { parts.push(f"\"versions\":{strs(x.versions)}"); }
+        afs.push("{" + parts.join(",") + "}");
+    }
+    f.push(f"\"affected\":[{afs.join(",")}]");
+    let refs: List<str> = [f"{{\"type\":\"ADVISORY\",\"url\":{json::quote(base + "/advisories/" + a.id)}}}"];
+    for r in a.references { refs.push(f"{{\"type\":{json::quote(r.kind)},\"url\":{json::quote(r.url)}}}"); }
+    f.push(f"\"references\":[{refs.join(",")}]");
+    if !a.credits.is_empty() {
+        let cs: List<str> = List::new();
+        for c in a.credits {
+            let parts: List<str> = [f"\"name\":{json::quote(c.name)}"];
+            if !c.contact.is_empty() { parts.push(f"\"contact\":{strs(c.contact)}"); }
+            if !c.kind.is_empty() { parts.push(f"\"type\":{json::quote(c.kind)}"); }
+            cs.push("{" + parts.join(",") + "}");
+        }
+        f.push(f"\"credits\":[{cs.join(",")}]");
+    }
+    "{" + f.join(",") + "}"
+}
+
+/// `{"advisories": [..]}`.
+pub fn list_json(xs: List<Advisory>, base: str) -> str {
+    let parts: List<str> = List::new();
+    for a in xs { parts.push(to_json(a, base)); }
+    "{\"advisories\":[" + parts.join(",") + "]}"
+}
+
+// Pages.
+
+pub fn list_out() -> str { "advisories/index.html" }
+
+pub fn page_out(id: str) -> str { f"advisories/{id}.html" }
+
+pub fn href(id: str) -> str { "/advisories/" + id }
+
+/// The versions `x` covers, as a reader says them: `< 0.2.1; >= 0.3.0,
+/// <= 0.3.2`, each introduced version starting a part.
+pub fn ranges_text(x: Affected) -> str {
+    let parts: List<str> = List::new();
+    for r in x.ranges {
+        // Each part as its bounds, a part opened by each `introduced`.
+        let segs: List<List<str>> = List::new();
+        for e in r.events {
+            if !e.introduced.is_empty() {
+                segs.push(if e.introduced == "0" { List::<str>::new() } else { [f">= {e.introduced}"] });
+                continue;
+            }
+            if segs.is_empty() { continue; }
+            let b = if !e.fixed.is_empty() { f"< {e.fixed}" } else if !e.last_affected.is_empty() { f"<= {e.last_affected}" } else { f"< {e.limit}" };
+            segs[segs.len() - 1].push(b);
+        }
+        for sg in segs { parts.push(if sg.is_empty() { "every version" } else { sg.join(", ") }); }
+    }
+    for v in x.versions { parts.push(f"= {v}"); }
+    parts.join("; ")
+}
+
+/// The versions with a fix, as written in the `fixed` events.
+pub fn fixed_in(x: Affected) -> List<str> {
+    let out: List<str> = List::new();
+    for r in x.ranges {
+        for e in r.events {
+            if !e.fixed.is_empty() { out.push(e.fixed); }
+        }
+    }
+    out
+}
+
+fn state_tag(a: Advisory) -> str {
+    if a.state == WITHDRAWN { "<span class=\"tag\">withdrawn</span>" } else { "" }
+}
+
+/// `/advisories`: every public advisory, newest first; `base` is the
+/// site's URL, the API's links are absolute (the link check knows only
+/// pages). The title and body.
+pub fn list_page(xs: List<Advisory>, base: str) -> (str, str) {
+    let shown: List<Advisory> = List::new();
+    for a in xs {
+        if public(a) { shown.push(a); }
+    }
+    shown.sort_by(|a: Advisory, b: Advisory| b.published.cmp(a.published));
+    let b = StrBuf::new();
+    for a in shown {
+        let pk: List<str> = List::new();
+        for n in names_of(a) { pk.push(f"<a class=\"mono\" href=\"/packages/{esc(n)}\">{esc(n)}</a>"); }
+        b.push_str(f"<tr{if a.state == WITHDRAWN { " class=\"yanked\"" } else { "" }}><td class=\"mono\"><a href=\"{esc(href(a.id))}\">{esc(a.id)}</a>{state_tag(a)}</td><td>{esc(a.summary)}</td><td>{pk.join(", ")}</td><td><time datetime=\"{esc(a.published)}\">{esc(a.published[:if a.published.len() >= 10 { 10usize } else { a.published.len() }])}</time></td></tr>");
+    }
+    let table = if shown.is_empty() { "<p class=\"empty\">No advisories yet.</p>" } else { f"<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">Id</th><th scope=\"col\">Summary</th><th scope=\"col\">Packages</th><th scope=\"col\">Published</th></tr></thead><tbody>{b.to_str()}</tbody></table></div>" };
+    ("Security advisories", f"<div class=\"frame list-page\">
+<div class=\"page-head\"><h1 class=\"t-h2\">Security advisories</h1><p class=\"t-small\">Vulnerabilities in packages of this registry, newest first, in the <a href=\"https://ossf.github.io/osv-schema/\">OSV format</a> at <a href=\"{esc(base)}/api/v1/advisories?format=json\"><code class=\"ic\">/api/v1/advisories</code></a>. A withdrawn advisory stays listed, marked so. To report one, write to <a href=\"mailto:security@nabi-lang.org\">security@nabi-lang.org</a>.</p></div>
+{table}
+</div>
+")
+}
+
+/// `/advisories/<id>`: one advisory, `base` as for list_page. `details`
+/// is rendered as the untrusted Markdown it is.
+pub fn advisory_page(a: Advisory, base: str) -> str {
+    let b = StrBuf::new();
+    if a.state == WITHDRAWN {
+        let why = if a.withdrawn_reason.is_empty() { "" } else { f" Reason: {esc(a.withdrawn_reason.trim_end_matches("."))}." };
+        b.push_str(f"<p class=\"callout help\"><span class=\"lab\">withdrawn</span><span>This advisory was withdrawn on {esc(a.withdrawn[:10])}: it no longer applies.{why}</span></p>\n");
+    }
+    let rows = StrBuf::new();
+    for x in a.affected {
+        let fixes = fixed_in(x);
+        let fix = if fixes.is_empty() { "<span class=\"muted\">none yet</span>" } else {
+            let fl: List<str> = List::new();
+            for f in fixes { fl.push(f"<a class=\"mono\" href=\"/packages/{esc(x.package.name)}/{esc(f)}\">{esc(f)}</a>"); }
+            fl.join(", ")
+        };
+        rows.push_str(f"<tr><td><a class=\"mono\" href=\"/packages/{esc(x.package.name)}\">{esc(x.package.name)}</a></td><td class=\"mono\">{esc(ranges_text(x))}</td><td>{fix}</td></tr>");
+    }
+    let kv = StrBuf::new();
+    kv.push_str(f"<dt>Published</dt><dd><time datetime=\"{esc(a.published)}\">{esc(a.published[:if a.published.len() >= 10 { 10usize } else { a.published.len() }])}</time></dd>");
+    if a.modified != a.published { kv.push_str(f"<dt>Modified</dt><dd><time datetime=\"{esc(a.modified)}\">{esc(a.modified[:10])}</time></dd>"); }
+    if !a.aliases.is_empty() {
+        let al: List<str> = List::new();
+        for x in a.aliases {
+            let link = if x.starts_with("CVE-") { f"https://www.cve.org/CVERecord?id={x}" } else if x.starts_with("GHSA-") { f"https://github.com/advisories/{x}" } else { "" };
+            al.push(if link.is_empty() { f"<code class=\"ic\">{esc(x)}</code>" } else { f"<a class=\"mono\" href=\"{esc(link)}\">{esc(x)}</a>" });
+        }
+        kv.push_str(f"<dt>Aliases</dt><dd>{al.join(", ")}</dd>");
+    }
+    for s in a.severity { kv.push_str(f"<dt>Severity</dt><dd><code class=\"ic\" title=\"{esc(s.kind)}\">{esc(s.score)}</code></dd>"); }
+    if !a.credits.is_empty() {
+        let cs: List<str> = List::new();
+        for c in a.credits { cs.push(esc(c.name) + (if c.kind.is_empty() { "" } else { f" <span class=\"muted\">({esc(c.kind.to_lowercase().replace("_", " "))})</span>" })); }
+        kv.push_str(f"<dt>Credits</dt><dd>{cs.join(", ")}</dd>");
+    }
+    let refs = StrBuf::new();
+    for r in a.references { refs.push_str(f"<li><span class=\"tag\">{esc(r.kind.to_lowercase())}</span> <a href=\"{esc(r.url)}\" rel=\"nofollow ugc\">{esc(r.url)}</a></li>"); }
+    let details = if a.details.trim().is_empty() { "" } else {
+        let doc = markdown::render_untrusted(a.details, pkg::layout::md(|h| h));
+        f"<h2>Details</h2>\n{packages::untrusted_refs(web::chrome::align_classes(doc.html))}\n"
+    };
+    f"<div class=\"frame list-page\">
+<nav class=\"crumbs\" aria-label=\"Breadcrumb\"><a href=\"/advisories\">advisories</a> / {esc(a.id)}</nav>
+<div class=\"page-head\"><h1 class=\"t-h2\">{esc(a.id)}{state_tag(a)}</h1><p class=\"t-lead\">{esc(a.summary)}</p></div>
+{b.to_str()}<dl class=\"kv\">{kv.to_str()}</dl>
+<article class=\"prose md adv\">
+<h2>Affected</h2>
+<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">Package</th><th scope=\"col\">Versions</th><th scope=\"col\">Fixed in</th></tr></thead><tbody>{rows.to_str()}</tbody></table></div>
+{details}{if refs.to_str().is_empty() { "" } else { f"<h2>References</h2>\n<ul class=\"refs\">{refs.to_str()}</ul>\n" }}</article>
+<p class=\"t-small\"><a href=\"{esc(base)}/api/v1/advisories/{esc(a.id)}?format=json\">OSV JSON</a></p>
+</div>
+"
+}
+
+/// The red banner of a package or version page: the live advisories of
+/// `xs` that affect `version` of `name`; "" for none.
+pub fn banner(xs: List<Advisory>, name: str, version: str) -> str {
+    let hit = affecting(xs, name, version);
+    if hit.is_empty() { return ""; }
+    let links: List<str> = List::new();
+    for a in hit { links.push(f"<a href=\"{esc(href(a.id))}\">{esc(a.id)}</a>: {esc(a.summary)}"); }
+    let n = if hit.len() == 1 { "1 advisory affects" } else { f"{hit.len()} advisories affect" };
+    f"<div class=\"callout vuln\" role=\"alert\"><span class=\"lab\">security</span><span>{n} {esc(name)} {esc(version)}. {links.join("; ")}. Upgrade to a fixed version.</span></div>"
+}
+
+/// The side panel's line: each public advisory on `name`, those that
+/// affect `version` marked; none when there are none.
+pub fn side_kv(xs: List<Advisory>, name: str, version: str) -> str {
+    let k = index::key(name);
+    let items: List<str> = List::new();
+    for a in xs {
+        if !live(a) || !packages_of(a).contains(k) { continue; }
+        let mark = if affects(a, name, version) { " <span class=\"tag\" title=\"affects this version\">affects</span>" } else { "" };
+        items.push(f"<a class=\"mono\" href=\"{esc(href(a.id))}\" title=\"{esc(a.summary)}\">{esc(a.id)}</a>{mark}");
+    }
+    if items.is_empty() { return "<dt>Advisories</dt><dd>None</dd>"; }
+    f"<dt>Advisories</dt><dd>{items.join("<br>")}</dd>"
+}
+
+#[test]
+fn osv_ranges() {
+    let r = Range { events: [RangeEvent { introduced: "0" }, RangeEvent { fixed: "0.2.1" }, RangeEvent { introduced: "0.3.0" }, RangeEvent { last_affected: "0.3.2" }] };
+    let got: List<str> = List::new();
+    for v in ["0.1.0", "0.2.0", "0.2.1", "0.2.9", "0.3.0", "0.3.2", "0.3.3", "1.0.0-rc.1"] { got.push(f"{v}:{in_range(r, v)}"); }
+    assert(got.join(" ") == "0.1.0:true 0.2.0:true 0.2.1:false 0.2.9:false 0.3.0:true 0.3.2:true 0.3.3:false 1.0.0-rc.1:false", got.join(" "));
+    let lim = Range { events: [RangeEvent { limit: "2.0.0" }, RangeEvent { introduced: "1.0.0" }] };
+    assert(in_range(lim, "1.5.0") && !in_range(lim, "2.0.0") && !in_range(lim, "0.9.0"), "limit, events out of order");
+    let a = Advisory { id: "NABI-2026-0001", summary: "x", state: PUBLISHED, affected: [Affected { package: AffectedPackage { name: "ge-om" }, ranges: [r], versions: ["0.2.5"] }] };
+    assert(affects(a, "ge_om", "0.1.0") && affects(a, "ge_om", "0.2.5") && !affects(a, "ge_om", "0.2.6") && !affects(a, "json", "0.1.0"), "affects");
+    assert(banner([a], "ge-om", "0.1.0").contains("1 advisory affects ge-om 0.1.0") && banner([a], "ge-om", "0.2.6").is_empty(), "banner");
+    assert(ranges_text(a.affected[0]) == "< 0.2.1; >= 0.3.0, <= 0.3.2; = 0.2.5", ranges_text(a.affected[0]));
+    a.state = WITHDRAWN;
+    assert(banner([a], "ge-om", "0.1.0").is_empty() && side_kv([a], "ge-om", "0.1.0") == "<dt>Advisories</dt><dd>None</dd>", "withdrawn");
+}
+
+#[test]
+fn osv_ids_and_checks() {
+    let now = 1795000000i64;
+    assert(rfc3339(now) == "2026-11-18T11:06:40Z", rfc3339(now));
+    let xs = [Advisory { id: "NABI-2026-0009" }, Advisory { id: "NABI-2025-0042" }];
+    assert(next_id(List::new(), now) == "NABI-2026-0001" && next_id(xs, now) == "NABI-2026-0010", next_id(xs, now));
+    assert(is_id("NABI-2026-0010") && is_id("NABI-2026-12345") && !is_id("NABI-26-0001") && !is_id("CVE-2026-0001") && !is_id("NABI-2026-01x1"), "ids");
+    let good = "{\"summary\":\"Path traversal in unpack\",\"details\":\"A `..` entry escapes.\",\"aliases\":[\"CVE-2026-1\"],\"severity\":[{\"type\":\"CVSS_V3\",\"score\":\"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H\"}],\"affected\":[{\"package\":{\"ecosystem\":\"Nabi\",\"name\":\"geom\"},\"ranges\":[{\"type\":\"SEMVER\",\"events\":[{\"introduced\":\"0\"},{\"fixed\":\"0.2.1\"}]}]}],\"references\":[{\"type\":\"FIX\",\"url\":\"https://example.org/fix\"}],\"credits\":[{\"name\":\"Ann\",\"contact\":[\"mailto:a@example.org\"],\"type\":\"FINDER\"}]}";
+    let a = try from_json(good) catch e { panic(e.msg); };
+    try check(a) catch e { panic(e.msg); };
+    assert(a.affected[0].ranges[0].events[1].fixed == "0.2.1" && a.credits[0].contact[0] == "mailto:a@example.org" && a.severity[0].kind == "CVSS_V3", "parsed");
+    a.id = "NABI-2026-0001";
+    a.published = rfc3339(now);
+    a.modified = a.published;
+    let j = to_json(a, "https://p.test");
+    let back = try from_json(j) catch e { panic(e.msg); };
+    assert(back.summary == a.summary && back.references.len() == 2 && back.references[0].url == "https://p.test/advisories/NABI-2026-0001" && back.affected[0].ranges[0].events.len() == 2, j);
+    assert(j.contains("\"schema_version\":\"1.6.0\"") && j.contains("{\"introduced\":\"0\"},{\"fixed\":\"0.2.1\"}") && !j.contains("withdrawn"), j);
+    for (body, says) in [
+        ("{\"summary\":\"x\",\"affected\":[]}", "name at least one package"),
+        ("{\"summary\":\"x\",\"color\":\"red\"}", "has no field `color`"),
+        ("{\"summary\":\"x\",\"affected\":[{\"package\":{\"ecosystem\":\"npm\",\"name\":\"geom\"},\"versions\":[\"1.0.0\"]}]}", "`ecosystem` is `Nabi`"),
+        ("{\"summary\":\"x\",\"affected\":[{\"package\":{\"ecosystem\":\"Nabi\",\"name\":\"geom\"},\"ranges\":[{\"type\":\"SEMVER\",\"events\":[{\"fixed\":\"1.0.0\"}]}]}]}", "starts with an `introduced`"),
+        ("{\"summary\":\"x\",\"affected\":[{\"package\":{\"ecosystem\":\"Nabi\",\"name\":\"geom\"},\"ranges\":[{\"type\":\"GIT\",\"events\":[{\"introduced\":\"0\"}]}]}]}", "`SEMVER`"),
+        ("{\"summary\":\"\",\"affected\":[]}", "give a `summary`"),
+    ] {
+        let msg = "";
+        try check(try from_json(body)) catch e { msg = e.msg; };
+        assert(msg.contains(says), f"{body}: {msg}");
+    }
+}

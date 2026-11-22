@@ -142,6 +142,9 @@ pub struct Package {
     /// One package per version for its version pages, newest first; empty
     /// in those packages themselves.
     pub views: List<Package> = List::new();
+    /// Public security advisories naming it; each says which versions it
+    /// affects.
+    pub advisories: List<pkg::osv::Advisory> = List::new();
     /// Its latest version is official (published from the nabi-lang
     /// organization).
     pub official: bool = false;
@@ -169,6 +172,8 @@ pub struct Data {
     pub names: Dict<i64, str> = Dict::new();
     /// Downloads by `<key>@<version>`: all and recent; none: not counted.
     pub downloads: Dict<str, (i64, i64)> | none = none;
+    /// Public security advisories by key (osv.nabi).
+    pub advisories: Dict<str, List<pkg::osv::Advisory>> = Dict::new();
 }
 
 pub fn no_data() -> Data { Data { releases: Dict::new(), owners: Dict::new() } }
@@ -1055,6 +1060,7 @@ pub fn load(dir: str, r: Readmes, data: Data) -> Index {
         let (t, d) = dates.get(files[k]) ?? (0i64, "");
         let s = shown(r, k, files[k], by_name[k], l, rdeps.get(k) ?? List::new(), t, d);
         s.owners = data.owners.get(key_of(k)) ?? List::new();
+        s.advisories = data.advisories.get(key_of(k)) ?? List::new();
         s.official = l.official;
         let vs: List<Version> = List::new();
         for v in by_name[k] { vs.push(v); }
@@ -1064,6 +1070,7 @@ pub fn load(dir: str, r: Readmes, data: Data) -> Index {
             let x = if v.version == l.version { again(s) } else { shown(r, k, files[k], by_name[k], v, s.rdeps, t, d) };
             x.owners = s.owners;
             x.official = s.official;
+            x.advisories = s.advisories;
             x.at = v.version;
             x.top = l.version;
             views.push(x);

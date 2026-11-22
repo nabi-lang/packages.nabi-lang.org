@@ -358,3 +358,14 @@ html:not(.js) .ipanel+.ipanel{border-top:1px solid var(--line)}
 .readme>h1:first-child{display:none}
 /* Phone tap targets: the kit's social icons are 24px at least. */
 .social a{min-width:24px;min-height:24px;box-sizing:border-box;justify-content:center;align-items:center}
+/* Advisories: a red banner on an affected version, a red tag in the table. */
+.callout.vuln{border-color:var(--cli-red);margin-top:12px}
+.callout.vuln .lab,.tag.vuln{color:var(--cli-red)}
+.tag.vuln{border-color:var(--cli-red)}
+@supports (color:color-mix(in oklch,red,blue)){.callout.vuln{background:color-mix(in oklch,var(--cli-red) 8%,var(--bg))}}
+.md .refs{list-style:none;padding-left:0}
+.refs li{margin:4px 0;overflow-wrap:anywhere}
+.refs .tag{margin:0 8px 0 0}
+.adv{margin-top:8px}
+.list-page>.callout{margin:16px 0}
+.list-page>.adv+.t-small{margin-top:24px}

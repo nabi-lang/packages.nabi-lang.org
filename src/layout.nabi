@@ -4,6 +4,7 @@
 use pkg::Site;
 use pkg::docs::Status;
 use pkg::meta;
+use pkg::osv;
 use pkg::packages;
 use pkg::packages::{Package, Version};
 use pkg::server::names;
@@ -870,7 +871,7 @@ fn package_head(site: Site, s: Package, tab: str) -> str {
 <nav class=\"crumbs\" aria-label=\"Breadcrumb\"><a href=\"/packages\">packages</a> / {crumbs(s, tab)}</nav>
 <div class=\"title\"><span class=\"gl-box {hue_class(s.name)}\">{glyph(s.name, 44, "gl")}</span><div class=\"what\"><div class=\"name-line\"><h1>{esc(s.name)}</h1><span class=\"ver{if l.yanked { " gone" } else { "" }}\">{esc(l.version)}</span>{if s.official { official_badge() } else { "" }}</div>{about}</div></div>
 <p class=\"sum t-small\"><span>{sum.join("</span> · <span>")}</span></p>
-{notice}{inst}<div class=\"tabs-line\"><nav class=\"tabs\" aria-label=\"Package sections\">{tabs.to_str()}</nav></div>
+{notice}{osv::banner(s.advisories, s.name, l.version)}{inst}<div class=\"tabs-line\"><nav class=\"tabs\" aria-label=\"Package sections\">{tabs.to_str()}</nav></div>
 </div>
 "
 }
@@ -1014,6 +1015,7 @@ fn side(site: Site, s: Package) -> str {
         kv.push_str(f"<dt>Published</dt><dd>{when}{who}</dd>");
     }
     kv.push_str(downloads_kv(s));
+    kv.push_str(osv::side_kv(s.advisories, s.name, l.version));
     if !m.license.is_empty() { kv.push_str(f"<dt>License</dt><dd>{esc(m.license)}</dd>"); }
     if !l.nabi_version.is_empty() { kv.push_str(f"<dt>Requires</dt><dd>{esc(packages::admits(l.nabi_version))}</dd>"); }
     if !m.links.is_empty() { kv.push_str(f"<dt>Links</dt><dd title=\"The native library it links\"><code class=\"ic\">{esc(m.links)}</code></dd>"); }
@@ -1304,6 +1306,7 @@ pub fn versions_page(site: Site, s: Package) -> str {
             tags.push_str(f"<span class=\"tag\"{by}>yanked</span>");
         }
         if packages::is_pre(v.version) { tags.push_str("<span class=\"tag\">pre-release</span>"); }
+        if !osv::affecting(s.advisories, s.name, v.version).is_empty() { tags.push_str("<span class=\"tag vuln\" title=\"A security advisory affects it\">advisory</span>"); }
         // The day; the time is in the title.
         let when = if v.date.is_empty() { "<span class=\"muted\">unknown</span>" } else { when_tag(v.date, "", true).replace("<time ", f"<time title=\"{esc(when_text(v.date))}\" ") };
         let none_yet = "<span class=\"muted\">unknown</span>";

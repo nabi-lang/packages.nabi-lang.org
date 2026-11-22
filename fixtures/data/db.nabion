@@ -210,4 +210,31 @@ Db {
     trusted: [
         TrustedPublisher { package: "json", repository: "nabi-lang/json", owner_id: 341800840, workflow: "publish.yml", seeded: true },
     ],
+    advisories: [
+        Advisory {
+            id: "NABI-2026-0001",
+            aliases: ["CVE-2026-0001"],
+            summary: "Division by zero in Polygon::centroid",
+            details: "`Polygon::centroid` divides by the signed area, which is zero for a degenerate polygon, and panics.\n\nUpgrade to 0.3.0, which returns `none` for such a polygon.",
+            severity: [Severity { kind: "CVSS_V3", score: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L" }],
+            affected: [Affected { package: AffectedPackage { name: "geom" }, ranges: [Range { events: [RangeEvent { introduced: "0" }, RangeEvent { fixed: "0.3.0" }] }] }],
+            references: [Reference { kind: "FIX", url: "https://github.com/packages-demo/geom/commit/b1939b3d562fe3fd0a6a1678f9f84a807b05e296" }],
+            credits: [Credit { name: "Bob", kind: "FINDER" }],
+            published: "2026-01-10T09:00:00Z",
+            modified: "2026-01-10T09:00:00Z",
+            state: "published",
+            drafted_by: 1001,
+            published_by: 1001,
+        },
+        Advisory {
+            id: "NABI-2026-0002",
+            summary: "Stack overflow on deeply nested arrays",
+            affected: [Affected { package: AffectedPackage { name: "json" }, ranges: [Range { events: [RangeEvent { introduced: "0" }, RangeEvent { fixed: "0.4.0" }] }] }],
+            published: "2026-02-01T09:00:00Z",
+            modified: "2026-02-03T09:00:00Z",
+            withdrawn: "2026-02-03T09:00:00Z",
+            state: "withdrawn",
+            withdrawn_reason: "the parser has a depth limit; the report was mistaken",
+        },
+    ],
 }

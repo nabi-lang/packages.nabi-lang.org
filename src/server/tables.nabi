@@ -1,6 +1,6 @@
 // The data in SQLite: PACKAGES_DATA/registry.sqlite3, in WAL mode.
 //
-// One table per kind of record. Each row keeps the record's NABION in
+// One table per kind of record (specs). Each row keeps the record's NABION in
 // `data` (so a field added later needs no migration, its default fills
 // in) under a key `k`, beside the columns lookups use. A record without
 // a natural key (an event, a trusted publisher) is keyed by its digest.
@@ -17,6 +17,8 @@
 // as it was.
 
 use pkg::meta::Release;
+use pkg::osv;
+use pkg::osv::Advisory;
 use pkg::secret;
 use pkg::server::sqlite;
 use pkg::server::sqlite::{Conn, SqlError};
@@ -55,6 +57,8 @@ fn migrations() -> List<str> {
          CREATE TABLE events (k TEXT PRIMARY KEY, package TEXT NOT NULL, at INTEGER NOT NULL, data TEXT NOT NULL);
          CREATE INDEX events_package ON events (package, at);
          CREATE TABLE imports (at INTEGER NOT NULL, source TEXT NOT NULL, summary TEXT NOT NULL);",
+        "CREATE TABLE advisories (k TEXT PRIMARY KEY, state TEXT NOT NULL, packages TEXT NOT NULL, data TEXT NOT NULL);
+         CREATE INDEX advisories_state ON advisories (state);",
     ]
 }
 
@@ -87,6 +91,7 @@ fn specs() -> List<Spec> {
         Spec { name: "removed", cols: List::new() },
         Spec { name: "approved", cols: List::new() },
         Spec { name: "events", cols: ["package", "at"] },
+        Spec { name: "advisories", cols: ["state", "packages"] },
     ]
 }
 
@@ -244,6 +249,7 @@ fn rows_of(db: Db) throws -> List<List<Row>> {
         try rows(db.removed, |x: Removal| x.name + "@" + x.version, |_x: Removal| List::<str>::new()),
         approved,
         try rows(db.events, |_e: Event| "", |e: Event| [e.package, f"{e.at}"]),
+        try rows(db.advisories, |a: Advisory| a.id, |a: Advisory| [a.state, " " + osv::packages_of(a).join(" ") + " "]),
     ]
 }
 
@@ -286,6 +292,7 @@ fn read_all(c: Conn) throws -> Db {
         removed: try parse(c, "removed"),
         approved: try parse(c, "approved"),
         events: try parse(c, "events"),
+        advisories: try parse(c, "advisories"),
     };
     try sqlite::commit(c);
     db
@@ -419,7 +426,7 @@ pub fn set_row(dir: str, table: str, k: str, data: str) throws -> bool {
 
 /// Counts of each table's rows, `accounts 2, sessions 0, ..`.
 fn summary(db: Db) -> str {
-    f"{db.accounts.len()} accounts, {db.sessions.len()} sessions, {db.tokens.len()} tokens, {db.owners.len()} owners, {db.releases.len()} releases, {db.trusted.len()} trusted publishers, {db.trust_tokens.len()} trusted publishing tokens, {db.invites.len()} invitations, {db.locked.len()} locked accounts, {db.removed.len()} takedowns, {db.approved.len()} approved names, {db.events.len()} events"
+    f"{db.accounts.len()} accounts, {db.sessions.len()} sessions, {db.tokens.len()} tokens, {db.owners.len()} owners, {db.releases.len()} releases, {db.trusted.len()} trusted publishers, {db.trust_tokens.len()} trusted publishing tokens, {db.invites.len()} invitations, {db.locked.len()} locked accounts, {db.removed.len()} takedowns, {db.approved.len()} approved names, {db.events.len()} events, {db.advisories.len()} advisories"
 }
 
 /// Make `dir`'s database ready for the server: created, imported from
@@ -546,5 +553,30 @@ fn import_and_round_trip() {
     assert(r.accounts.len() == back.accounts.len(), "restored");
     close_all(dir);
     close_all(dir + "/restored");
+    try fs::remove_dir_all(dir) catch _ {};
+}
+
+#[test]
+fn schema_steps() {
+    let dir = std::env::temp_dir().as_str() + f"/packages-schema-{std::process::id()}";
+    try fs::remove_dir_all(dir) catch _ {};
+    try! fs::create_dir_all(dir);
+    // A database of the first schema, as the first server left it.
+    let c = try fresh(path_of(dir), true) catch e { panic(f"{e}"); };
+    try sqlite::exec(c, "CREATE TABLE schema_version (version INTEGER NOT NULL); INSERT INTO schema_version (version) VALUES (1)") catch e { panic(f"{e}"); };
+    try sqlite::exec(c, migrations()[0]) catch e { panic(f"{e}"); };
+    try sqlite::exec(c, "INSERT INTO accounts (k, id, login, data) VALUES ('5', 5, 'ann', 'Account { id: 5, login: \"ann\", created: 1 }')") catch e { panic(f"{e}"); };
+    sqlite::close(c);
+    let db = try load(dir) catch e { panic(f"{e}"); };
+    assert(db.accounts.len() == 1 && db.advisories.is_empty(), "read after the later steps");
+    let v = try take(dir) catch e { panic(f"{e}"); };
+    assert((try stored_version(v) catch _ { 0i64 }) == schema_version(), "at the current schema");
+    // One newer than this server: refused, with what to do.
+    try sqlite::exec(v, f"UPDATE schema_version SET version = {schema_version() + 1i64}") catch e { panic(f"{e}"); };
+    let refused = "";
+    try migrate(v) catch e { refused = e.msg; };
+    assert(refused.contains("newer than this server") && refused.contains("restore a backup"), refused);
+    give(dir, v);
+    close_all(dir);
     try fs::remove_dir_all(dir) catch _ {};
 }

@@ -21,6 +21,7 @@ mod index;
 mod json;
 mod layout;
 mod meta;
+mod osv;
 mod packages;
 mod secret;
 mod server;
@@ -269,6 +270,8 @@ fn main() throws {
     let data = packages::no_data();
     // Packages the admins took down are left out of the site.
     let removed: Set<str> = Set::new();
+    // Public advisories, for their pages and the packages' banners.
+    let advisories: List<osv::Advisory> = List::new();
     if !data_dir.is_empty() {
         let db = try server::store::read_db(data_dir);
         for x in db.removed {
@@ -280,6 +283,15 @@ fn main() throws {
             List::new()
         };
         data.downloads = server::downloads::sums(counts, server::downloads::today());
+        for a in db.advisories {
+            if !osv::public(a) { continue; }
+            advisories.push(a);
+            for k in osv::packages_of(a) {
+                let l = data.advisories.get(k) ?? List::new();
+                l.push(a);
+                data.advisories.insert(k, l);
+            }
+        }
         for a in db.accounts {
             if !a.name.is_empty() { data.names.insert(a.id, a.name); }
         }
@@ -367,6 +379,14 @@ fn main() throws {
             let po = layout::ver_out(s.name, v.at);
             files.insert(po, layout::page_desc(site, po, f"{s.name} {v.at}", vabout, layout::package_page(site, v), og, alt));
         }
+    }
+
+    // Security advisories: the list, and a page each.
+    let (adv_title, adv_body) = osv::list_page(advisories, site.base_url);
+    files.insert(osv::list_out(), layout::page_desc(site, osv::list_out(), adv_title, "Security advisories for Nabi packages, in the OSV format.", adv_body));
+    for a in advisories {
+        let out = osv::page_out(a.id);
+        files.insert(out, layout::page_desc(site, out, f"{a.id}: {a.summary}", a.summary, osv::advisory_page(a, site.base_url)));
     }
 
     // Browsing by category and keyword.
