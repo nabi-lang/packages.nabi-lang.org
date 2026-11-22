@@ -9,6 +9,7 @@ use core::cmp::Ordering;
 use core::crypto::HashAlgorithm;
 use core::encoding::hex;
 use std::fs;
+use std::net::IpAddr;
 use std::nabion;
 use std::nabion::Value;
 
@@ -181,8 +182,8 @@ fn https(url: str) -> bool {
     url.starts_with("https://") && url.len() > 8 && !url.contains(" ") && !url.contains("\"")
 }
 
-/// Whether `h` is an IPv4 address in a range that is not the internet:
-/// loopback, private, link-local, shared, multicast and reserved.
+/// Whether `h` is an IPv4 address in a range that is not the internet
+/// (internal_v4).
 fn private_v4(h: str) -> bool {
     let parts: List<u32> = List::new();
     for p in h.split(".") {
@@ -190,15 +191,97 @@ fn private_v4(h: str) -> bool {
         parts.push(try p.parse::<u32>() catch _ { return false; });
     }
     if parts.len() != 4 { return false; }
-    let (a, b) = (parts[0], parts[1]);
-    a == 0u32 || a == 10u32 || a == 127u32 || a >= 224u32 || (a == 100u32 && b >= 64u32 && b < 128u32) || (a == 169u32 && b == 254u32) || (a == 172u32 && b >= 16u32 && b < 32u32) || (a == 192u32 && b == 168u32) || (a == 198u32 && (b == 18u32 || b == 19u32))
+    internal_v4(parts[0], parts[1], parts[2])
+}
+
+/// Whether the IPv4 address `a.b.c.*` is not the internet: this network,
+/// loopback, private, shared (CGNAT), link-local (cloud metadata),
+/// protocol and documentation ranges, benchmarking, multicast, reserved
+/// and broadcast.
+fn internal_v4(a: u32, b: u32, c: u32) -> bool {
+    a == 0u32 || a == 10u32 || a == 127u32 || a >= 224u32 || (a == 100u32 && b >= 64u32 && b < 128u32) || (a == 169u32 && b == 254u32) || (a == 172u32 && b >= 16u32 && b < 32u32) || (a == 192u32 && b == 168u32) || (a == 198u32 && (b == 18u32 || b == 19u32)) || (a == 192u32 && b == 0u32 && (c == 0u32 || c == 2u32)) || (a == 198u32 && b == 51u32 && c == 100u32) || (a == 203u32 && b == 0u32 && c == 113u32)
+}
+
+/// Whether `ip` is not on the internet, so a source fetch must not reach
+/// it. IPv6 outside global unicast (2000::/3: loopback, unspecified,
+/// unique local, link-local, multicast) is; IPv4 inside IPv6 (mapped,
+/// NAT64, 6to4) is judged by its IPv4 address.
+pub fn internal_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            internal_v4(o[0] as u32, o[1] as u32, o[2] as u32)
+        },
+        IpAddr::V6(a) => {
+            let g: List<u32> = List::new();
+            for x in a.segments() { g.push(x as u32); }
+            let embedded = |hi: u32, lo: u32| internal_v4(hi >> 8u32, hi & 255u32, lo >> 8u32);
+            let low_zero = g[2] == 0u32 && g[3] == 0u32 && g[4] == 0u32;
+            if g[0] == 0u32 && g[1] == 0u32 && low_zero && g[5] == 65535u32 { return embedded(g[6], g[7]); }
+            if g[0] == 100u32 && g[1] == 65435u32 && low_zero && g[5] == 0u32 { return embedded(g[6], g[7]); }
+            if g[0] == 8194u32 { return embedded(g[1], g[2]); }
+            // 2001:0::/32 (Teredo) and 2001:db8::/32 (documentation).
+            if g[0] == 8193u32 && (g[1] == 0u32 || g[1] == 3512u32) { return true; }
+            (g[0] & 57344u32) != 8192u32
+        },
+    }
+}
+
+/// The addresses of `host`, as `resolve` gives them, when every one is
+/// on the internet (internal_ip): the ones a source fetch may connect
+/// to. `resolve` returns none for a name it cannot resolve.
+pub fn public_addrs(host: str, resolve: fn(str) -> List<IpAddr>) throws (ApiError) -> List<IpAddr> {
+    let addrs = resolve(host);
+    if addrs.is_empty() { throw bad(f"the source host `{host}` has no address; check the url's spelling, or publish from a public https host such as github.com"); }
+    for ip in addrs {
+        if internal_ip(ip) {
+            throw bad(f"the source host `{host}` resolves to {ip}, which is not on the public internet; publish from a public https host such as github.com");
+        }
+    }
+    addrs
+}
+
+/// `host`'s addresses by the system resolver; none when it has none.
+fn system_addrs(host: str) -> List<IpAddr> {
+    let out: List<IpAddr> = List::new();
+    for a in (try std::net::resolve(host) catch _ { return out; }) {
+        if !out.contains(a.ip()) { out.push(a.ip()); }
+    }
+    out
+}
+
+/// The host of the https `url`, lowercase and without `:443`.
+fn https_host(url: str) -> str {
+    let rest = url["https://".len():];
+    let host = (rest.split_once("/") ?? (rest, "")).0.to_lowercase();
+    host.strip_suffix(":443") ?? host
+}
+
+/// The git options that keep a fetch of the https `url` off the
+/// server's own network: its host resolved now, refused when any address
+/// is internal (public_addrs), and pinned to those addresses
+/// (http.curloptResolve, git 2.37), so a second lookup by git cannot
+/// answer differently. A git before 2.37 ignores the pin and resolves
+/// again, which leaves a DNS rebinding window of the fetch's own lookup.
+/// A name under `.invalid` never resolves on the internet: only the
+/// operator's own `url.<base>.insteadOf` can point it somewhere, so it
+/// is left to that rewrite (the tests use one).
+fn pinned(url: str) throws (ApiError) -> List<str> {
+    if !url.starts_with("https://") { return List::new(); }
+    let host = https_host(url);
+    if host.ends_with(".invalid") { return List::new(); }
+    let addrs: List<str> = List::new();
+    for ip in (try public_addrs(host, system_addrs)) {
+        addrs.push(if ip.is_ipv6() { f"[{ip}]" } else { f"{ip}" });
+    }
+    ["-c", f"http.curloptResolve={host}:443:{addrs.join(",")}"]
 }
 
 /// Why the server will not fetch a package source from `url`; none when
 /// it will: https on the default port to a named public host, so a
-/// publish cannot make the server reach its own network. A host that
-/// resolves to a private address is refused by the proxy in front, not
-/// here.
+/// publish cannot make the server reach its own network. A name that
+/// resolves to an internal address is refused when it is fetched
+/// (pinned).
 pub fn source_problem(url: str) -> str | none {
     if !https(url) { return f"the source url `{url}` is not https"; }
     let rest = url["https://".len():];
@@ -800,15 +883,16 @@ pub fn fetch_source(cache: str, url: str, rev: str, protocols: str) throws (ApiE
         if packages::git(["init", "-q", "--bare", db]) is none { throw err(500, "cannot make the source cache"); }
     }
     let cannot = bad(f"cannot fetch {url} at {rev} (within {packages::FETCH_SECS} s and 256 MiB)");
+    let pin = try pinned(url);
     if packages::git(["-C", db, "cat-file", "-e", rev + "^{commit}"]) is none {
-        _ = source_git(db, cache, ["fetch", "-q", "--depth", "1", "--no-tags", url, rev], protocols) ?? { throw cannot; };
+        _ = source_git(db, cache, pin + ["fetch", "-q", "--depth", "1", "--no-tags", url, rev], protocols) ?? { throw cannot; };
     }
-    let refs = source_git(db, cache, ["ls-remote", "--heads", "--tags", url], protocols) ?? { throw cannot; };
+    let refs = source_git(db, cache, pin + ["ls-remote", "--heads", "--tags", url], protocols) ?? { throw cannot; };
     for line in refs.split("\n") {
         if (line.split_once("\t") ?? (line, "")).0 == rev { return db; }
     }
     // Not a tip: bring the branches and tags, and look for one that has it.
-    _ = source_git(db, cache, ["fetch", "-q", "--no-tags", "--force", url, "+refs/heads/*:refs/src/heads/*", "+refs/tags/*:refs/src/tags/*"], protocols) ?? { throw cannot; };
+    _ = source_git(db, cache, pin + ["fetch", "-q", "--no-tags", "--force", url, "+refs/heads/*:refs/src/heads/*", "+refs/tags/*:refs/src/tags/*"], protocols) ?? { throw cannot; };
     let holding = packages::git(["-C", db, "for-each-ref", "--contains", rev, "--format=%(refname)", "refs/src/"]) ?? "";
     if holding.trim().is_empty() {
         throw bad(f"commit {rev} is on no branch or tag of {url}; push it there (a commit of a fork does not count) and publish again");
@@ -1165,4 +1249,43 @@ fn source_urls() {
     for bad in ["http://github.com/x/y", "https://localhost/x", "https://127.0.0.1/x", "https://10.1.2.3/x", "https://[::1]/x", "https://user@github.com/x", "https://github.com:8443/x", "https://metadata/x", "https://169.254.169.254/x", "https://svc.internal/x", "https://a_b.example.org/x"] {
         expect(!(source_problem(bad) is none), bad);
     }
+}
+
+#[cfg(test)]
+fn ip(s: str) -> IpAddr { try! s.parse::<IpAddr>() }
+
+#[test]
+fn internal_addresses() {
+    for a in ["127.0.0.1", "10.0.0.1", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254", "100.64.0.1", "100.127.255.255", "0.0.0.0", "224.0.0.1", "255.255.255.255", "192.0.2.1", "198.18.0.1", "::1", "::", "fc00::1", "fd12:3456::1", "fe80::1", "febf::1", "ff02::1", "::ffff:7f00:1", "::ffff:a01:203", "64:ff9b::a9fe:a9fe", "2002:c0a8:101::1", "2001:db8::1", "::7f00:1"] {
+        expect(internal_ip(ip(a)), a);
+    }
+    for a in ["140.82.121.4", "8.8.8.8", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "2a00:1450:4001::200e", "::ffff:8c52:7904", "2002:8c52:7904::1"] {
+        expect(!internal_ip(ip(a)), a);
+    }
+}
+
+#[cfg(test)]
+fn fake_dns(host: str) -> List<IpAddr> {
+    match host {
+        "public.example" => [ip("140.82.121.4"), ip("2606:4700::1111")],
+        "rebind.example" => [ip("140.82.121.4"), ip("127.0.0.1")],
+        "meta.example" => [ip("169.254.169.254")],
+        "ula.example" => [ip("fd00::1")],
+        _ => List::new(),
+    }
+}
+
+#[test]
+fn source_hosts() {
+    let got = try public_addrs("public.example", fake_dns) catch e { panic(e.msg); };
+    expect(got.len() == 2, "public");
+    for (h, want) in [("rebind.example", "resolves to 127.0.0.1"), ("meta.example", "resolves to 169.254.169.254"), ("ula.example", "resolves to fd00::1"), ("gone.example", "has no address")] {
+        let msg = try {
+            _ = public_addrs(h, fake_dns);
+            ""
+        } catch e { e.msg };
+        expect(msg.contains(want) && msg.contains("publish from a public https host"), msg);
+    }
+    expect((try! pinned("https://example.invalid/geom")).is_empty() && (try! pinned("/tmp/x")).is_empty(), "not pinned");
+    expect(https_host("https://Git.Example.org:443/a") == "git.example.org", "host");
 }
