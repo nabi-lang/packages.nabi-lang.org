@@ -4,7 +4,7 @@
 
 import { render } from "preact";
 import { CodeBlock } from "./ui/code-block.tsx";
-import { KO, MAX, Results, type Entry } from "./ui/results.tsx";
+import { MAX, Results, SAY, LANG, type Entry } from "./ui/results.tsx";
 
 (() => {
   let index: Entry[] | null = null;
@@ -181,8 +181,8 @@ import { KO, MAX, Results, type Entry } from "./ui/results.tsx";
   };
 
   // Header search: a combobox over the index; Enter without a pick opens
-  // the full list filtered (packages/?q=). On a Korean page the rows lead
-  // to the Korean pages (results.tsx).
+  // the full list filtered (packages/?q=). On a page in another language
+  // the rows lead to the pages in it (results.tsx).
   const form = document.querySelector<HTMLFormElement>(".hdr .search");
   const q = form?.querySelector<HTMLInputElement>(".q");
   const box = form?.querySelector<HTMLUListElement>(".results");
@@ -225,13 +225,7 @@ import { KO, MAX, Results, type Entry } from "./ui/results.tsx";
       if (box.hidden) fill(hits, terms, data, fixed);
       else resize(box, () => fill(hits, terms, data, fixed));
       show(true);
-      if (KO) {
-        const n = !hits.length ? "맞는 패키지가 없습니다" : `패키지 ${hits.length}개`;
-        status.textContent = fixed && hits.length ? `${fixed}: ${n}` : n;
-      } else {
-        const n = !hits.length ? "No packages match" : hits.length === 1 ? "1 package" : `${hits.length} packages`;
-        status.textContent = fixed && hits.length ? `${n} for ${fixed}` : n;
-      }
+      status.textContent = SAY[LANG].status(hits.length, fixed);
       mark(-1);
     };
     q.addEventListener("focus", () => void load(), { once: true });
