@@ -167,6 +167,18 @@ pre.cmd{border:1px solid var(--line);border-radius:var(--r);background:var(--cod
 .meta{border-left:1px solid var(--line);padding:32px 0 72px 32px;display:flex;flex-direction:column;gap:28px;min-width:0}
 .meta section{display:flex;flex-direction:column;gap:10px}
 .meta .kv code{font-size:13px}
+/* The details: two columns on a shared baseline when the panel is wide
+   (under the page on a phone), the label over its value when it is the
+   narrow side column. */
+.meta{container-type:inline-size}
+.meta .kv{row-gap:14px;column-gap:20px;align-items:baseline}
+.meta .kv dd{line-height:22px}
+@container (max-width:360px){
+  .meta .kv{grid-template-columns:minmax(0,1fr);row-gap:0}
+  .meta .kv dt{margin-top:14px;font-size:12px;line-height:16px}
+  .meta .kv dt:first-child{margin-top:0}
+  .meta .kv dd{margin-top:2px}
+}
 .inst{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);overflow:hidden;box-sizing:border-box}
 .itabs{display:flex;gap:16px;padding:0 12px;border-bottom:1px solid var(--line)}
 .itabs button{background:none;border:0;padding:10px 0;font-size:13px;line-height:18px;color:var(--ink-2);cursor:pointer}
