@@ -760,6 +760,10 @@ expect_body "<title>Search: geo - " "search title"
 expect_body '<option value="name" selected>' "search sort"
 req GET "/packages?q=nothing-like-it"
 expect_body "No packages match" "no results"
+req GET "/packages?q=gemo"
+expect_code 200 "typo search"
+expect_body 'Showing results for <a class="fixed" href="/packages?q=geom"><q>geom</q></a>' "typo corrected"
+expect_body '<b class="nm"><mark>geom</mark></b>' "typo results"
 # An executable alone: no Docs tab, `nabi install` in the box, a bin tag.
 req GET /packages/app
 expect_code 200 "executable page"

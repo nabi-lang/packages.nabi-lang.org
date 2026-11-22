@@ -55,6 +55,10 @@ Serve over HTTP (the search index is loaded with `fetch`). Links are root-relati
 python3 -m http.server -d public 8000
 ```
 
+## Search and browse
+
+`/packages?q=` (served by `serve`, works without JS) and the header's search box (`static/search.tsx`, over `/search-index.json`) match alike: every term must be in the name, the description or a keyword; exact name first, then name prefix, name, keyword, the rest, official packages first among equals. When nothing matches, each term found nowhere is replaced by the nearest name, part of a name (split at `-` / `_`) or keyword within a few edits (1 for 3 to 4 characters, 2 up to 8, 3 beyond; `names::edits`, which counts a swap of two neighbours as one), and the page shows those results under "Showing results for ..": `?q=jsn` shows `json`, `?q=lnalg` shows `linalg`.
+
 ## Server
 
 `nabi run -- serve` serves `public/` and the API over plain HTTP on `PACKAGES_ADDR` (TLS ends at a reverse proxy). Run it from this directory (reads `site.nabion` and `.env`). At start and after each index commit it rebuilds the site in the background. `GET /api/health` answers `ok`, `nabi <release>` (the toolchain the footer names) and `packages <count>`, one a line, or a 503 `failing` while the package list cannot be read.

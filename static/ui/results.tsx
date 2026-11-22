@@ -61,10 +61,12 @@ function Row({ e, k, terms }: { e: Entry; k: number; terms: string[] }) {
   );
 }
 
-/** `published`: the index has any packages at all. */
-export function Results({ hits, terms, published }: { hits: Entry[]; terms: string[]; published: boolean }) {
+/** `published`: the index has any packages at all; `fixed`: the
+ * corrected query the hits are for, when the typed one matched nothing. */
+export function Results({ hits, terms, published, fixed = "" }: { hits: Entry[]; terms: string[]; published: boolean; fixed?: string }) {
   return (
     <>
+      {fixed && hits.length ? <li role="none" class="fixed">Showing results for <q>{fixed}</q></li> : null}
       {hits.slice(0, MAX).map((e, k) => <Row e={e} k={k} terms={terms} />)}
       {!hits.length ? (
         <li role="none" class="empty">{published ? "No packages match." : "No packages published yet."}</li>

@@ -123,6 +123,63 @@ import { MAX, Results, type Entry } from "./ui/results.tsx";
     return [hits.map((h) => h[1]), terms];
   };
 
+  // Edits (insert, delete, change, swap two neighbours) from a to b, as
+  // names.nabi's edits.
+  const edits = (a: string, b: string): number => {
+    const x = [...a], y = [...b];
+    const d: number[][] = [];
+    for (let i = 0; i <= x.length; i++) d.push(Array.from({ length: y.length + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)));
+    for (let i = 1; i <= x.length; i++) {
+      for (let j = 1; j <= y.length; j++) {
+        const row = d[i]!, up = d[i - 1]!;
+        let best = Math.min(up[j]! + 1, row[j - 1]! + 1, up[j - 1]! + (x[i - 1] === y[j - 1] ? 0 : 1));
+        if (i > 1 && j > 1 && x[i - 1] === y[j - 2] && x[i - 2] === y[j - 1]) best = Math.min(best, d[i - 2]![j - 2]! + 1);
+        row[j] = best;
+      }
+    }
+    return d[x.length]![y.length]!;
+  };
+  const room = (n: number): number => (n < 3 ? 0 : n <= 4 ? 1 : n <= 8 ? 2 : 3);
+
+  // The query with each term found nowhere replaced by the nearest name,
+  // part of a name or keyword; null when none changed. layout.nabi's
+  // corrected does the same.
+  const corrected = (data: Entry[], query: string): string | null => {
+    const words = new Map<string, boolean>();
+    const add = (w: string, name: boolean): void => { if ([...w].length >= 2 && !words.has(w)) words.set(w, name); };
+    for (const e of data) {
+      const n = e.t.toLowerCase();
+      add(n, true);
+      for (const part of n.replace(/_/g, "-").split("-")) add(part, true);
+    }
+    for (const e of data) {
+      for (const k of e.k ?? []) {
+        const kl = k.toLowerCase();
+        add(kl, false);
+        for (const part of kl.replace(/_/g, "-").split("-")) add(part, false);
+      }
+    }
+    const found = (w: string): boolean =>
+      data.some((e) => e.t.toLowerCase().includes(w) || e.p.toLowerCase().includes(w) || (e.k ?? []).some((k) => k.toLowerCase().includes(w)));
+    let changed = false;
+    const out = query.toLowerCase().split(/\s+/).filter(Boolean).map((w) => {
+      const r = room([...w].length);
+      if (w.startsWith("official:") || !r || found(w)) return w;
+      let best = "", bestD = r + 1, bestName = false;
+      for (const [c, name] of words) {
+        const d = edits(w, c);
+        if (d > r) continue;
+        if (d < bestD || (d === bestD && ((name && !bestName) || (name === bestName && c < best)))) {
+          best = c; bestD = d; bestName = name;
+        }
+      }
+      if (!best) return w;
+      changed = true;
+      return best;
+    });
+    return changed ? out.join(" ") : null;
+  };
+
   // Header search: a combobox over the index; Enter without a pick opens
   // the full list filtered (packages/?q=).
   const form = document.querySelector<HTMLFormElement>(".hdr .search");
@@ -149,18 +206,26 @@ import { MAX, Results, type Entry } from "./ui/results.tsx";
       q.setAttribute("aria-expanded", on ? "true" : "false");
       if (!on) { q.removeAttribute("aria-activedescendant"); sel = -1; }
     };
-    const fill = (hits: Entry[], terms: string[], data: Entry[]): void =>
-      render(<Results hits={hits} terms={terms} published={data.length > 0} />, box);
+    const fill = (hits: Entry[], terms: string[], data: Entry[], fixed: string): void =>
+      render(<Results hits={hits} terms={terms} published={data.length > 0} fixed={fixed} />, box);
     const search = async (): Promise<void> => {
       const query = q.value.trim();
       if (!query) { show(false); status.textContent = ""; return; }
       const data = await load();
-      const [hits, terms] = match(data, query);
+      let [hits, terms] = match(data, query);
+      // Nothing matched: show the corrected query's matches, and say so.
+      let fixed = "";
+      const c = hits.length ? null : corrected(data, query);
+      if (c) {
+        const [h, t] = match(data, c);
+        if (h.length) { [hits, terms, fixed] = [h, t, c]; }
+      }
       // An open list eases to its new length; a closed one fades in (.appear).
-      if (box.hidden) fill(hits, terms, data);
-      else resize(box, () => fill(hits, terms, data));
+      if (box.hidden) fill(hits, terms, data, fixed);
+      else resize(box, () => fill(hits, terms, data, fixed));
       show(true);
-      status.textContent = !hits.length ? "No packages match" : hits.length === 1 ? "1 package" : `${hits.length} packages`;
+      const n = !hits.length ? "No packages match" : hits.length === 1 ? "1 package" : `${hits.length} packages`;
+      status.textContent = fixed && hits.length ? `${n} for ${fixed}` : n;
       mark(-1);
     };
     q.addEventListener("focus", () => void load(), { once: true });

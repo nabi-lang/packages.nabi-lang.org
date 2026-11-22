@@ -6,6 +6,7 @@ use pkg::docs::Status;
 use pkg::meta;
 use pkg::packages;
 use pkg::packages::{Package, Version};
+use pkg::server::names;
 use core::cmp::Ordering;
 use markdown::{Options, esc};
 use web::build;
@@ -485,24 +486,75 @@ fn official_grid(xs: List<Package>) -> str {
     b.to_str()
 }
 
-/// Edit distance (insert, delete, substitute) between `a` and `b`.
-fn distance(a: str, b: str) -> usize {
-    let x: List<char> = List::new();
-    for c in a.chars() { x.push(c); }
-    let y: List<char> = List::new();
-    for c in b.chars() { y.push(c); }
-    let prev: List<usize> = List::new();
-    for j in 0..y.len() + 1 { prev.push(j); }
-    for i in 0..x.len() {
-        let cur: List<usize> = [i + 1];
-        for j in 0..y.len() {
-            let sub = prev[j] + (if x[i] == y[j] { 0 } else { 1 });
-            let best = if prev[j + 1] + 1 < cur[j] + 1 { prev[j + 1] + 1 } else { cur[j] + 1 };
-            cur.push(if sub < best { sub } else { best });
+/// Edits a misspelt term of `n` characters may be from the word it
+/// meant: none under 3 characters, then 1, 2 from 5, 3 from 9.
+pub fn typo_room(n: usize) -> usize { if n < 3 { 0usize } else if n <= 4 { 1usize } else if n <= 8 { 2usize } else { 3usize } }
+
+/// `q` with each term that is in no name, description or keyword
+/// replaced by the nearest name, part of a name (split at `-` / `_`) or
+/// keyword within typo_room edits (names::edits); names win ties, then
+/// the shorter distance, then the word. None when no term changed.
+/// search.tsx corrects the same way.
+pub fn corrected(rows: List<Row>, q: str) -> str | none {
+    let words: List<(str, bool)> = List::new();
+    let seen: Set<str> = Set::new();
+    let add = |w: str, name: bool| {
+        if w.char_count() >= 2 && !seen.contains(w) {
+            seen.insert(w);
+            words.push((w, name));
         }
-        prev = cur;
+    };
+    for r in rows {
+        let n = r.name.to_lowercase();
+        add(n, true);
+        for part in n.replace("_", "-").split("-") { add(part, true); }
     }
-    prev[y.len()]
+    for r in rows {
+        for k in r.keywords {
+            let kl = k.to_lowercase();
+            add(kl, false);
+            for part in kl.replace("_", "-").split("-") { add(part, false); }
+        }
+    }
+    let found = |w: str| {
+        for r in rows {
+            if r.name.to_lowercase().contains(w) || r.desc.to_lowercase().contains(w) { return true; }
+            for k in r.keywords {
+                if k.to_lowercase().contains(w) { return true; }
+            }
+        }
+        false
+    };
+    let out: List<str> = List::new();
+    let changed = false;
+    for w in q.to_lowercase().replace("\t", " ").split(" ") {
+        if w.is_empty() { continue; }
+        let room = typo_room(w.char_count());
+        if w.starts_with("official:") || room == 0 || found(w) {
+            out.push(w);
+            continue;
+        }
+        let best = "";
+        let best_d = room + 1;
+        let best_name = false;
+        for (c, name) in words {
+            let d = names::edits(w, c);
+            if d > room { continue; }
+            let better = d < best_d || (d == best_d && ((name && !best_name) || (name == best_name && c < best)));
+            if better {
+                best = c;
+                best_d = d;
+                best_name = name;
+            }
+        }
+        if best.is_empty() {
+            out.push(w);
+        } else {
+            out.push(best);
+            changed = true;
+        }
+    }
+    if changed { out.join(" ") } else { none }
 }
 
 /// Up to three of `names` close to `name`: a few edits away, or one
@@ -513,7 +565,7 @@ pub fn closest(names: List<str>, name: str) -> List<str> {
     let room = if n <= 3 { 1usize } else if n <= 6 { 2usize } else { 3usize };
     let near: List<(usize, str)> = List::new();
     for c in names {
-        let d = distance(q, c);
+        let d = names::edits(q, c);
         if d <= room || (n >= 3 && (c.contains(q) || q.contains(c))) { near.push((d, c)); }
     }
     near.sort_by(|a: (usize, str), b: (usize, str)| if a.0 != b.0 { a.0.cmp(b.0) } else { a.1.cmp(b.1) });
@@ -537,6 +589,19 @@ pub fn list_page(rows: List<Row>, q: str, sort: str) -> (str, str) {
     // Without a query every row ties on relevance: that is name order.
     let sort = if sort == "name" || sort == "updated" { sort } else if terms.is_empty() { "name" } else { "relevance" };
     let hits = search(rows, q, sort);
+    // Nothing matched: a misspelling, most likely. Show the corrected
+    // query's matches and say so.
+    let fixed = "";
+    if hits.is_empty() && !terms.is_empty() {
+        if let c: str = corrected(rows, q) {
+            let again = search(rows, c, sort);
+            if !again.is_empty() {
+                fixed = c;
+                hits = again;
+                terms = terms_of(c);
+            }
+        }
+    }
     let order = if sort == "updated" { "recently updated first" } else if sort == "name" { "sorted by name" } else { "best match first" };
     let opts = StrBuf::new();
     for (v, label) in SORTS {
@@ -551,6 +616,9 @@ pub fn list_page(rows: List<Row>, q: str, sort: str) -> (str, str) {
         ("All packages", f"{plural(rows.len(), "package", "packages")}, {order}.")
     } else if hits.is_empty() {
         (f"Search: {q}", f"No packages match {qt}.")
+    } else if !fixed.is_empty() {
+        let href = esc("/packages?q=" + http::pct_encode(fixed));
+        (f"Search: {q}", f"No packages match {qt}. Showing results for <a class=\"fixed\" href=\"{href}\"><q>{esc(fixed)}</q></a>: {plural(hits.len(), "package", "packages")}, {order}. <a href=\"/packages\">Show all packages</a>")
     } else {
         (f"Search: {q}", f"{if hits.len() == 1 { "1 package matches" } else { f"{grouped(hits.len())} packages match" }} {qt}, {order}. <a href=\"/packages\">Show all packages</a>")
     };
@@ -1131,6 +1199,19 @@ fn searching() {
     assert(terms_of("Json official:yes").join(",") == "json" && filter_of("official:YES") == "yes" && filter_of("official:x").is_empty(), "filter terms");
     let (ot, ob) = list_page(rows, "official:yes", "");
     assert(ot == "Official packages" && ob.contains("2 official packages") && ob.contains("class=\"official\""), ob);
+}
+
+#[test]
+fn typos() {
+    let rows = [row("json", "JSON values", List::new(), 1i64), row("linalg", "Dense matrices", ["linear-algebra"], 2i64), row("nabi-syntax", "Highlighting", List::new(), 3i64), row("geom", "2D shapes", ["geometry"], 4i64)];
+    let fix = |q: str| corrected(rows, q) ?? "-";
+    assert(fix("jsn") == "json" && fix("lnalg") == "linalg" && fix("Jsno") == "json", fix("jsn"));
+    assert(fix("sytnax") == "syntax" && fix("geometyr") == "geometry" && fix("linera") == "linear", fix("sytnax"));
+    assert(fix("json") == "-" && fix("shapes") == "-" && fix("zzzzzz") == "-" && fix("jq") == "-", "nothing to correct");
+    assert(fix("jsn official:yes") == "json official:yes" && fix("dense lnalg") == "dense linalg", fix("dense lnalg"));
+    let (title, body) = list_page(rows, "lnalg", "");
+    assert(title == "Search: lnalg" && body.contains("No packages match <q>lnalg</q>. Showing results for <a class=\"fixed\" href=\"/packages?q=linalg\"><q>linalg</q></a>: 1 package") && body.contains("<b class=\"nm\"><mark>linalg</mark></b>"), body);
+    assert(list_page(rows, "zzzzzz", "").1.contains("No packages match <q>zzzzzz</q>. Try"), "no correction");
 }
 
 #[test]

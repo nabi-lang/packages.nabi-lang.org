@@ -59,6 +59,7 @@ button{font:inherit}
 .why{font-size:12px;line-height:16px;color:var(--ink-3);white-space:nowrap}
 .results .empty,.results .all{padding:8px 10px;font-size:13px;line-height:18px;color:var(--ink-2)}
 .results .all{border-top:1px solid var(--line);margin-top:4px}
+.results .fixed{padding:6px 10px 4px;font-size:12px;line-height:16px;color:var(--ink-3)}
 mark{background:none;color:var(--ink);font-weight:600;text-decoration:underline;text-decoration-color:var(--acc);text-underline-offset:3px}
 
 /* package rows */
