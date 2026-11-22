@@ -158,7 +158,7 @@ pub struct Package {
 /// Whether `s` has an executable: `nabi install` installs it.
 pub fn has_bin(s: Package) -> bool { !s.bins.is_empty() }
 
-/// What the server's data file adds to the index.
+/// What the server's data adds to the index.
 pub struct Data {
     /// By `<key>@<version>` (`index::key`).
     pub releases: Dict<str, Release>;

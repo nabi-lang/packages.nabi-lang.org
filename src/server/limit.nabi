@@ -16,7 +16,7 @@ pub const LOGINS: i64 = 20i64;
 /// Trusted publishing exchanges a minute per address.
 pub const EXCHANGES: i64 = 20i64;
 /// Reads that cost work, a minute per address: searches and package 404
-/// pages (both scan every name), and API reads (the data file, archives).
+/// pages (both scan every name), and API reads (the data, archives).
 pub const READS: i64 = 300i64;
 /// CSP violation reports logged a minute per address; the rest are
 /// dropped.

@@ -11,7 +11,7 @@ use pkg::secret;
 use pkg::server::admin::{Audit, audit};
 use pkg::server::github::{cq, curl, github_user};
 use pkg::server::routes::read_page;
-use pkg::server::store::{Account, Db, Locked, MAX_SESSIONS, SEEN_SECS, SESSION_COOKIE, SESSION_SECS, Session, STATE_COOKIE, account_of, load_db, lock_of, now_secs, save_db, session_cookie, session_of};
+use pkg::server::store::{Account, Db, Locked, MAX_SESSIONS, SEEN_SECS, SESSION_COOKIE, SESSION_SECS, Session, STATE_COOKIE, load_db, lock_of, now_secs, save_db, touch_session, viewer_of};
 use pkg::server::{Cfg, Resp, cookie, counts, LOCK, message, nabion_resp, page, redirect};
 use pkg::trust;
 use pkg::trust::{TrustedPublisher, TrustToken};
@@ -274,14 +274,11 @@ pub struct Viewer {
 }
 
 /// Who a request with a live session cookie is; none without one. No
-/// lock: the data file is replaced in one rename, and a cookie that is
-/// not 64 hex digits never reaches it. The session's `seen` moves on at
+/// lock, and three rows read, not the whole data; a cookie that is not
+/// 64 hex digits never reaches them. The session's `seen` moves on at
 /// most every SEEN_SECS.
 pub fn viewer(cfg: Cfg, r: Request) -> Viewer | none {
-    if session_cookie(r) is none { return none; }
-    let d = (try? load_db(cfg)) ?? { return none; };
-    let s = session_of(d, r) ?? { return none; };
-    let a = account_of(d, s.account) ?? { return none; };
+    let (s, a) = viewer_of(cfg, r) ?? { return none; };
     if now_secs() - s.seen >= SEEN_SECS { touch(cfg, s.hash); }
     Viewer { account: a, csrf: s.csrf }
 }
@@ -289,11 +286,7 @@ pub fn viewer(cfg: Cfg, r: Request) -> Viewer | none {
 /// Mark the session stored as `hash` seen now.
 fn touch(cfg: Cfg, hash: str) {
     using g = LOCK.lock() {
-        let d = (try? load_db(cfg)) ?? { return; };
-        for i in 0..d.sessions.len() {
-            if d.sessions[i].hash == hash { d.sessions[i].seen = now_secs(); }
-        }
-        try save_db(cfg, d) catch e { eprintln(f"data: {e}"); };
+        try touch_session(cfg, hash, now_secs()) catch e { eprintln(f"data: {e}"); };
     }
 }
 

@@ -118,6 +118,8 @@ mail_to() {
     done
     fail "no mail to $1 with $2: $(mails | tail -3)"
 }
+# db: the server's data as db.nabion has it (`export`).
+db() { "$bin" export - --data "$T/data"; }
 header() { grep -i "^$1:" "$T/h" | head -1 | sed -e 's/^[^:]*: *//' -e 's/\r$//'; }
 cookie_of() { grep -i "^set-cookie: $1=" "$T/h" | head -1 | sed -e "s/^[^=]*=//" -e 's/;.*//'; }
 expect_code() { [ "$code" = "$1" ] || fail "$2: HTTP $code, want $1: $(head -c 300 "$T/b")"; }
@@ -273,7 +275,7 @@ expect_code 403 "login without 2fa"
 expect_body "Turn on two-factor authentication" "2fa page"
 expect_body 'href="https://github.com/settings/security"' "2fa settings link"
 [ -z "$(cookie_of __Host-pkg_session)" ] || fail "session without 2fa"
-grep -q '"dave"' "$T/data/db.nabion" && fail "account stored without 2fa"
+grep -q '"dave"' <(db) && fail "account stored without 2fa"
 ok "two-factor required"
 
 login user
@@ -311,7 +313,7 @@ login admin
 expect_body "<strong>alice</strong>" "admin page"
 expect_body '<img class="av" src="https://avatars.githubusercontent.com/u/1001?s=160&v=4" width="80" height="80"' "profile avatar"
 expect_body '<p class="t-h3">Alice Liddell</p>' "profile name"
-grep -q 'name: "Alice Liddell"' "$T/data/db.nabion" && grep -q 'avatar_url: "https://avatars.githubusercontent.com/u/1001?v=4"' "$T/data/db.nabion" || fail "account name and avatar not stored"
+grep -q 'name: "Alice Liddell"' <(db) && grep -q 'avatar_url: "https://avatars.githubusercontent.com/u/1001?v=4"' <(db) || fail "account name and avatar not stored"
 req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "name=ci"
 expect_code 403 "token without csrf"
 req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$bob_csrf&name=ci"
@@ -325,7 +327,7 @@ req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&nam
 expect_code 200 "create token"
 tok=$(grep -o 'pkg_[0-9a-f]\{64\}' "$T/b" | head -1)
 [ -n "$tok" ] || fail "token not shown"
-grep -q "$tok" "$T/data/db.nabion" && fail "token stored in clear"
+grep -q "$tok" <(db) && fail "token stored in clear"
 req GET /me -H "Cookie: __Host-pkg_session=$sess"
 grep -q "$tok" "$T/b" && fail "token shown twice"
 expect_body "<td>ci</td>" "token listed"
@@ -342,7 +344,7 @@ ok "admin token"
 
 # Notices go to the primary verified address GitHub gave at login,
 # through SES with the instance role's credentials (the fake's IMDSv2).
-grep -q 'email: "alice@example.com"' "$T/data/db.nabion" || fail "primary verified email stored"
+grep -q 'email: "alice@example.com"' <(db) || fail "primary verified email stored"
 mail_to alice@example.com 'publish token ci created'
 mail_to alice@example.com 'It may: publish-update, publish-new, yank, owners, admin'
 mail_to alice@example.com 'publish token one created'
@@ -401,7 +403,7 @@ mail_to alice@example.com 'https://packages.test/packages/geom'
 req POST /me/notices -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&notify=on&kind-yank=on&kind-owners=on&kind-trusted=on&kind-token=on"
 expect_code 303 "notice settings"
 [ "$(header location)" = "/me#notices" ] || fail "notice settings location: $(header location)"
-grep -q 'notify_off: \["publish"\]' "$T/data/db.nabion" || fail "publish notices off"
+grep -q 'notify_off: \["publish"\]' <(db) || fail "publish notices off"
 [ "$(git -C "$T/remote.git" log -1 --format=%s)" = "Publish geom 0.1.0" ] || fail "pushed commit"
 [ "$(git -C "$T/remote.git" log -1 --format='%an <%ae>')" = "alice <1001+alice@users.noreply.github.com>" ] || fail "commit author"
 # The server adds the archive's SHA-256 after `tree`.
@@ -668,7 +670,7 @@ req GET /api/v1/packages/geom/0.1.0/download
 expect_code 200 "archive download"
 [ "$(header content-type)" = "application/gzip" ] || fail "archive type: $(header content-type)"
 tar -tzf "$T/b" | grep -qx 'geom-0.1.0/src/lib.nabi' || fail "archive paths: $(tar -tzf "$T/b" | head -3)"
-[ "$(shasum -a 256 "$T/b" | cut -d' ' -f1)" = "$(grep -o 'archive: "[0-9a-f]\{64\}"' "$T/data/db.nabion" | head -1 | cut -d'"' -f2)" ] || fail "archive digest"
+[ "$(shasum -a 256 "$T/b" | cut -d' ' -f1)" = "$(grep -o 'archive: "[0-9a-f]\{64\}"' <(db) | head -1 | cut -d'"' -f2)" ] || fail "archive digest"
 # Downloads: a GET sent whole counts; a HEAD, a 304 and a 404 do not.
 etag=$(header etag)
 code=$(curl -s -I -o /dev/null -w '%{http_code}' "$base/api/v1/packages/geom/0.1.0/download")
@@ -783,7 +785,7 @@ exchange "$jwt"
 expect_code 200 "exchange"
 expect_body 'TrustedToken { token: "pkt_[0-9a-f]\{64\}", expires: [0-9]*, packages: \["geom"\] }' "exchange body"
 ttok=$(grep -o 'pkt_[0-9a-f]\{64\}' "$T/b")
-grep -q "$ttok" "$T/data/db.nabion" && fail "trusted token stored in clear"
+grep -q "$ttok" <(db) && fail "trusted token stored in clear"
 exchange "$jwt"
 expect_code 401 "replayed OIDC token"
 expect_body "exchanged already" "replay body"
@@ -877,7 +879,7 @@ req POST "/me/trusted/$pid/remove" -H "Cookie: __Host-pkg_session=$sess" --data 
 expect_code 303 "remove trusted publisher"
 exchange "$(mint "$(claims acme/geom publish.yml)")"
 expect_code 403 "removed publisher"
-sid=$(grep -o 'seed-[0-9a-f]*' "$T/data/db.nabion" | head -1)
+sid=$(grep -o 'seed-[0-9a-f]*' <(db) | head -1)
 req POST "/me/trusted/$sid/remove" -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf"
 expect_code 400 "seeded publisher stays"
 ok "trusted publishing"
@@ -1048,7 +1050,7 @@ expect_code 200 "restored api"
 grep -q 'action: "takedown", target: "ge_om", reason: "malware"' "$T/data/audit.nabion" || fail "audit: $(cat "$T/data/audit.nabion")"
 # Five moderation steps; the accounts' own changes are logged beside them.
 [ "$(grep '^Audit' "$T/data/audit.nabion" | grep -cvE 'action: "(login|logout|logout-all|notices|token-[a-z]+|owner-[a-z]+|invite-[a-z]+|trusted-[a-z]+)"')" = 5 ] || fail "audit lines: $(cat "$T/data/audit.nabion")"
-ls "$T/data/backup/" | grep -q '^db-[0-9]\{10\}\.nabion$' || fail "db snapshot"
+ls "$T/data/backup/" | grep -q '^registry-[0-9]\{10\}\.sqlite3$' || fail "db snapshot"
 ok "moderation"
 
 # Official packages: a version is official when a trusted publisher in
@@ -1082,7 +1084,7 @@ expect_code 200 "publish from the organization"
 req GET /api/v1/packages/units
 expect_body 'unyanked_by: none, official: true }\], official: true, downloads: 0, recent_downloads: 0 }' "official in the api"
 expect_body 'published_by: Actor { id: 5151, login: "nabi-lang"' "an official version is the organization's"
-sed -n '/name: "units",/,/^        Release {/p' "$T/data/db.nabion" | grep -q 'official: true' || fail "official release record"
+sed -n '/name: "units",/,/^        Release {/p' <(db) | grep -q 'official: true' || fail "official release record"
 # An admin's publish is not the organization's.
 auth=("${aauth[@]}")
 publish "$(entry units 0.1.1)"
@@ -1239,6 +1241,66 @@ for c in "$first" "$sess"; do
 done
 grep -q 'action: "logout-all"' "$T/data/audit.nabion" || fail "audited: logout-all"
 ok "sessions"
+
+# Backups: `backup` copies the live database (the online backup API);
+# the copy holds the same data, in one file.
+"$bin" backup "$T/copy/registry.sqlite3" --data "$T/data" 2>/dev/null && fail "backup into a missing directory"
+mkdir -p "$T/copy"
+"$bin" backup "$T/copy/registry.sqlite3" --data "$T/data" 2>"$T/err" || fail "backup: $(cat "$T/err")"
+"$bin" backup "$T/copy/registry.sqlite3" --data "$T/data" 2>"$T/err" && fail "backup over a file"
+grep -q 'exists; remove it or name a new file' "$T/err" || fail "backup over a file: $(cat "$T/err")"
+[ ! -e "$T/copy/registry.sqlite3-wal" ] || fail "backup left a WAL"
+diff <(db) <("$bin" export - --data "$T/copy") >/dev/null || fail "backup differs"
+ok "backup"
+
+# Migration: a data directory with db.nabion and no registry.sqlite3
+# (a server from before SQLite) is imported once on start, db.nabion
+# kept as it was, and the server answers as before: sessions, tokens,
+# accounts, owners and releases all came across.
+login admin
+req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&name=migrate&$all_scopes"
+expect_code 200 "token before the migration"
+mtok=$(grep -o 'pkg_[0-9a-f]\{64\}' "$T/b" | head -1)
+answers() {
+    local p
+    for p in /api/v1/packages/geom "/api/v1/packages/units?format=json" /api/v1/docs /api/v1/me /api/v1/trusted-publishers /api/v1/admin; do
+        req GET "$p" -H "Authorization: Bearer $mtok"
+        echo "$p $code"
+        cat "$T/b"
+    done
+    req GET /me -H "Cookie: __Host-pkg_session=$sess"
+    echo "/me $code"
+    cat "$T/b"
+    for p in /packages/geom /packages/geom/versions /packages/units; do
+        req GET "$p"
+        echo "$p $code"
+        cat "$T/b"
+    done
+}
+answers > "$T/before"
+[ "$(grep -c '^/[^ ]* 200$' "$T/before")" = 10 ] || fail "answers before the migration: $(grep '^/[^ ]* [0-9]*$' "$T/before")"
+"$bin" export "$T/old.nabion" --data "$T/data" || fail "export"
+kill "$server"; wait "$server" 2>/dev/null || true
+mv "$T/data/registry.sqlite3" "$T/first.sqlite3"
+rm -f "$T/data/registry.sqlite3-wal" "$T/data/registry.sqlite3-shm"
+cp "$T/old.nabion" "$T/data/db.nabion"
+# The site too is built again, from the imported data.
+rm -rf "$T/site/public"
+start_server 1001
+grep -q "data: imported $T/data/db.nabion into $T/data/registry.sqlite3: [0-9]* accounts, [0-9]* sessions, [0-9]* tokens" "$T/server.log" || fail "import logged: $(grep 'data:' "$T/server.log" | tail -3)"
+for _ in $(seq 100); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/packages/units")" = 200 ] && break
+    sleep 0.2
+done
+answers > "$T/after"
+diff "$T/before" "$T/after" >"$T/err" || fail "answers differ after the migration: $(head -20 "$T/err")"
+cmp -s "$T/old.nabion" "$T/data/db.nabion" || fail "db.nabion changed by the import"
+kill "$server"; wait "$server" 2>/dev/null || true
+start_server 1001
+[ "$(grep -c 'data: imported' "$T/server.log")" = 1 ] || fail "imported twice"
+req GET /api/v1/me -H "Authorization: Bearer $mtok"
+expect_code 200 "token after a second start"
+ok "migration from db.nabion"
 
 grep -q "code=" "$T/server.log" && fail "OAuth code in the log"
 grep -q "test-secret\|gho_" "$T/server.log" && fail "secret in the log"

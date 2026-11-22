@@ -1,5 +1,5 @@
 // What the index does not hold: a version's descriptive metadata, sent
-// with the publish and kept in the data file, and who published, yanked
+// with the publish and kept in the server's data, and who published, yanked
 // and unyanked it.
 
 use std::nabion;

@@ -256,8 +256,8 @@ fn trusted_section(b: StrBuf, csrf: str, list: List<TrustedPublisher>) {
 }
 
 /// `/me`, `/logout`, `/me/tokens..`, `/me/trusted..`, `/me/owners..` and
-/// `/me/invites..`: the session's account pages. The data file is read
-/// as it is; each change takes `LOCK` for its own read and write.
+/// `/me/invites..`: the session's account pages. The data is read as it
+/// is; each change takes `LOCK` for its own read and write.
 pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     let db = try load_db(cfg);
     let s = session_of(db, r) ?? Session { hash: "", account: 0i64, csrf: "", expires: 0i64 };

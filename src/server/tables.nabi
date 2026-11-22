@@ -1,0 +1,550 @@
+// The data in SQLite: PACKAGES_DATA/registry.sqlite3, in WAL mode.
+//
+// One table per kind of record. Each row keeps the record's NABION in
+// `data` (so a field added later needs no migration, its default fills
+// in) under a key `k`, beside the columns lookups use. A record without
+// a natural key (an event, a trusted publisher) is keyed by its digest.
+// Rows read back in rowid order, which is the order they were added.
+//
+// A write (save) runs in one IMMEDIATE transaction and changes only the
+// rows that differ from what is stored. Reads run in a plain
+// transaction, a snapshot that never waits on a writer. Connections are
+// pooled per database, one thread on each at a time.
+//
+// The schema is `MIGRATIONS`, applied in order and counted in
+// schema_version. A data directory with db.nabion and no
+// registry.sqlite3 is imported once (import_nabion); db.nabion is left
+// as it was.
+
+use pkg::meta::Release;
+use pkg::secret;
+use pkg::server::sqlite;
+use pkg::server::sqlite::{Conn, SqlError};
+use pkg::server::store::{Account, Db, Event, Invite, Locked, Owner, Removal, Session, Token};
+use pkg::trust::{TrustedPublisher, TrustToken};
+use std::fs;
+use std::nabion;
+use std::nabion::{FromNabion, ToNabion};
+
+pub const FILE: str = "registry.sqlite3";
+
+/// Milliseconds a connection waits for another's write lock.
+const BUSY_MS: i32 = 10000;
+
+/// Idle connections kept per database.
+const POOL_MAX: usize = 16;
+
+/// The schema, one step a version: step `i` takes version `i` to `i + 1`.
+fn migrations() -> List<str> {
+    [
+        "CREATE TABLE accounts (k TEXT PRIMARY KEY, id INTEGER NOT NULL, login TEXT NOT NULL, data TEXT NOT NULL);
+         CREATE INDEX accounts_login ON accounts (login);
+         CREATE TABLE sessions (k TEXT PRIMARY KEY, account INTEGER NOT NULL, data TEXT NOT NULL);
+         CREATE INDEX sessions_account ON sessions (account);
+         CREATE TABLE tokens (k TEXT PRIMARY KEY, account INTEGER NOT NULL, data TEXT NOT NULL);
+         CREATE INDEX tokens_account ON tokens (account);
+         CREATE TABLE owners (k TEXT PRIMARY KEY, data TEXT NOT NULL);
+         CREATE TABLE releases (k TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, data TEXT NOT NULL);
+         CREATE INDEX releases_name ON releases (name);
+         CREATE TABLE trusted (k TEXT PRIMARY KEY, package TEXT NOT NULL, data TEXT NOT NULL);
+         CREATE TABLE trust_tokens (k TEXT PRIMARY KEY, data TEXT NOT NULL);
+         CREATE TABLE invites (k TEXT PRIMARY KEY, account INTEGER NOT NULL, data TEXT NOT NULL);
+         CREATE TABLE locked (k TEXT PRIMARY KEY, data TEXT NOT NULL);
+         CREATE TABLE removed (k TEXT PRIMARY KEY, data TEXT NOT NULL);
+         CREATE TABLE approved (k TEXT PRIMARY KEY, data TEXT NOT NULL);
+         CREATE TABLE events (k TEXT PRIMARY KEY, package TEXT NOT NULL, at INTEGER NOT NULL, data TEXT NOT NULL);
+         CREATE INDEX events_package ON events (package, at);
+         CREATE TABLE imports (at INTEGER NOT NULL, source TEXT NOT NULL, summary TEXT NOT NULL);",
+    ]
+}
+
+pub fn schema_version() -> i64 { migrations().len() as i64 }
+
+/// One stored record: its key, its lookup columns and its NABION.
+struct Row {
+    k: str;
+    cols: List<str>;
+    data: str;
+}
+
+/// A table: its name and the lookup columns between `k` and `data`.
+struct Spec {
+    name: str;
+    cols: List<str>;
+}
+
+fn specs() -> List<Spec> {
+    [
+        Spec { name: "accounts", cols: ["id", "login"] },
+        Spec { name: "sessions", cols: ["account"] },
+        Spec { name: "tokens", cols: ["account"] },
+        Spec { name: "owners", cols: List::new() },
+        Spec { name: "releases", cols: ["name", "version"] },
+        Spec { name: "trusted", cols: ["package"] },
+        Spec { name: "trust_tokens", cols: List::new() },
+        Spec { name: "invites", cols: ["account"] },
+        Spec { name: "locked", cols: List::new() },
+        Spec { name: "removed", cols: List::new() },
+        Spec { name: "approved", cols: List::new() },
+        Spec { name: "events", cols: ["package", "at"] },
+    ]
+}
+
+pub fn path_of(dir: str) -> str { dir + "/" + FILE }
+
+/// Idle connections by database path.
+static POOL: Mutex<Dict<str, List<usize>>> = Mutex::new(Dict::new());
+/// Databases this process has brought to the current schema.
+static READY: Mutex<Set<str>> = Mutex::new(Set::new());
+/// Held while a database is set up, so two threads do not both migrate.
+static SETUP: Mutex<i32> = Mutex::new(0);
+
+fn fresh(path: str, create: bool) throws (SqlError) -> Conn {
+    let c = try sqlite::open(path, create, BUSY_MS);
+    // FULL: a commit is on disk before the answer goes out.
+    try sqlite::exec(c, "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON") catch e {
+        sqlite::close(c);
+        throw e;
+    };
+    c
+}
+
+/// A connection to `dir`'s database, at the current schema; never
+/// creates it (open_data does).
+pub fn take(dir: str) throws (SqlError) -> Conn {
+    let path = path_of(dir);
+    let idle: usize = 0usize;
+    using g = POOL.lock() {
+        let d = g.get();
+        if let l: List<usize> = d.get(path) {
+            if let p: usize = l.pop() { idle = p; }
+        }
+    }
+    if idle != 0usize { return try sqlite::adopt(idle); }
+    if !fs::exists(path) { throw SqlError { code: 14, msg: f"no database at {path}; start the server once (`serve`) to create it" }; }
+    let c = try fresh(path, false);
+    try ready(c, path) catch e {
+        sqlite::close(c);
+        throw e;
+    };
+    c
+}
+
+/// Give `c` back for the next caller; past POOL_MAX it is closed.
+pub fn give(dir: str, c: Conn) {
+    let path = path_of(dir);
+    let kept = false;
+    using g = POOL.lock() {
+        let d = g.get();
+        let l = d.get(path) ?? List::new();
+        if l.len() < POOL_MAX {
+            l.push(c.p);
+            d.insert(path, l);
+            kept = true;
+        }
+    }
+    if !kept { sqlite::close(c); }
+}
+
+/// Close the pooled connections of `dir` (tests, and before a file is
+/// replaced).
+pub fn close_all(dir: str) {
+    let path = path_of(dir);
+    let ps: List<usize> = List::new();
+    using g = POOL.lock() {
+        let d = g.get();
+        for p in d.get(path) ?? List::new() { ps.push(p); }
+        d.remove(path);
+    }
+    using g = READY.lock() { g.get().remove(path); }
+    for p in ps {
+        if let c: Conn = try? sqlite::adopt(p) { sqlite::close(c); }
+    }
+}
+
+fn ready(c: Conn, path: str) throws (SqlError) {
+    using g = READY.lock() {
+        if g.get().contains(path) { return; }
+    }
+    using s = SETUP.lock() { try migrate(c); }
+    using g = READY.lock() { g.get().insert(path); }
+}
+
+fn stored_version(c: Conn) throws (SqlError) -> i64 {
+    let q = try sqlite::prepare(c, "SELECT version FROM schema_version");
+    let has = false;
+    try { has = try q.step(); } catch e {
+        q.finalize();
+        throw e;
+    };
+    let v = if has { q.col_int(0) } else { 0i64 };
+    q.finalize();
+    v
+}
+
+/// Bring `c`'s database to the current schema, each step in its own
+/// transaction.
+pub fn migrate(c: Conn) throws (SqlError) {
+    try sqlite::exec(c, "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)");
+    let steps = migrations();
+    let v = try stored_version(c);
+    if v > steps.len() as i64 {
+        throw SqlError { code: -1, msg: f"{FILE} is at schema version {v}, newer than this server's {steps.len()}: run the newer server, or restore a backup made for this one" };
+    }
+    while v < steps.len() as i64 {
+        try sqlite::begin(c, true);
+        try {
+            try sqlite::exec(c, steps[v as usize]);
+            try sqlite::exec(c, "DELETE FROM schema_version");
+            let s = try sqlite::prepare(c, "INSERT INTO schema_version (version) VALUES (?1)");
+            try s.num(1, v + 1i64).run() catch e {
+                s.finalize();
+                throw e;
+            };
+            s.finalize();
+            try sqlite::commit(c);
+        } catch e {
+            sqlite::rollback(c);
+            throw SqlError { code: -1, msg: f"schema step {v + 1i64}: {e}" };
+        };
+        eprintln(f"data: {FILE} schema version {v + 1i64}");
+        v += 1i64;
+    }
+}
+
+/// `xs` as rows keyed by `key`; a key met again gets `#n`.
+fn rows<T: ToNabion>(xs: List<T>, key: fn(T) -> str, cols: fn(T) -> List<str>) throws -> List<Row> {
+    let out: List<Row> = List::new();
+    let seen: Dict<str, i64> = Dict::new();
+    for x in xs {
+        let data = try nabion::to_str_flat(x);
+        let k = key(x);
+        if k.is_empty() { k = secret::sha256_hex(data)[:32]; }
+        let n = seen.get(k) ?? 0i64;
+        seen.insert(k, n + 1i64);
+        out.push(Row { k: if n == 0i64 { k } else { f"{k}#{n}" }, cols: cols(x), data: data });
+    }
+    out
+}
+
+/// Every table's rows for `db`, in specs() order.
+fn rows_of(db: Db) throws -> List<List<Row>> {
+    let approved: List<Row> = List::new();
+    for n in db.approved { approved.push(Row { k: n, cols: List::new(), data: try nabion::to_str_flat(n) }); }
+    [
+        try rows(db.accounts, |a: Account| f"{a.id}", |a: Account| [f"{a.id}", a.login]),
+        try rows(db.sessions, |s: Session| s.hash, |s: Session| [f"{s.account}"]),
+        try rows(db.tokens, |t: Token| t.hash, |t: Token| [f"{t.account}"]),
+        try rows(db.owners, |o: Owner| o.name, |_o: Owner| List::<str>::new()),
+        try rows(db.releases, |r: Release| r.name + "@" + r.version, |r: Release| [r.name, r.version]),
+        try rows(db.trusted, |_p: TrustedPublisher| "", |p: TrustedPublisher| [p.package]),
+        try rows(db.trust_tokens, |t: TrustToken| t.hash, |_t: TrustToken| List::<str>::new()),
+        try rows(db.invites, |v: Invite| f"{v.package} {v.account}", |v: Invite| [f"{v.account}"]),
+        try rows(db.locked, |l: Locked| f"{l.id}", |_l: Locked| List::<str>::new()),
+        try rows(db.removed, |x: Removal| x.name + "@" + x.version, |_x: Removal| List::<str>::new()),
+        approved,
+        try rows(db.events, |_e: Event| "", |e: Event| [e.package, f"{e.at}"]),
+    ]
+}
+
+/// The `data` of every row of `table`, in rowid order.
+fn datas(c: Conn, table: str) throws (SqlError) -> List<str> {
+    let q = try sqlite::prepare(c, f"SELECT data FROM {table} ORDER BY rowid");
+    let out: List<str> = List::new();
+    try {
+        while try q.step() { out.push(q.col(0)); }
+    } catch e {
+        q.finalize();
+        throw e;
+    };
+    q.finalize();
+    out
+}
+
+fn parse<T: FromNabion>(c: Conn, table: str) throws -> List<T> {
+    let out: List<T> = List::new();
+    for d in try datas(c, table) {
+        let x: T = try nabion::from_str(d) catch e { throw SqlError { code: -1, msg: f"a row of {table} is not valid NABION ({e}): {d[:if d.len() > 120 { 120usize } else { d.len() }]}" }; };
+        out.push(x);
+    }
+    out
+}
+
+/// The whole of `c`'s data, read in one snapshot.
+fn read_all(c: Conn) throws -> Db {
+    try sqlite::begin(c, false);
+    let db = Db {
+        accounts: try parse(c, "accounts"),
+        sessions: try parse(c, "sessions"),
+        tokens: try parse(c, "tokens"),
+        owners: try parse(c, "owners"),
+        releases: try parse(c, "releases"),
+        trusted: try parse(c, "trusted"),
+        trust_tokens: try parse(c, "trust_tokens"),
+        invites: try parse(c, "invites"),
+        locked: try parse(c, "locked"),
+        removed: try parse(c, "removed"),
+        approved: try parse(c, "approved"),
+        events: try parse(c, "events"),
+    };
+    try sqlite::commit(c);
+    db
+}
+
+/// Make `table` hold `want`: rows whose data changed are updated in
+/// place (keeping their rowid, so their order), new ones added at the
+/// end, missing ones deleted.
+fn sync(c: Conn, s: Spec, want: List<Row>) throws (SqlError) {
+    let have: Dict<str, str> = Dict::new();
+    let q = try sqlite::prepare(c, f"SELECT k, data FROM {s.name}");
+    try {
+        while try q.step() { have.insert(q.col(0), q.col(1)); }
+    } catch e {
+        q.finalize();
+        throw e;
+    };
+    q.finalize();
+    let names = ["k"];
+    let marks = ["?1"];
+    let sets: List<str> = List::new();
+    for i in 0..s.cols.len() {
+        names.push(s.cols[i]);
+        marks.push(f"?{i + 2}");
+        sets.push(f"{s.cols[i]} = excluded.{s.cols[i]}");
+    }
+    names.push("data");
+    marks.push(f"?{s.cols.len() + 2}");
+    sets.push("data = excluded.data");
+    let up = try sqlite::prepare(c, f"INSERT INTO {s.name} ({names.join(", ")}) VALUES ({marks.join(", ")}) ON CONFLICT (k) DO UPDATE SET {sets.join(", ")}");
+    let del = try sqlite::prepare(c, f"DELETE FROM {s.name} WHERE k = ?1");
+    try {
+        for r in want {
+            let old = have.get(r.k);
+            have.remove(r.k);
+            if let o: str = old {
+                if o == r.data { continue; }
+            }
+            _ = try up.text(1, r.k);
+            for i in 0..r.cols.len() { _ = try up.text((i + 2) as i32, r.cols[i]); }
+            try up.text((r.cols.len() + 2) as i32, r.data).run();
+            up.reset();
+        }
+        for k in have.keys() {
+            try del.text(1, k).run();
+            del.reset();
+        }
+    } catch e {
+        up.finalize();
+        del.finalize();
+        throw e;
+    };
+    up.finalize();
+    del.finalize();
+}
+
+fn write_all(c: Conn, db: Db) throws {
+    let all = try rows_of(db);
+    let ss = specs();
+    try sqlite::begin(c, true);
+    try {
+        for i in 0..ss.len() { try sync(c, ss[i], all[i]); }
+        try sqlite::commit(c);
+    } catch e {
+        sqlite::rollback(c);
+        throw e;
+    };
+}
+
+/// `dir`'s data, read without waiting on a writer.
+pub fn load(dir: str) throws -> Db {
+    let c = try take(dir);
+    let db = try read_all(c) catch e {
+        sqlite::rollback(c);
+        sqlite::close(c);
+        throw e;
+    };
+    give(dir, c);
+    db
+}
+
+/// Store `db` as `dir`'s data, in one transaction.
+pub fn store(dir: str, db: Db) throws {
+    let c = try take(dir);
+    try write_all(c, db) catch e {
+        sqlite::close(c);
+        throw e;
+    };
+    give(dir, c);
+}
+
+/// The `data` of the row of `table` keyed `k`; none when there is none.
+pub fn row(dir: str, table: str, k: str) throws -> str | none {
+    let c = try take(dir);
+    let out: str | none = none;
+    let q = try sqlite::prepare(c, f"SELECT data FROM {table} WHERE k = ?1") catch e {
+        give(dir, c);
+        throw e;
+    };
+    try {
+        if try q.text(1, k).step() { out = q.col(0); }
+    } catch e {
+        q.finalize();
+        give(dir, c);
+        throw e;
+    };
+    q.finalize();
+    give(dir, c);
+    out
+}
+
+/// Replace the data of the row of `table` keyed `k`; false when there
+/// is no such row. Lookup columns are left as they are: for a change
+/// that touches none of them.
+pub fn set_row(dir: str, table: str, k: str, data: str) throws -> bool {
+    let c = try take(dir);
+    let q = try sqlite::prepare(c, f"UPDATE {table} SET data = ?1 WHERE k = ?2") catch e {
+        give(dir, c);
+        throw e;
+    };
+    try q.text(1, data).text(2, k).run() catch e {
+        q.finalize();
+        give(dir, c);
+        throw e;
+    };
+    q.finalize();
+    let n = sqlite::changes(c);
+    give(dir, c);
+    n > 0i64
+}
+
+/// Counts of each table's rows, `accounts 2, sessions 0, ..`.
+fn summary(db: Db) -> str {
+    f"{db.accounts.len()} accounts, {db.sessions.len()} sessions, {db.tokens.len()} tokens, {db.owners.len()} owners, {db.releases.len()} releases, {db.trusted.len()} trusted publishers, {db.trust_tokens.len()} trusted publishing tokens, {db.invites.len()} invitations, {db.locked.len()} locked accounts, {db.removed.len()} takedowns, {db.approved.len()} approved names, {db.events.len()} events"
+}
+
+/// Make `dir`'s database ready for the server: created, imported from
+/// db.nabion when that is all there is, and at the current schema.
+/// What was done, for the log.
+pub fn open_data(dir: str) throws -> str {
+    let path = path_of(dir);
+    let old = dir + "/db.nabion";
+    let said = "";
+    if !fs::exists(path) {
+        if fs::exists(old) {
+            said = try import_nabion(dir, old);
+        } else {
+            let c = try fresh(path, true);
+            try migrate(c) catch e {
+                sqlite::close(c);
+                throw e;
+            };
+            sqlite::close(c);
+            said = f"created {path}";
+        }
+    }
+    let c = try take(dir);
+    give(dir, c);
+    said
+}
+
+/// Import `file` (db.nabion) into a new `dir/registry.sqlite3`, all in
+/// one transaction, built beside it and renamed into place: a crash
+/// halfway leaves no database, and the next start imports again.
+pub fn import_nabion(dir: str, file: str) throws -> str {
+    let db: Db = try nabion::from_str(try fs::read_to_str(file)) catch e {
+        throw SqlError { code: -1, msg: f"cannot import {file}: {e}; fix the file or move it away to start with no data" };
+    };
+    let path = path_of(dir);
+    let tmp = path + ".import";
+    for x in [tmp, tmp + "-wal", tmp + "-shm"] { try fs::remove_file(x) catch _ {}; }
+    let c = try fresh(tmp, true);
+    try {
+        try migrate(c);
+        try write_all(c, db);
+        let s = summary(db);
+        let q = try sqlite::prepare(c, "INSERT INTO imports (at, source, summary) VALUES (?1, ?2, ?3)");
+        try q.num(1, pkg::server::store::now_secs()).text(2, file).text(3, s).run() catch e {
+            q.finalize();
+            throw e;
+        };
+        q.finalize();
+        // One file: nothing left in the WAL to lose in the rename.
+        try sqlite::exec(c, "PRAGMA wal_checkpoint(TRUNCATE)");
+    } catch e {
+        sqlite::close(c);
+        throw e;
+    };
+    sqlite::close(c);
+    try fs::rename(tmp, path);
+    for x in [tmp + "-wal", tmp + "-shm"] { try fs::remove_file(x) catch _ {}; }
+    f"imported {file} into {path}: {summary(db)}; {file} is kept as it was"
+}
+
+/// A consistent copy of `dir`'s database at `dest`, made while the
+/// server runs (the online backup API). `dest` must not exist.
+pub fn backup(dir: str, dest: str) throws {
+    if fs::exists(dest) { throw SqlError { code: -1, msg: f"{dest} exists; remove it or name a new file" }; }
+    let c = try take(dir);
+    try sqlite::backup(c, dest) catch e {
+        give(dir, c);
+        throw e;
+    };
+    give(dir, c);
+    let b = try fresh(dest, false);
+    let q = try sqlite::prepare(b, "PRAGMA quick_check") catch e {
+        sqlite::close(b);
+        throw e;
+    };
+    let ok = (try q.step() catch _ { false }) && q.col(0) == "ok";
+    q.finalize();
+    // A copy in one file: rollback journal, no -wal beside it.
+    try sqlite::exec(b, "PRAGMA journal_mode = DELETE") catch _ {};
+    sqlite::close(b);
+    if !ok { throw SqlError { code: -1, msg: f"the copy at {dest} fails PRAGMA quick_check; keep the last good backup and look at the disk" }; }
+}
+
+#[test]
+fn import_and_round_trip() {
+    let dir = std::env::temp_dir().as_str() + f"/packages-tables-{std::process::id()}";
+    try fs::remove_dir_all(dir) catch _ {};
+    try! fs::create_dir_all(dir);
+    let fixture = try! fs::read_to_str("fixtures/data/db.nabion");
+    try! fs::write(dir + "/db.nabion", fixture);
+    let want: Db = try! nabion::from_str(fixture);
+    // Records the fixture lacks: sessions, tokens, events, duplicates.
+    let said = try open_data(dir) catch e { panic(f"{e}"); };
+    assert(said.contains("imported") && said.contains(f"{want.accounts.len()} accounts"), said);
+    assert(try! fs::read_to_str(dir + "/db.nabion") == fixture, "db.nabion left as it was");
+    assert(!fs::exists(path_of(dir) + ".import"), "no import file left");
+    let got = try load(dir) catch e { panic(f"{e}"); };
+    assert(try! nabion::to_str(got) == try! nabion::to_str(want), "same data after the import");
+    // Changes: one row changed in place, one added, one removed.
+    got.accounts[0].name = "Changed";
+    got.accounts.push(Account { id: 7i64, login: "new", created: 1i64 });
+    got.owners.remove(1);
+    let e = Event { package: "geom", at: 5i64, by: 1i64, who: "a", action: "publish" };
+    got.events = [e, e];
+    got.sessions = [Session { hash: "ab".repeat(32), account: 7i64, csrf: "c", expires: 9i64 }];
+    try store(dir, got) catch x { panic(f"{x}"); };
+    let back = try load(dir) catch x { panic(f"{x}"); };
+    assert(try! nabion::to_str(back) == try! nabion::to_str(got), "same data after a write");
+    assert(back.accounts[0].name == "Changed" && back.accounts[back.accounts.len() - 1].login == "new" && back.events.len() == 2, "order kept");
+    let s = try row(dir, "sessions", "ab".repeat(32)) catch x { panic(f"{x}"); };
+    assert(s is str && (try row(dir, "sessions", "cd") catch _ { "x" }) is none, "one row");
+    assert(try set_row(dir, "accounts", "7", "Account { id: 7, login: \"renamed\", created: 1 }") catch _ { false }, "set row");
+    assert((try load(dir) catch x { panic(f"{x}"); }).accounts[back.accounts.len() - 1].login == "renamed", "row set");
+    // Started again: no import, the same data.
+    close_all(dir);
+    assert((try open_data(dir) catch x { panic(f"{x}"); }).is_empty(), "nothing to do");
+    try backup(dir, dir + "/copy.sqlite3") catch x { panic(f"{x}"); };
+    let refused = "";
+    try backup(dir, dir + "/copy.sqlite3") catch x { refused = f"{x}"; };
+    assert(refused.contains("remove it or name a new file"), refused);
+    try! fs::create_dir_all(dir + "/restored");
+    try! fs::rename(dir + "/copy.sqlite3", dir + "/restored/" + FILE);
+    let r = try load(dir + "/restored") catch x { panic(f"{x}"); };
+    assert(r.accounts.len() == back.accounts.len(), "restored");
+    close_all(dir);
+    close_all(dir + "/restored");
+    try fs::remove_dir_all(dir) catch _ {};
+}

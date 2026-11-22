@@ -175,7 +175,7 @@ pub fn wants(a: Account, kind: str) -> bool { a.notify && !a.email.is_empty() &&
 /// `name` the package as written ("" for an account's notice).
 pub fn notify(cfg: Cfg, kind: str, key: str, name: str, subject: str, what: str, also: List<i64>) {
     let db = (try? load_db(cfg)) ?? {
-        eprintln(f"mail: cannot read the data file; not sent: {subject}");
+        eprintln(f"mail: cannot read the data; not sent: {subject}");
         return;
     };
     let ids: List<i64> = List::new();

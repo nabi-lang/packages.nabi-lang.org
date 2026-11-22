@@ -6,8 +6,11 @@
 //   nabi run -- --demo            use fixtures/index and fixtures/readme
 //   nabi run -- --offline         no `git fetch` for READMEs (cache only)
 //   nabi run -- --index <dir>     another index checkout
-//   nabi run -- --data <dir>      the server's data (db.nabion): metadata, publishers, owners
+//   nabi run -- --data <dir>      the server's data (registry.sqlite3, or a
+//                                 db.nabion): metadata, publishers, owners
 //   nabi run -- serve             serve the site and the API (see server.nabi)
+//   nabi run -- backup <file>     copy the server's database while it runs
+//   nabi run -- export <file|->   the server's data as db.nabion has it
 //   <program> docs <db> <rev> <crate> <dir>
 //                                 scan one version's docs (docs.nabi; run by
 //                                 the server and the build, not by hand)
@@ -225,6 +228,7 @@ fn main() throws {
         try server::serve(try load_site());
         return;
     }
+    if args.len() >= 2 && (args[1] == "backup" || args[1] == "export") { process::exit(server::data_cmd(args)); }
     if args.len() == 6 && args[1] == "docs" { process::exit(docs::scan_cmd(args[2], args[3], args[4], args[5])); }
     let strict = false;
     let demo = false;

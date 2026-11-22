@@ -2,10 +2,10 @@
 // anyone; publish, yank, owners, trusted publishers and moderation for a
 // token.
 //
-// Nothing slow runs under a lock. Reads take the data file as it is (it
-// is replaced in one rename). A package's source is fetched and checked
-// before any lock is taken; then `INDEX` covers the index commit and
-// push, and `LOCK`, inside it, the data file's read and write.
+// Nothing slow runs under a lock. Reads take a snapshot of the data,
+// without a lock. A package's source is fetched and checked before any
+// lock is taken; then `INDEX` covers the index commit and push, and
+// `LOCK`, inside it, the data's read and write.
 
 use pkg::docs;
 use pkg::index;
@@ -134,7 +134,7 @@ fn actor_value(a: Actor | none) -> Value {
         x: Actor => {
             // A trusted publish is the repository owner's (the nabi-lang
             // organization's for an official one), by its GitHub id; who
-            // started the run stays in the data file only.
+            // started the run stays in the data only.
             let shown = match x.via {
                 w: meta::Via => Actor { id: w.owner_id, login: meta::owner_of(w), at: x.at, via: w },
                 none => x,

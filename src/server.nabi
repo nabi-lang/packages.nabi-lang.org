@@ -2,20 +2,21 @@
 // publishing and the publish / yank API over plain HTTP (TLS ends at a
 // reverse proxy).
 //
-// One thread per connection. A write to the data file reads it and
-// writes it back under `LOCK`; an index commit and push holds `INDEX`
-// (taken before `LOCK`, never inside it). Neither is held across a
-// fetch of a package source or a call to GitHub. Reads take the data
-// file without a lock: it is replaced in one rename. After an index
-// commit `STALE` is set and a background thread rebuilds the site by
-// running this program again.
+// One thread per connection. A write to the data (registry.sqlite3,
+// tables.nabi) reads it and writes it back under `LOCK`, in one
+// transaction; an index commit and push holds `INDEX` (taken before
+// `LOCK`, never inside it). Neither is held across a fetch of a package
+// source or a call to GitHub. Reads take no lock: each reads a snapshot
+// of the database. After an index commit `STALE` is set and a background
+// thread rebuilds the site by running this program again.
 //
 // Here: the settings, the responses every route builds, the connection
 // loop and the rebuild. `routes` picks the answer to a request; `api`,
 // `auth`, `account`, `owners` and `admin` are the routes behind it;
-// `store` is the data file, `github` the calls to GitHub, `limit` the
-// rate limits, `names` which new names are taken, and `mail` the
-// notices sent through Amazon SES (`aws`) by a thread of their own.
+// `store` is the data, kept in SQLite by `tables` through `sqlite`;
+// `github` the calls to GitHub, `limit` the rate limits, `names` which
+// new names are taken, and `mail` the notices sent through Amazon SES
+// (`aws`) by a thread of their own.
 
 pub mod account;
 pub mod admin;
@@ -31,6 +32,7 @@ pub mod owners;
 pub mod routes;
 pub mod sqlite;
 pub mod store;
+pub mod tables;
 
 use pkg::Site;
 use pkg::index;
@@ -450,8 +452,11 @@ pub fn serve(site: Site) throws {
     try index::sync(cfg.index) catch e { eprintln(f"index sync: {e.msg}"); };
     if cfg.admins == "," { eprintln("PACKAGES_ADMINS is empty: no account may publish or moderate"); }
     try fs::create_dir_all(cfg.data);
-    // Fail now on a bad data file or bootstrap file, not on the first
+    // Fail now on a bad database or bootstrap file, not on the first
     // request.
+    let did = try pkg::server::tables::open_data(cfg.data);
+    if !did.is_empty() { eprintln(f"data: {did}"); }
+    eprintln(f"data: {pkg::server::tables::path_of(cfg.data)}, SQLite {try pkg::server::sqlite::version()} from {pkg::server::sqlite::lib_path()}");
     let db = try load_db(cfg);
     let seeds = if cfg.trusted.is_empty() { List::<TrustedPublisher>::new() } else { try trust::read_seeds(cfg.trusted) };
     db.trusted = trust::merge_seeds(db.trusted, seeds);
@@ -503,6 +508,70 @@ pub fn serve(site: Site) throws {
             t.detach();
         }
     }
+}
+
+/// `backup <file>` and `export <file>`, each with `--data <dir>` or
+/// PACKAGES_DATA (environment or .env): a copy of the database made
+/// while the server runs, and the data as db.nabion has it (`-`:
+/// printed). The exit status.
+pub fn data_cmd(args: List<str>) -> i32 {
+    let usage = "usage: backup <new file> [--data <dir>], export <file or -> [--data <dir>]";
+    let dir = "";
+    let dest = "";
+    let i = 2usize;
+    while i < args.len() {
+        if args[i] == "--data" && i + 1 < args.len() {
+            i += 1;
+            dir = args[i];
+        } else if dest.is_empty() {
+            dest = args[i];
+        } else {
+            eprintln(usage);
+            return 2;
+        }
+        i += 1;
+    }
+    if dest.is_empty() {
+        eprintln(usage);
+        return 2;
+    }
+    if dir.is_empty() {
+        let text = if fs::exists(".env") { (try? fs::read_to_str(".env")) ?? "" } else { "" };
+        dir = optional(parse_env(text), "PACKAGES_DATA").trim();
+    }
+    if dir.is_empty() {
+        eprintln("no data directory: give `--data <dir>` or set PACKAGES_DATA");
+        return 2;
+    }
+    if !fs::exists(pkg::server::tables::path_of(dir)) {
+        eprintln(f"no database at {pkg::server::tables::path_of(dir)}; start the server on {dir} once to create it (and import db.nabion)");
+        return 1;
+    }
+    if args[1] == "backup" {
+        try pkg::server::tables::backup(dir, dest) catch e {
+            eprintln(f"backup: {e}");
+            return 1;
+        };
+        eprintln(f"backup: {pkg::server::tables::path_of(dir)} copied to {dest}");
+        return 0;
+    }
+    let text = try nabion::to_str(try pkg::server::store::read_db(dir)) catch e {
+        eprintln(f"export: {e}");
+        return 1;
+    };
+    if dest == "-" {
+        print(text + "\n");
+        return 0;
+    }
+    if fs::exists(dest) {
+        eprintln(f"export: {dest} exists; remove it or name a new file");
+        return 1;
+    }
+    try fs::write_atomic(dest, text + "\n") catch e {
+        eprintln(f"export: {e}");
+        return 1;
+    };
+    0
 }
 
 #[test]

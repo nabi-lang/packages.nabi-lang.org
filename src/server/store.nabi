@@ -1,13 +1,15 @@
-// The data file (`db.nabion` under PACKAGES_DATA): accounts, sessions,
-// tokens, owners, releases, trusted publishers and each package's
-// events, and the lookups into it. Callers hold `LOCK` around a read and
-// the write that follows.
+// The server's data: accounts, sessions, tokens, owners, releases,
+// trusted publishers and each package's events, and the lookups into
+// it. Kept in PACKAGES_DATA/registry.sqlite3 (tables.nabi); `Db` is all
+// of it at once. A writer holds `LOCK` around its read and the write
+// that follows; readers take no lock.
 
 use pkg::index;
 use pkg::meta;
 use pkg::meta::{Release, Actor};
 use pkg::secret;
 use pkg::server::Cfg;
+use pkg::server::tables;
 use pkg::trust;
 use pkg::trust::{TrustedPublisher, TrustToken};
 use std::fs;
@@ -284,39 +286,42 @@ pub const MAX_SESSIONS: usize = 10;
 /// Invitations not accepted within this long lapse.
 pub const INVITE_SECS: i64 = 2592000i64;
 
-/// Snapshots of db.nabion kept under `backup/`, one an hour at most.
+/// Copies of the database kept under `backup/`, one an hour at most.
 const SNAPSHOTS: usize = 72;
 
 pub fn load_db(cfg: Cfg) throws -> Db { try read_db(cfg.data) }
 
-/// `dir/db.nabion`; empty when there is none.
+fn empty_db() -> Db { Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: List::new(), releases: List::new() } }
+
+/// The data in `dir`: its registry.sqlite3, else (a directory the server
+/// has not started on, such as fixtures/data) its db.nabion, read only;
+/// empty when there is neither.
 pub fn read_db(dir: str) throws -> Db {
+    if fs::exists(tables::path_of(dir)) { return try tables::load(dir); }
     let p = dir + "/db.nabion";
-    if !fs::exists(p) { return Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: List::new(), releases: List::new() }; }
+    if !fs::exists(p) { return empty_db(); }
     try nabion::from_str(try fs::read_to_str(p))
 }
 
-/// `dir/db.nabion` written whole (sessions kept as they are), replacing
-/// the old file in one rename. Before the first write of each hour the
-/// old file is kept as `backup/db-<yyyymmddhh>.nabion`, the newest
-/// SNAPSHOTS of them.
+/// Store `db` (sessions kept as they are) in `dir`'s database, in one
+/// transaction. Before the first write of each hour a copy is kept as
+/// `backup/registry-<yyyymmddhh>.sqlite3`, the newest SNAPSHOTS of them.
 pub fn write_db(dir: str, db: Db) throws {
-    let p = dir + "/db.nabion";
-    try snapshot(dir, p) catch e { eprintln(f"db backup: {e}"); };
-    try fs::write_atomic(p, (try nabion::to_str(db)) + "\n");
+    try snapshot(dir) catch e { eprintln(f"db backup: {e}"); };
+    try tables::store(dir, db);
 }
 
-fn snapshot(dir: str, p: str) throws {
-    if !fs::exists(p) { return; }
+fn snapshot(dir: str) throws {
+    if !fs::exists(tables::path_of(dir)) { return; }
     let b = dir + "/backup";
-    let name = f"db-{hour_stamp(now_secs())}.nabion";
+    let name = f"registry-{hour_stamp(now_secs())}.sqlite3";
     if fs::exists(b + "/" + name) { return; }
     try fs::create_dir_all(b);
-    try fs::write_atomic(b + "/" + name, try fs::read(p));
+    try tables::backup(dir, b + "/" + name);
     let all: List<str> = List::new();
     for e in (try fs::read_dir(b)).results() {
         let n = (try e.get()).file_name();
-        if n.starts_with("db-") && n.ends_with(".nabion") { all.push(n); }
+        if n.starts_with("registry-") && n.ends_with(".sqlite3") { all.push(n); }
     }
     all.sort();
     let extra = if all.len() > SNAPSHOTS { all.len() - SNAPSHOTS } else { 0usize };
@@ -384,7 +389,7 @@ pub fn is_hex(s: str, n: usize) -> bool {
 }
 
 /// The cookie of a request that may name a session: 64 hex digits, so
-/// a made-up one costs no data file read.
+/// a made-up one costs no database read.
 pub fn session_cookie(r: Request) -> str | none {
     let c = http::cookie(r, SESSION_COOKIE);
     if is_hex(c, 64) { c } else { none }
@@ -399,6 +404,32 @@ pub fn session_of(db: Db, r: Request) -> Session | none {
         if secret::same(s.hash, h) && session_live(s, now) && lock_of(db, s.account) is none { return s; }
     }
     none
+}
+
+/// The live session a request's cookie names and its account, of an
+/// account not locked: lookups by key, not the whole data.
+pub fn viewer_of(cfg: Cfg, r: Request) -> (Session, Account) | none {
+    let c = session_cookie(r) ?? { return none; };
+    let sd = (try tables::row(cfg.data, "sessions", secret::sha256_hex(c)) catch e {
+        eprintln(f"data: {e}");
+        none
+    }) ?? { return none; };
+    let s: Session = try nabion::from_str(sd) catch _ { return none; };
+    if !session_live(s, now_secs()) { return none; }
+    let ad = (try tables::row(cfg.data, "accounts", f"{s.account}") catch _ { none }) ?? { return none; };
+    let a: Account = try nabion::from_str(ad) catch _ { return none; };
+    let locked = try tables::row(cfg.data, "locked", f"{s.account}") catch _ { "error" };
+    if locked is str { return none; }
+    (s, a)
+}
+
+/// Mark the session stored as `hash` seen at `now`: one row rewritten.
+/// Under `LOCK`, as every write.
+pub fn touch_session(cfg: Cfg, hash: str, now: i64) throws {
+    let sd = (try tables::row(cfg.data, "sessions", hash)) ?? { return; };
+    let s: Session = try nabion::from_str(sd);
+    s.seen = now;
+    _ = try tables::set_row(cfg.data, "sessions", hash, try nabion::to_str_flat(s));
 }
 
 /// Where `db.tokens` has the token `t` (`pkg_` + 64 hex), checked
@@ -568,16 +599,25 @@ fn snapshots() {
     let dir = std::env::temp_dir().as_str() + f"/packages-db-{std::process::id()}";
     try fs::remove_dir_all(dir) catch _ {};
     try! fs::create_dir_all(dir + "/backup");
-    for i in 0..(SNAPSHOTS + 3) { try! fs::write(dir + f"/backup/db-1999{i:06}.nabion", ""); }
-    let db = Db { accounts: List::new(), sessions: List::new(), tokens: List::new(), owners: List::new() };
+    for i in 0..(SNAPSHOTS + 3) { try! fs::write(dir + f"/backup/registry-1999{i:06}.sqlite3", ""); }
+    _ = try tables::open_data(dir) catch e { panic(f"{e}"); };
+    let db = empty_db();
+    db.accounts = [Account { id: 5i64, login: "ann", created: 1i64 }];
     try! write_db(dir, db);
     try! write_db(dir, db);
     let n = 0usize;
     for e in (try! fs::read_dir(dir + "/backup")).results() {
-        if (try! e.get()).file_name().starts_with("db-1999") { n += 1; }
+        if (try! e.get()).file_name().starts_with("registry-1999") { n += 1; }
     }
     assert(n == SNAPSHOTS - 1, f"old snapshots kept: {n}");
-    assert(fs::exists(dir + f"/backup/db-{hour_stamp(now_secs())}.nabion"), "this hour's snapshot");
+    let snap = dir + "/backup";
+    assert(fs::exists(snap + f"/registry-{hour_stamp(now_secs())}.sqlite3"), "this hour's snapshot");
+    // The snapshot is a database: the state before the hour's first write.
+    try! fs::create_dir_all(dir + "/old");
+    try! fs::rename(snap + f"/registry-{hour_stamp(now_secs())}.sqlite3", dir + "/old/" + tables::FILE);
+    assert((try! read_db(dir + "/old")).accounts.is_empty() && (try! read_db(dir)).accounts.len() == 1, "snapshot before the write");
+    tables::close_all(dir);
+    tables::close_all(dir + "/old");
     try fs::remove_dir_all(dir) catch _ {};
 }
 
