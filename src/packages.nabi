@@ -197,6 +197,9 @@ pub struct Readmes {
     /// publish are kept in its `docs/`; `""`: none (docs kept in
     /// `<cache>/docs`).
     pub data: str = "";
+    /// PACKAGES_IMG_KEY: README images go through the image proxy
+    /// (server::img); `""`: linked directly.
+    pub img_key: str = "";
 }
 
 /// Where the docs of each version are kept.
@@ -822,7 +825,7 @@ fn shown(r: Readmes, k: str, file: str, versions: List<Version>, v: Version, rde
     if meta.links.is_empty() { meta.links = v.links; }
     if !text.is_empty() {
         let doc = markdown::render_untrusted(text, layout::md(|h| repo_link(v.url, v.rev, h)));
-        html = untrusted_refs(fix_headings(web::chrome::align_classes(doc.html), k));
+        html = pkg::server::img::proxied(untrusted_refs(fix_headings(web::chrome::align_classes(doc.html), k)), r.img_key);
     }
     Package {
         name: k,

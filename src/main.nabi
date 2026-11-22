@@ -178,7 +178,8 @@ fn check(files: Dict<str, str>, statics: Set<str>) -> List<str> {
     let bad: List<str> = List::new();
     for out in files.keys() {
         for raw in refs[out] {
-            if raw.contains("://") || raw.starts_with("mailto:") || raw == "#" { continue; }
+            // `/img/..` is the image proxy, served by `serve`.
+            if raw.contains("://") || raw.starts_with("mailto:") || raw == "#" || raw.starts_with("/img/") { continue; }
             // `?v=` on assets, `?q=` on keyword links.
             let (p0, rest) = url::split_ref(raw);
             let href = p0 + (if let k: usize = rest.find("#") { rest[k:] } else { "" });
@@ -261,7 +262,7 @@ fn main() throws {
         process::exit(1);
     }
     let data_dir = if demo { "fixtures/data" } else { data_arg };
-    let readmes = packages::Readmes { cache: site.cache, fixed: if demo { "fixtures/readme" } else { "" }, fixed_src: if demo { "fixtures/src" } else { "" }, offline: offline, data: data_dir };
+    let readmes = packages::Readmes { cache: site.cache, fixed: if demo { "fixtures/readme" } else { "" }, fixed_src: if demo { "fixtures/src" } else { "" }, offline: offline, data: data_dir, img_key: server::build_img_key() };
     let data = packages::no_data();
     // Packages the admins took down are left out of the site.
     let removed: Set<str> = Set::new();

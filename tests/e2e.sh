@@ -66,6 +66,11 @@ fi
 
 # Settings that change between restarts.
 extra_env=(PACKAGES_REQUIRE_2FA=1)
+# The image proxy's key, and img.invalid pointed at the fake (curl's own
+# config: only the operator's can make a .invalid name reach anything).
+img_key=$(printf 'k%.0s' $(seq 40))
+mkdir -p "$T/curl"
+echo "connect-to = img.invalid:80:127.0.0.1:$gh_port" > "$T/curl/.curlrc"
 start_server() {
     (cd "$T/site" && exec env \
         PACKAGES_URL="https://packages.test" \
@@ -81,6 +86,8 @@ start_server() {
         PACKAGES_TRUSTED="$T/trusted.nabion" \
         GIT_ALLOW_PROTOCOL=https:file:http \
         PACKAGES_RATE_LIMIT=1000 \
+        PACKAGES_IMG_KEY="$img_key" \
+        CURL_HOME="$T/curl" \
         PACKAGES_OFFICIAL_ORG=5151 \
         PACKAGES_MAIL_FROM="Nabi packages <noreply@packages.test>" \
         PACKAGES_SES_REGION=us-east-1 \
@@ -1016,6 +1023,52 @@ grep -q '>Docs <span' "$T/b" && fail "an executable has no Docs tab"
 req GET "/packages?q=app"
 expect_body '<span class="tag bin" title="[^"]*">bin</span>' "bin tag in the list"
 ok "site rebuilt"
+
+# README images through the proxy: signed addresses on the page, fetched
+# from public hosts only, images only, at most 5 MiB, cached for good,
+# no cookie or referrer passed either way.
+pics_rev=$(source_repo pics lib.nabi)
+pics_line=${line//example.invalid\/geom/example.invalid\/pics}
+pics_line=${pics_line//\"geom\"/\"pics\"}
+pics_line=${pics_line//$rev/$pics_rev}
+pics_line=${pics_line//$tree/$(git -C "$T/src/pics" rev-parse "HEAD^{tree}")}
+readme='# pics\n\n![logo](http://img.invalid/img/logo.svg) ![moved](http://img.invalid/img/moved.svg) ![page](http://img.invalid/img/page) ![big](http://img.invalid/img/big.png) ![inside](http://127.0.0.1/img/logo.svg)\n'
+publish "$pics_line" "{ description: \"Pictures\", readme_content: \"$readme\" }"
+expect_code 200 "publish a readme with images"
+for _ in $(seq 100); do grep -q 'src="/img/' "$T/site/public/packages/pics.html" 2>/dev/null && break; sleep 0.1; done
+grep -q 'img.invalid' "$T/site/public/packages/pics.html" && fail "an image linked directly with the proxy on"
+hexof() { printf %s "$1" | od -An -tx1 | tr -d ' \n'; }
+img_at() { grep -o "src=\"/img/[0-9a-f]\{32\}/$(hexof "$1")\"" "$T/site/public/packages/pics.html" | head -1 | sed -e 's/^src="//' -e 's/"$//'; }
+logo=$(img_at http://img.invalid/img/logo.svg)
+[ -n "$logo" ] || fail "no signed image address: $(grep -o '<img [^>]*>' "$T/site/public/packages/pics.html" | head -3)"
+req GET "$logo" -H "Cookie: __Host-pkg_session=$sess" -H "Referer: https://packages.test/packages/pics"
+expect_code 200 "proxied image"
+[ "$(header content-type)" = "image/svg+xml" ] || fail "image type: $(header content-type)"
+[ "$(header cache-control)" = "public, max-age=31536000, immutable" ] || fail "image cache: $(header cache-control)"
+header content-security-policy | grep -q "sandbox" || fail "image csp: $(header content-security-policy)"
+[ -z "$(header set-cookie)" ] || fail "the image host's cookie passed on"
+expect_body '<svg xmlns' "image body"
+seen=$(curl -s "http://127.0.0.1:$gh_port/_img" | grep -c 'GET /img/logo.svg')
+req GET "$logo"
+expect_code 200 "cached image"
+[ "$(curl -s "http://127.0.0.1:$gh_port/_img" | grep -c 'GET /img/logo.svg')" = "$seen" ] || fail "a cached image fetched again"
+curl -s "http://127.0.0.1:$gh_port/_img" | grep 'GET /img/logo.svg' | grep -qi 'cookie:\|referer:' && fail "cookie or referrer sent to the image host"
+ls "$T/data/img-cache" | grep -q '\.type$' || fail "image cache on disk"
+req GET "$(img_at http://img.invalid/img/moved.svg)"
+expect_code 200 "redirected image"
+req GET "$(img_at http://img.invalid/img/page)"
+expect_code 415 "not an image"
+expect_body 'is not an image (Content-Type `text/html`)' "not an image body"
+req GET "$(img_at http://img.invalid/img/big.png)"
+expect_code 413 "image size cap"
+req GET "$(img_at http://127.0.0.1/img/logo.svg)"
+expect_code 403 "an image on an internal address"
+expect_body 'has no address on the public internet' "internal image body"
+req GET "/img/$(printf '0%.0s' $(seq 32))/$(hexof http://img.invalid/img/logo.svg)"
+expect_code 404 "unsigned image address"
+req GET /packages/pics
+header content-security-policy | grep -q "img-src 'self' data: https://avatars.githubusercontent.com;" || fail "page csp with the proxy: $(header content-security-policy)"
+ok "image proxy"
 
 # Sources the server will not fetch, and commits a repository does not
 # hold on a branch or tag (as GitHub serves a fork's commits through the

@@ -19,6 +19,11 @@
 // `nabi-lang` and the user `carol` (id 3003). The issuer is
 // http://<addr>/oidc; `POST /_mint` signs the JSON claims it is sent
 // into an OIDC token.
+//
+// For the image proxy it is an image host too: `/img/logo.svg` (with a
+// cookie the proxy must not pass on), `/img/moved.svg` (a redirect to
+// it), `/img/page` (HTML) and `/img/big.png` (6 MiB); `GET /_img`
+// lists the request heads it got for them.
 
 use core::convert::AsBytes;
 use core::crypto::HashAlgorithm;
@@ -81,7 +86,7 @@ fn param(q: str, key: str) -> str {
     ""
 }
 
-fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>, mails: List<str>) throws {
+fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>, mails: List<str>, imgs: List<str>) throws {
     let data: List<u8> = List::new();
     let buf: List<u8> = List::with_capacity(4096);
     for _ in 0..4096 { buf.push(0u8); }
@@ -104,7 +109,34 @@ fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>, mails: Lis
     let out = "{\"message\":\"Not Found\"}";
     let status = "404 Not Found";
     let extra = "";
-    if let rest: str = line.0.strip_prefix("GET /login/oauth/authorize?") {
+    let ctype = "application/json";
+    if line.0.starts_with("GET /img/") {
+        imgs.push((text.split_once("\r\n\r\n") ?? (text, "")).0.replace("\r\n", " | "));
+        status = "200 OK";
+        if line.0.starts_with("GET /img/logo.svg ") {
+            ctype = "image/svg+xml";
+            out = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"/>";
+            extra = "Set-Cookie: track=1\r\n";
+        } else if line.0.starts_with("GET /img/moved.svg ") {
+            status = "302 Found";
+            out = "";
+            extra = "Location: /img/logo.svg\r\n";
+        } else if line.0.starts_with("GET /img/page ") {
+            ctype = "text/html";
+            out = "<p>not an image</p>";
+        } else if line.0.starts_with("GET /img/big.png ") {
+            ctype = "image/png";
+            let b = StrBuf::new();
+            for _ in 0..(6 * 1024) { b.push_str("a".repeat(1024)); }
+            out = b.to_str();
+        } else {
+            status = "404 Not Found";
+        }
+    } else if line.0.starts_with("GET /_img ") {
+        status = "200 OK";
+        ctype = "text/plain";
+        out = imgs.join("\n") + "\n";
+    } else if let rest: str = line.0.strip_prefix("GET /login/oauth/authorize?") {
         let q = (rest.split_once(" ") ?? (rest, "")).0;
         let code = param(q, "as");
         status = "400 Bad Request";
@@ -214,16 +246,17 @@ fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>, mails: Lis
             out = "{\"login\":\"Bob\",\"id\":1002,\"type\":\"User\"}";
         }
     }
-    try s.write_all(f"HTTP/1.1 {status}\r\n{extra}Content-Type: application/json\r\nContent-Length: {out.len()}\r\nConnection: close\r\n\r\n{out}");
+    try s.write_all(f"HTTP/1.1 {status}\r\n{extra}Content-Type: {ctype}\r\nContent-Length: {out.len()}\r\nConnection: close\r\n\r\n{out}");
 }
 
 fn main() throws {
     let args = env::args();
     let pkce: Dict<str, str> = Dict::new();
     let mails: List<str> = List::new();
+    let imgs: List<str> = List::new();
     using l = try net::tcp_listen(args[1]) {
         try for s in l.incoming() {
-            try answer(s, args[2], args[1], pkce, mails) catch e { eprintln(f"fake github: {e}"); };
+            try answer(s, args[2], args[1], pkce, mails, imgs) catch e { eprintln(f"fake github: {e}"); };
             try s.close() catch _ {};
         }
     }

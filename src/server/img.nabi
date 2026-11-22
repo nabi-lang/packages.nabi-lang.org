@@ -1,0 +1,338 @@
+// README images through the registry, as GitHub's camo does: a page asks
+// for `/img/<mac>/<hex url>`, the mac an HMAC of the url with
+// PACKAGES_IMG_KEY, so the server fetches only the images the site
+// itself links. A fetch goes to a public address only (index::
+// public_addrs, pinned for curl), is an image of an allowed type, at most
+// MAX_BYTES, within FETCH_SECS, and is kept under PACKAGES_DATA/img-cache
+// (at most Cfg.img_cache bytes, the least recently used going first).
+// Neither the reader's cookies nor its address or referrer reach the
+// image's host. Without a key the README links its images directly.
+
+use pkg::index;
+use pkg::index::ApiError;
+use pkg::secret;
+use pkg::server::store::now_secs;
+use pkg::server::{Cfg, Resp};
+use core::crypto::{Hmac, HashAlgorithm};
+use core::encoding::hex;
+use std::fs;
+use std::process::{Command, Stdio, ChildStdout};
+use web::http::Request;
+
+/// An image's size at most: 5 MiB.
+pub const MAX_BYTES: i64 = 5242880i64;
+
+/// Seconds a fetch may take, redirects included.
+const FETCH_SECS: i64 = 10i64;
+
+/// Redirects followed, each to a checked address.
+const HOPS: usize = 3;
+
+/// A failed fetch is not tried again for this long.
+const RETRY_SECS: i64 = 600i64;
+
+/// The cache's size when PACKAGES_IMG_CACHE_MB is unset: 1 GiB.
+pub const CACHE_MAX: i64 = 1073741824i64;
+
+/// The image types served, by Content-Type.
+const TYPES: [str; 9] = ["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml", "image/x-icon", "image/vnd.microsoft.icon", "image/bmp"];
+
+/// Where pages may load images from with the proxy on: the site and
+/// GitHub's avatars.
+pub const CSP_IMG: str = "img-src 'self' data: https://avatars.githubusercontent.com";
+
+/// A cached image: its size and when it was last served (unix secs).
+struct Kept {
+    size: i64;
+    used: i64;
+}
+
+static CACHE: Mutex<Dict<str, Kept>> = Mutex::new(Dict::new());
+static LOADED: Atomic<i32> = Atomic::new(0);
+static FAILED: Mutex<Dict<str, i64>> = Mutex::new(Dict::new());
+
+/// The mac of `url` under `key`: 32 hex digits of HMAC-SHA256.
+pub fn mac(key: str, url: str) -> str { secret::hex(Hmac::mac(HashAlgorithm::Sha256, key, url)[0:16]) }
+
+/// The address a page shows image `url` at: `/img/<mac>/<hex url>`, or
+/// `url` itself without a key or when it is not http(s).
+pub fn path_of(key: str, url: str) -> str {
+    if key.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) { return url; }
+    f"/img/{mac(key, url)}/{hex::encode(url)}"
+}
+
+fn unesc(s: str) -> str { s.replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&") }
+
+/// `html` (a rendered README) with each `<img src>` on http(s) through
+/// the proxy; as it is without a key.
+pub fn proxied(html: str, key: str) -> str {
+    if key.is_empty() || !html.contains("<img ") { return html; }
+    let out = StrBuf::new();
+    let rest = html;
+    loop {
+        let k = rest.find("<img ") ?? { break; };
+        let end = (rest[k:].find(">") ?? (rest.len() - k)) + k;
+        let tag = rest[k:end];
+        out.push_str(rest[:k]);
+        if let s: usize = tag.find(" src=\"") {
+            let from = s + 6;
+            let len = tag[from:].find("\"") ?? 0usize;
+            let url = unesc(tag[from:from + len]);
+            out.push_str(tag[:from] + path_of(key, url) + tag[from + len:]);
+        } else {
+            out.push_str(tag);
+        }
+        rest = rest[end:];
+    }
+    out.push_str(rest);
+    out.to_str()
+}
+
+/// The scheme, host and port of an image url the proxy will fetch; why
+/// not otherwise.
+pub fn target(url: str) -> (str, str, i32) | str {
+    let (scheme, rest) = url.split_once("://") ?? { return "not an http(s) address"; };
+    let port = if scheme == "https" { 443 } else if scheme == "http" { 80 } else { return "not an http(s) address"; };
+    let auth = rest[:rest.find("/") ?? (rest.find("?") ?? rest.len())].to_lowercase();
+    if auth.contains("@") { return "an address with a user name"; }
+    if auth.starts_with("[") { return "not a public host"; }
+    let host = auth;
+    if let (h, p): (str, str) = auth.split_once(":") {
+        if p != f"{port}" { return "an address with a port of its own"; }
+        host = h;
+    }
+    if host.is_empty() || host.starts_with("[") || !host.contains(".") || host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") || host.ends_with(".internal") { return "not a public host"; }
+    for c in host.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '.') { return f"a host name with `{c}` in it"; }
+    }
+    (scheme, host, port)
+}
+
+/// `to` (a Location) against `from`.
+fn joined(from: str, to: str) -> str {
+    if to.starts_with("https://") || to.starts_with("http://") { return to; }
+    let (scheme, rest) = from.split_once("://") ?? ("https", from);
+    let origin = scheme + "://" + rest[:rest.find("/") ?? rest.len()];
+    if to.starts_with("//") { return scheme + ":" + to; }
+    if to.starts_with("/") { return origin + to; }
+    let path = rest[rest.find("/") ?? rest.len():];
+    let dir = path[:(path.rfind("/") ?? 0usize) + 1];
+    origin + (if dir.is_empty() { "/" } else { dir }) + to
+}
+
+/// The value of header `name` (lowercase) in a curl header dump.
+fn header_of(dump: str, name: str) -> str {
+    for l in dump.split("\n") {
+        if let v: str = l.to_lowercase().strip_prefix(name + ":") {
+            let at = l.len() - v.len();
+            return l[at:].trim();
+        }
+    }
+    ""
+}
+
+fn refused(status: i32, why: str) -> ApiError { index::err(status, why) }
+
+/// curl `config` on stdin; its exit code (none when it could not run)
+/// and stdout.
+fn run(config: str) -> (i32, str) {
+    let c = try Command::new("curl").args(["--config", "-"]).stdin(Stdio::Piped).stdout(Stdio::Piped).stderr(Stdio::Null).spawn() catch _ { return (-1, ""); };
+    if let w: std::process::ChildStdin = c.take_stdin() {
+        try w.write_all(config) catch _ {};
+        try w.close() catch _ {};
+    }
+    let out = "";
+    if let rd: ChildStdout = c.take_stdout() {
+        out = try str::from_utf8(try rd.read_to_end() catch _ { List::<u8>::new() }) catch _ { "" };
+        try rd.close() catch _ {};
+    }
+    let st = try c.wait() catch _ { return (-1, out); };
+    (st.code() ?? -1, out)
+}
+
+/// Fetch image `url` into `file`, following at most HOPS redirects, each
+/// to a checked public address; its Content-Type.
+fn fetch(url: str, file: str) throws (ApiError) -> str {
+    let at = url;
+    let hops = 0usize;
+    let t0 = now_secs();
+    loop {
+        let (host, port) = match target(at) {
+            t: (str, str, i32) => (t.1, t.2),
+            why: str => { throw refused(403, f"the image {at} is {why}; link an image on a public http(s) host"); },
+        };
+        // `.invalid` never resolves on the internet: only the operator's
+        // own curl config (`connect-to`) can point it somewhere; the tests do.
+        let pin = "";
+        if !host.ends_with(".invalid") {
+            let addrs: List<str> = List::new();
+            let ips = try index::public_addrs(host, index::system_addrs) catch _ { throw refused(403, f"the image host `{host}` has no address on the public internet; link an image on a public http(s) host"); };
+            for ip in ips { addrs.push(if ip.is_ipv6() { f"[{ip}]" } else { f"{ip}" }); }
+            pin = f"resolve = \"{host}:{port}:{addrs.join(",")}\"\n";
+        }
+        let left = FETCH_SECS - (now_secs() - t0);
+        if left <= 0i64 { throw refused(504, f"the image {url} took more than {FETCH_SECS} s"); }
+        let config = f"url = {pkg::server::github::cq(at)}\noutput = {pkg::server::github::cq(file)}\ndump-header = {pkg::server::github::cq(file + ".h")}\n{pin}proto = \"=http,https\"\nmax-filesize = {MAX_BYTES}\nmax-time = {left}\nconnect-timeout = 5\nuser-agent = \"packages.nabi-lang.org image proxy\"\nheader = \"Accept: image/*\"\nsilent\nwrite-out = \"%{{http_code}}\"\n";
+        let (code, out) = run(config);
+        let dump = try fs::read_to_str(file + ".h") catch _ { "" };
+        try fs::remove_file(file + ".h") catch _ {};
+        if code == 63 { throw refused(413, f"the image {url} is larger than {MAX_BYTES / 1048576i64} MiB; link a smaller one"); }
+        if code == 28 { throw refused(504, f"the image {url} took more than {FETCH_SECS} s"); }
+        if code != 0 { throw refused(502, f"the image {url} could not be fetched (curl {code})"); }
+        let status = try out.trim().parse::<i32>() catch _ { 0 };
+        if status >= 300 && status < 400 {
+            hops += 1;
+            let to = header_of(dump, "location");
+            if to.is_empty() || hops > HOPS { throw refused(502, f"the image {url} redirects more than {HOPS} times"); }
+            at = joined(at, to);
+            continue;
+        }
+        if status != 200 { throw refused(502, f"the image's host answered {status} for {at}"); }
+        let ct = header_of(dump, "content-type").to_lowercase();
+        let kind = (ct.split_once(";") ?? (ct, "")).0.trim();
+        if !TYPES.contains(kind) { throw refused(415, f"{at} is not an image (Content-Type `{kind}`); link a png, jpeg, gif, webp, avif, svg or ico file"); }
+        let size = (try fs::metadata(file) catch _ { throw refused(502, "the image could not be kept"); }).len() as i64;
+        if size > MAX_BYTES { throw refused(413, f"the image {url} is larger than {MAX_BYTES / 1048576i64} MiB; link a smaller one"); }
+        return kind;
+    }
+}
+
+fn dir_of(cfg: Cfg) -> str { cfg.data + "/img-cache" }
+
+/// The cache's entries, read from its directory on first use.
+fn load(cfg: Cfg) {
+    if LOADED.swap(1) == 1 { return; }
+    let d = dir_of(cfg);
+    let found: Dict<str, Kept> = Dict::new();
+    if fs::exists(d) {
+        for e in (try fs::read_dir(d) catch _ { return; }).results() {
+            let n = (try e.get() catch _ { continue; }).file_name();
+            if n.contains(".") { continue; }
+            let m = try fs::metadata(d + "/" + n) catch _ { continue; };
+            let used = (try m.modified() catch _ { continue; }).unix_secs();
+            found.insert(n, Kept { size: m.len() as i64, used: used });
+        }
+    }
+    using g = CACHE.lock() {
+        let c = g.get();
+        for (k, v) in found.iter() {
+            if !c.contains_key(k) { c.insert(k, v); }
+        }
+    }
+}
+
+/// Keep `k` (`size` bytes) as used now; then, past `max` bytes, drop the
+/// least recently used.
+fn keep(cfg: Cfg, k: str, size: i64) {
+    let gone: List<str> = List::new();
+    using g = CACHE.lock() {
+        let c = g.get();
+        c.insert(k, Kept { size: size, used: now_secs() });
+        let total = 0i64;
+        for (_, v) in c.iter() { total += v.size; }
+        while total > cfg.img_cache && c.len() > 1 {
+            let old = "";
+            let at = 0i64;
+            for (n, v) in c.iter() {
+                if n != k && (old.is_empty() || v.used < at) {
+                    old = n;
+                    at = v.used;
+                }
+            }
+            if old.is_empty() { break; }
+            total -= c[old].size;
+            c.remove(old);
+            gone.push(old);
+        }
+    }
+    for n in gone {
+        try fs::remove_file(dir_of(cfg) + "/" + n) catch _ {};
+        try fs::remove_file(dir_of(cfg) + "/" + n + ".type") catch _ {};
+    }
+}
+
+fn touch(k: str) {
+    using g = CACHE.lock() {
+        let c = g.get();
+        if let v: Kept = c.get(k) { c.insert(k, Kept { size: v.size, used: now_secs() }); }
+    }
+}
+
+fn text(status: i32, msg: str) -> Resp {
+    Resp { status: status, headers: ["Content-Type: text/plain; charset=utf-8", "Cache-Control: public, max-age=600", "X-Content-Type-Options: nosniff"], body: msg + "\n", file: "" }
+}
+
+/// The headers of a served image: kept for good (the address names the
+/// url), never run as a document, no referrer onwards.
+fn served(kind: str, file: str) -> Resp {
+    Resp { status: 200, headers: [f"Content-Type: {kind}", "Cache-Control: public, max-age=31536000, immutable", "X-Content-Type-Options: nosniff", "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox", "Referrer-Policy: no-referrer", "Content-Disposition: inline"], body: "", file: file }
+}
+
+/// `GET /img/<mac>/<hex url>`.
+pub fn route(cfg: Cfg, r: Request) -> Resp {
+    if r.method != "GET" && r.method != "HEAD" { return text(405, "GET only"); }
+    if cfg.img_key.is_empty() { return text(404, "the image proxy is off: set PACKAGES_IMG_KEY, or link the image directly"); }
+    let rest = r.path.strip_prefix("/img/") ?? "";
+    let (m, h) = rest.split_once("/") ?? ("", "");
+    let raw = try hex::decode(h) catch _ { return text(404, "not an image address of this registry"); };
+    let url = try str::from_utf8(raw) catch _ { return text(404, "not an image address of this registry"); };
+    if m.len() != 32 || !secret::same(m, mac(cfg.img_key, url)) { return text(404, "not an image address of this registry: its pages sign the images they show"); }
+    load(cfg);
+    let k = secret::sha256_hex(url);
+    let file = dir_of(cfg) + "/" + k;
+    if fs::exists(file) && fs::exists(file + ".type") {
+        let kind = try fs::read_to_str(file + ".type") catch _ { "" };
+        if TYPES.contains(kind.trim()) {
+            touch(k);
+            return served(kind.trim(), file);
+        }
+    }
+    let now = now_secs();
+    using g = FAILED.lock() {
+        let f = g.get();
+        if (f.get(k) ?? 0i64) > now { return text(502, "the image failed a moment ago; it is tried again in a few minutes"); }
+    }
+    try fs::create_dir_all(dir_of(cfg)) catch e { return text(500, f"image cache: {e}"); };
+    let tmp = file + f".{std::process::id()}-{try secret::random_hex(4) catch _ { "0" }}.tmp";
+    let kind = try fetch(url, tmp) catch e {
+        try fs::remove_file(tmp) catch _ {};
+        eprintln(f"img: {e.msg}");
+        using g = FAILED.lock() {
+            let f = g.get();
+            if f.len() > 4096 { f = Dict::new(); }
+            f.insert(k, now + RETRY_SECS);
+            g.set(f);
+        }
+        return text(e.status, e.msg);
+    };
+    let size = (try fs::metadata(tmp) catch _ { return text(500, "image cache"); }).len() as i64;
+    try {
+        fs::write(file + ".type", kind);
+        fs::rename(tmp, file);
+    } catch e { return text(500, f"image cache: {e}"); };
+    keep(cfg, k, size);
+    served(kind, file)
+}
+
+#[test]
+fn signed_addresses() {
+    let p = path_of("k", "https://x.org/a.png");
+    assert(p == f"/img/{mac("k", "https://x.org/a.png")}/{hex::encode("https://x.org/a.png")}" && mac("k", "u").len() == 32 && mac("k", "u") != mac("j", "u"), p);
+    assert(path_of("", "https://x.org/a.png") == "https://x.org/a.png" && path_of("k", "#") == "#", "off, not http");
+    let h = proxied("<p><img loading=\"lazy\" src=\"https://x.org/a.png?a=1&amp;b=2\" alt=\"a\"> and <img src=\"#\" alt=\"\"></p>", "k");
+    assert(h == f"<p><img loading=\"lazy\" src=\"{path_of("k", "https://x.org/a.png?a=1&b=2")}\" alt=\"a\"> and <img src=\"#\" alt=\"\"></p>", h);
+    assert(proxied("<img src=\"https://x\">", "") == "<img src=\"https://x\">", "no key");
+}
+
+#[test]
+fn targets() {
+    let t = |u: str| match target(u) {
+        x: (str, str, i32) => f"{x.0} {x.1} {x.2}",
+        why: str => why,
+    };
+    assert(t("https://img.shields.io/badge/x") == "https img.shields.io 443" && t("http://x.org:80/a") == "http x.org 80", t("http://x.org:80/a"));
+    assert(t("https://x.org:8443/a") == "an address with a port of its own" && t("https://u@x.org/") == "an address with a user name" && t("ftp://x.org/") == "not an http(s) address", "refused");
+    assert(t("http://localhost/a") == "not a public host" && t("http://[::1]/a") == "not a public host" && t("http://intranet/a") == "not a public host", "internal");
+    assert(joined("https://a.org/x/y.png", "/z.png") == "https://a.org/z.png" && joined("https://a.org/x/y.png", "z.png") == "https://a.org/x/z.png" && joined("http://a.org/y", "//b.org/c") == "http://b.org/c" && joined("https://a.org/y", "https://c.org/d") == "https://c.org/d", "redirects");
+    assert(header_of("HTTP/1.1 302 Found\r\nLocation: /b.png\r\nContent-Type: Image/PNG\r\n", "location") == "/b.png" && header_of("Content-Type: Image/PNG\r\n", "content-type") == "Image/PNG", "headers");
+}

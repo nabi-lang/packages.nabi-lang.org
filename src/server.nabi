@@ -25,6 +25,7 @@ pub mod aws;
 pub mod delete;
 pub mod downloads;
 pub mod github;
+pub mod img;
 pub mod limit;
 pub mod mail;
 pub mod names;
@@ -114,6 +115,12 @@ pub struct Cfg {
     /// AWS_EC2_METADATA_SERVICE_ENDPOINT: the instance metadata service
     /// (IMDSv2) the role's credentials come from.
     pub imds_url: str = "http://169.254.169.254";
+    /// PACKAGES_IMG_KEY: the key README images are signed with for the
+    /// image proxy (img.nabi); "": the proxy is off and READMEs link
+    /// their images directly.
+    pub img_key: str = "";
+    /// PACKAGES_IMG_CACHE_MB, in bytes: the proxy's cache at most.
+    pub img_cache: i64 = img::CACHE_MAX;
 }
 
 /// `KEY=value` lines; `#` comments, blank lines, `export ` and one pair
@@ -176,6 +183,7 @@ pub fn load_cfg(path: str) throws -> Cfg {
     }
     let ses = optional(f, "PACKAGES_SES_URL").trim();
     let imds = optional(f, "AWS_EC2_METADATA_SERVICE_ENDPOINT").trim();
+    let img_mb = optional(f, "PACKAGES_IMG_CACHE_MB").trim();
     Cfg {
         url: url.strip_suffix("/") ?? url,
         addr: try setting(f, "PACKAGES_ADDR", "127.0.0.1:8080"),
@@ -197,8 +205,27 @@ pub fn load_cfg(path: str) throws -> Cfg {
         ses_region: region,
         ses_url: if ses.is_empty() { f"https://email.{region}.amazonaws.com" } else { ses.strip_suffix("/") ?? ses },
         imds_url: if imds.is_empty() { "http://169.254.169.254" } else { imds.strip_suffix("/") ?? imds },
+        img_key: try img_key(optional(f, "PACKAGES_IMG_KEY").trim()),
+        img_cache: if img_mb.is_empty() { img::CACHE_MAX } else { (try img_mb.parse::<i64>() catch _ { throw ApiError { status: 0, msg: f"PACKAGES_IMG_CACHE_MB is the image cache's size in MiB, such as 1024, not `{img_mb}`" }; }) * 1048576i64 },
         official_org: if org.is_empty() { 0i64 } else { try org.parse::<i64>() catch _ { throw ApiError { status: 0, msg: f"PACKAGES_OFFICIAL_ORG is the numeric GitHub id of the organization (the `id` of https://api.github.com/orgs/<org>), not `{org}`" }; } },
         rate: try (if rate.is_empty() { "30" } else { rate }).parse::<i64>() catch _ { throw ApiError { status: 0, msg: f"PACKAGES_RATE_LIMIT is a number of changes a minute, not `{rate}`" }; },
+    }
+}
+
+/// PACKAGES_IMG_KEY checked: "" (off), or at least 32 characters.
+pub fn img_key(v: str) throws (ApiError) -> str {
+    if !v.is_empty() && v.len() < 32 { throw ApiError { status: 0, msg: "PACKAGES_IMG_KEY is a secret of at least 32 characters (`openssl rand -hex 32`), or unset to link README images directly" }; }
+    v
+}
+
+/// The image proxy's key for a site build: PACKAGES_IMG_KEY from the
+/// environment (a rebuild by `serve` inherits it), else `.env`; "" when
+/// unset or not valid.
+pub fn build_img_key() -> str {
+    let file = parse_env(if fs::exists(".env") { try fs::read_to_str(".env") catch _ { "" } } else { "" });
+    try img_key(optional(file, "PACKAGES_IMG_KEY").trim()) catch e {
+        eprintln(e.msg);
+        ""
     }
 }
 
@@ -251,13 +278,16 @@ pub struct Resp {
 }
 
 // Every page, generated or from public/: Cloudflare injects its Web
-// Analytics beacon; a README may show images from anywhere on https. No
-// style attributes: a package's hue is a class (layout::hue_class).
-const CSP: str = "Content-Security-Policy: default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; style-src 'self'; font-src 'self'; img-src 'self' data: https:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" + http::REPORT_TO;
-
-/// The CSP of a page with a <select> (the list's sort): WebKit's own select
-/// shadow DOM sets style attributes, so those are allowed there alone.
-const CSP_SELECT: str = "Content-Security-Policy: default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' data: https:; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" + http::REPORT_TO;
+// Analytics beacon; README images come from anywhere on https, or, with
+// the image proxy on, from the site (img::CSP_IMG). No style
+// attributes: a package's hue is a class (layout::hue_class). A page
+// with a <select> (the list's sort) allows them: WebKit's own select
+// shadow DOM sets style attributes.
+pub fn csp(cfg: Cfg, select: bool) -> str {
+    let imgs = if cfg.img_key.is_empty() { "img-src 'self' data: https:" } else { img::CSP_IMG };
+    let attrs = if select { " style-src-attr 'unsafe-inline';" } else { "" };
+    f"Content-Security-Policy: default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; style-src 'self';{attrs} font-src 'self'; {imgs}; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" + http::REPORT_TO
+}
 
 pub fn html(status: i32, body: str) -> Resp {
     Resp {
@@ -341,14 +371,14 @@ fn handle(s: TcpStream, cfg: Cfg, site: Site) {
     let sent = resp.status;
     if !resp.file.is_empty() {
         if let data: List<u8> = read_page(site, r.path, resp.file) {
-            sent = respond(s, r, 200, resp.headers, data);
+            sent = respond(cfg, s, r, 200, resp.headers, data);
         } else {
             resp = message(site, r.path, 503, "Try again", "The site is being rebuilt. Reload the page in a moment.");
             resp.headers.push("Retry-After: 1");
-            sent = respond(s, r, resp.status, resp.headers, resp.body.as_bytes().to_list());
+            sent = respond(cfg, s, r, resp.status, resp.headers, resp.body.as_bytes().to_list());
         }
     } else {
-        sent = respond(s, r, resp.status, resp.headers, resp.body.as_bytes().to_list());
+        sent = respond(cfg, s, r, resp.status, resp.headers, resp.body.as_bytes().to_list());
     }
     try s.close() catch _ {};
     if !resp.count.is_empty() && sent == 200 && r.method == "GET" {
@@ -376,11 +406,11 @@ pub fn etag_matches(header: str, tag: str) -> bool {
 
 /// Send a response. A 200 anyone may cache gets an ETag, and a request
 /// that already has it a 304. The status sent.
-fn respond(s: TcpStream, r: Request, status: i32, headers: List<str>, body: List<u8>) -> i32 {
+fn respond(cfg: Cfg, s: TcpStream, r: Request, status: i32, headers: List<str>, body: List<u8>) -> i32 {
     let head = r.method == "HEAD";
     if headers.contains(HTML_TYPE) {
         let text = (try? str::from_utf8(body)) ?? "";
-        headers.push(if text.contains("<select") { CSP_SELECT } else { CSP });
+        headers.push(csp(cfg, text.contains("<select")));
         headers.push(http::REPORTING);
         headers.push(http::SPECULATION);
         // The header differs for a logged-in session (signed_in).
@@ -536,6 +566,11 @@ fn env_files() {
     let named = try mail_from("Nabi packages <noreply@nabi-lang.org>") catch _ { "" };
     let wrong = try mail_from("noreply") catch _ { "refused" };
     assert(named.starts_with("Nabi") && wrong == "refused" && (try mail_from("") catch _ { "x" }).is_empty(), "mail from");
+    let short = try img_key("short") catch _ { "refused" };
+    assert(short == "refused" && (try img_key("") catch _ { "x" }).is_empty(), "image key");
+    assert(csp(cfg, false).contains("img-src 'self' data: https:;") && !csp(cfg, false).contains("style-src-attr") && csp(cfg, true).contains("style-src-attr 'unsafe-inline';"), "csp");
+    cfg.img_key = "k";
+    assert(csp(cfg, false).contains("img-src 'self' data: https://avatars.githubusercontent.com;"), csp(cfg, false));
 }
 
 #[test]

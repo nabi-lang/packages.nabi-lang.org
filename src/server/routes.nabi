@@ -112,6 +112,12 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
         if p == from { return Resp { status: 301, headers: ["Location: " + to, "Cache-Control: public, max-age=86400"], body: "", file: "" }; }
     }
     if p.starts_with("/api/") { return api_route(cfg, r, client); }
+    if p.starts_with("/img/") {
+        if !limit::allow("img:" + client, limit::READS) {
+            return Resp { status: 429, headers: ["Content-Type: text/plain; charset=utf-8", "Retry-After: 60", "Cache-Control: no-store"], body: "too many images; wait a minute\n", file: "" };
+        }
+        return pkg::server::img::route(cfg, r);
+    }
     if p == http::REPORT_PATH {
         if r.method != "POST" { return Resp { status: 405, headers: ["Content-Type: text/plain; charset=utf-8", "Cache-Control: no-store"], body: "POST only\n", file: "" }; }
         // Anyone may send one: past REPORTS a minute an address's go

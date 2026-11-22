@@ -242,7 +242,7 @@ pub fn public_addrs(host: str, resolve: fn(str) -> List<IpAddr>) throws (ApiErro
 }
 
 /// `host`'s addresses by the system resolver; none when it has none.
-fn system_addrs(host: str) -> List<IpAddr> {
+pub fn system_addrs(host: str) -> List<IpAddr> {
     let out: List<IpAddr> = List::new();
     for a in (try std::net::resolve(host) catch _ { return out; }) {
         if !out.contains(a.ip()) { out.push(a.ip()); }
