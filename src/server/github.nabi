@@ -68,9 +68,16 @@ pub fn display_name(raw: str) -> str {
     out.to_str()
 }
 
+/// Who logged in on GitHub: the account, and whether GitHub says it has
+/// two-factor authentication on (false when GitHub does not say).
+pub struct GitHubUser {
+    pub account: Account;
+    pub two_factor: bool;
+}
+
 /// The GitHub account behind an OAuth `code`, its PKCE `verifier` sent
 /// along.
-pub fn github_user(cfg: Cfg, code: str, verifier: str) throws (ApiError) -> Account {
+pub fn github_user(cfg: Cfg, code: str, verifier: str) throws (ApiError) -> GitHubUser {
     let callback = cfg.url + "/auth/github/callback";
     let data = f"client_id={http::pct_encode(cfg.client_id)}&client_secret={http::pct_encode(cfg.client_secret)}&code={http::pct_encode(code)}&redirect_uri={http::pct_encode(callback)}&code_verifier={http::pct_encode(verifier)}";
     let ua = "header = " + cq("User-Agent: packages.nabi-lang.org") + "\n";
@@ -82,7 +89,9 @@ pub fn github_user(cfg: Cfg, code: str, verifier: str) throws (ApiError) -> Acco
     let login = user.get("login") ?? "";
     if id <= 0i64 || !is_login(login) { throw index::err(502, "GitHub sent a malformed user"); }
     let av = user.get("avatar_url") ?? "";
-    Account { id: id, login: login, created: 0i64, name: display_name(user.get("name") ?? ""), avatar_url: if av.starts_with("https://") && av.len() <= 512 { av } else { "" } }
+    let a = Account { id: id, login: login, created: 0i64, name: display_name(user.get("name") ?? ""), avatar_url: if av.starts_with("https://") && av.len() <= 512 { av } else { "" } };
+    // GitHub sends `two_factor_authentication` only to the user's own token.
+    GitHubUser { account: a, two_factor: (user.get("two_factor_authentication") ?? "") == "true" }
 }
 
 /// The User-Agent and, with GITHUB_API_TOKEN, the Authorization header

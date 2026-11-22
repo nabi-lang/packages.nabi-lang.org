@@ -12,9 +12,10 @@ use pkg::server::admin::{Audit, audit};
 use pkg::server::github::{cq, curl, github_user};
 use pkg::server::routes::read_page;
 use pkg::server::store::{Account, Db, Locked, MAX_SESSIONS, SESSION_COOKIE, Session, STATE_COOKIE, account_of, load_db, lock_of, now_secs, save_db, session_cookie, session_of};
-use pkg::server::{Cfg, Resp, cookie, counts, LOCK, message, nabion_resp, redirect};
+use pkg::server::{Cfg, Resp, cookie, counts, LOCK, message, nabion_resp, page, redirect};
 use pkg::trust;
 use pkg::trust::{TrustedPublisher, TrustToken};
+use markdown::esc;
 use core::crypto::HashAlgorithm;
 use core::crypto::rsa::PublicKey;
 use core::encoding::base64;
@@ -113,9 +114,11 @@ pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
     if code.is_empty() {
         return message(site, r.path, 400, "Login cancelled", "GitHub did not authorize the login. Log in again and authorize the app on GitHub.");
     }
-    let gh = try github_user(cfg, code, verifier) catch e {
+    let u = try github_user(cfg, code, verifier) catch e {
         return message(site, r.path, e.status, "Login failed", e.msg);
     };
+    let gh = u.account;
+    if cfg.require_2fa && !u.two_factor { return no_two_factor(site, r.path, gh.login); }
     let id = gh.id;
     let sid = try secret::random_hex(32);
     let csrf = try secret::random_hex(16);
@@ -156,6 +159,17 @@ pub fn callback(cfg: Cfg, site: Site, r: Request) throws -> Resp {
         out = redirect("/me", [cookie(SESSION_COOKIE, sid, SESSION_SECS), cookie(STATE_COOKIE, "", 0i64)]);
     }
     out
+}
+
+/// The refusal of a login whose GitHub account has no two-factor
+/// authentication, with the way to turn it on.
+fn no_two_factor(site: Site, path: str, login: str) -> Resp {
+    let b = StrBuf::new();
+    b.push_str("<h1 class=\"t-h1\">Turn on two-factor authentication</h1>\n");
+    b.push_str(f"<p class=\"t-lead\">The registry takes logins only from GitHub accounts with two-factor authentication, and <strong>{esc(login)}</strong> has it off.</p>\n");
+    b.push_str("<ol>\n<li>Turn it on in GitHub's settings: <a href=\"https://github.com/settings/security\">Password and authentication</a>, then <em>Enable two-factor authentication</em>.</li>\n<li>Come back and <a href=\"/login\">log in again</a>.</li>\n</ol>\n");
+    b.push_str("<p class=\"t-small muted\">Nothing was stored: no account or session is made until the login succeeds.</p>\n");
+    page(site, path, "Two-factor authentication required", b.to_str(), 403)
 }
 
 /// The issuer's key `kid`: from the cached JWKS, else fetched again (at

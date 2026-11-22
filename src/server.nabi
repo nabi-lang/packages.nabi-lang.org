@@ -94,6 +94,9 @@ pub struct Cfg {
     /// owner lookups send, for GitHub's 5000 requests an hour in place
     /// of 60 per address; "": none.
     pub api_token: str = "";
+    /// PACKAGES_REQUIRE_2FA: refuse a login whose GitHub account has no
+    /// two-factor authentication. On unless set to 0.
+    pub require_2fa: bool = true;
 }
 
 /// `KEY=value` lines; `#` comments, blank lines, `export ` and one pair
@@ -123,6 +126,15 @@ fn setting(file: Dict<str, str>, k: str, dflt: str) throws -> str {
 }
 
 fn optional(file: Dict<str, str>, k: str) -> str { try env::var(k) catch _ { file.get(k) ?? "" } }
+
+/// A yes / no setting; `dflt` when unset.
+pub fn switch(k: str, v: str, dflt: bool) throws (ApiError) -> bool {
+    let t = v.trim().to_lowercase();
+    if t.is_empty() { return dflt; }
+    if ["1", "true", "on", "yes"].contains(t) { return true; }
+    if ["0", "false", "off", "no"].contains(t) { return false; }
+    throw ApiError { status: 0, msg: f"{k} is 1 (on) or 0 (off), not `{v}`" };
+}
 
 /// `packages.nabi-lang.org` of `https://packages.nabi-lang.org:443/x`.
 pub fn host_of(url: str) -> str {
@@ -157,6 +169,7 @@ pub fn load_cfg(path: str) throws -> Cfg {
         open: ["1", "true"].contains(optional(f, "PACKAGES_OPEN_PUBLISHING").to_lowercase()),
         client_header: optional(f, "PACKAGES_CLIENT_HEADER").trim().to_lowercase(),
         api_token: optional(f, "GITHUB_API_TOKEN").trim(),
+        require_2fa: try switch("PACKAGES_REQUIRE_2FA", optional(f, "PACKAGES_REQUIRE_2FA"), true),
         official_org: if org.is_empty() { 0i64 } else { try org.parse::<i64>() catch _ { throw ApiError { status: 0, msg: f"PACKAGES_OFFICIAL_ORG is the numeric GitHub id of the organization (the `id` of https://api.github.com/orgs/<org>), not `{org}`" }; } },
         rate: try (if rate.is_empty() { "30" } else { rate }).parse::<i64>() catch _ { throw ApiError { status: 0, msg: f"PACKAGES_RATE_LIMIT is a number of changes a minute, not `{rate}`" }; },
     }
@@ -460,6 +473,11 @@ fn env_files() {
     cfg.open = true;
     p.added_by_id = 1002i64;
     assert(may_act(cfg, 1002i64) && !may_act(cfg, 0i64) && counts(cfg, p), "open");
+    assert(cfg.require_2fa, "2fa required by default");
+    let on = try switch("X", "", true) catch _ { false };
+    let off = try switch("X", " Off ", true) catch _ { true };
+    let bad = try switch("X", "maybe", true) catch e { e.msg == "X is 1 (on) or 0 (off), not `maybe`" };
+    assert(on && !off && bad, "switches");
 }
 
 #[test]

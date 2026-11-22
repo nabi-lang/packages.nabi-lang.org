@@ -64,6 +64,8 @@ while True: held.append(s.accept()[0])' "$slow_port" &
     pids+=($!)
 fi
 
+# Settings that change between restarts.
+extra_env=(PACKAGES_REQUIRE_2FA=1)
 start_server() {
     (cd "$T/site" && exec env \
         PACKAGES_URL="https://packages.test" \
@@ -80,6 +82,7 @@ start_server() {
         GIT_ALLOW_PROTOCOL=https:file:http \
         PACKAGES_RATE_LIMIT=1000 \
         PACKAGES_OFFICIAL_ORG=5151 \
+        "${extra_env[@]}" \
         GIT_CONFIG_COUNT=2 \
         GIT_CONFIG_KEY_0="url.file://$T/src/.insteadOf" \
         GIT_CONFIG_VALUE_0="https://example.invalid/" \
@@ -246,6 +249,18 @@ req GET "/auth/github/callback?code=user&state=$first" -H "Cookie: __Host-pkg_st
 expect_code 400 "a verifier used twice"
 expect_body "The login expired" "used verifier body"
 ok "pkce"
+
+# Two-factor authentication required (PACKAGES_REQUIRE_2FA=1, the
+# default): an account without it is told how to turn it on, and nothing
+# is stored.
+authorize no2fa
+req GET "/auth/github/callback?code=no2fa&state=$state" -H "Cookie: __Host-pkg_state=$state"
+expect_code 403 "login without 2fa"
+expect_body "Turn on two-factor authentication" "2fa page"
+expect_body 'href="https://github.com/settings/security"' "2fa settings link"
+[ -z "$(cookie_of __Host-pkg_session)" ] || fail "session without 2fa"
+grep -q '"dave"' "$T/data/db.nabion" && fail "account stored without 2fa"
+ok "two-factor required"
 
 login user
 expect_body "Publishing is not open yet" "non-admin page"
@@ -999,7 +1014,11 @@ expect_code 403 "a non-admin's trusted publisher"
 exchange "$(mint "$(claims acme/seeded publish.yml)")"
 expect_code 200 "seeded publisher while closed"
 kill "$server"; wait "$server" 2>/dev/null || true
+extra_env=(PACKAGES_REQUIRE_2FA=0)
 start_server 1001
+login no2fa
+expect_body 'Logged in with GitHub as <a href="https://github.com/dave"><strong>dave</strong></a>' "login without 2fa when not required"
+login admin
 
 # A token limited to other packages publishes nothing else.
 req POST /api/v1/publish -H "Authorization: Bearer $one" --data-binary "Publish { entry: ${line//0.1.0/0.4.0} }"

@@ -6,7 +6,8 @@
 // `GET /login/oauth/authorize?..&as=<code>` keeps the PKCE challenge for
 // that code and redirects back with it; the token exchange then wants the
 // matching code_verifier. Code `admin` logs in as `alice` (id 1001),
-// `user` as `Bob` (id 1002).
+// `user` as `Bob` (id 1002), both with two-factor authentication, and
+// `no2fa` as `dave` (id 1004), without.
 // Repositories of `acme` exist, owned by id 4242, and of `nabi-lang`,
 // owned by id 5151; `/users/` knows the organisations `acme` and
 // `nabi-lang` and the user `carol` (id 3003). The issuer is
@@ -117,6 +118,7 @@ fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>) throws {
         if body.contains(f"client_secret={secret}") && body.contains("redirect_uri=") && !want.is_empty() && b64(HashAlgorithm::Sha256.digest(verifier)) == want {
             if body.contains("code=admin&") { out = "{\"access_token\":\"gho_alice\",\"token_type\":\"bearer\",\"scope\":\"read:user\"}"; }
             if body.contains("code=user&") { out = "{\"access_token\":\"gho_bob\",\"token_type\":\"bearer\",\"scope\":\"read:user\"}"; }
+            if body.contains("code=no2fa&") { out = "{\"access_token\":\"gho_dave\",\"token_type\":\"bearer\",\"scope\":\"read:user\"}"; }
         }
     } else if line.0.starts_with("GET /oidc/.well-known/openid-configuration ") {
         status = "200 OK";
@@ -139,11 +141,15 @@ fn answer(s: TcpStream, secret: str, addr: str, pkce: Dict<str, str>) throws {
         status = "401 Unauthorized";
         if text.contains("\r\nAuthorization: Bearer gho_alice\r\n") {
             status = "200 OK";
-            out = "{\"login\":\"alice\",\"id\":1001,\"name\":\"Alice Liddell\",\"avatar_url\":\"https://avatars.githubusercontent.com/u/1001?v=4\",\"plan\":{\"name\":\"free\"}}";
+            out = "{\"login\":\"alice\",\"id\":1001,\"name\":\"Alice Liddell\",\"avatar_url\":\"https://avatars.githubusercontent.com/u/1001?v=4\",\"plan\":{\"name\":\"free\"},\"two_factor_authentication\":true}";
         }
         if text.contains("\r\nAuthorization: Bearer gho_bob\r\n") {
             status = "200 OK";
-            out = "{\"login\":\"Bob\",\"id\":1002,\"name\":null}";
+            out = "{\"login\":\"Bob\",\"id\":1002,\"name\":null,\"two_factor_authentication\":true}";
+        }
+        if text.contains("\r\nAuthorization: Bearer gho_dave\r\n") {
+            status = "200 OK";
+            out = "{\"login\":\"dave\",\"id\":1004,\"name\":\"Dave\",\"two_factor_authentication\":false}";
         }
     } else if let rest: str = line.0.strip_prefix("GET /users/") {
         let who = (rest.split_once(" ") ?? (rest, "")).0.to_lowercase();
