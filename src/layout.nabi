@@ -1,7 +1,10 @@
 // Page chrome (header, search, footer) and the generated pages: landing,
 // package list, publishing guide, one page per package plus its tab pages.
-// Every page is in English at `<page>` and in Korean at `ko/<page>`: the
-// chrome, labels and dates in Korean, a package's own text as written.
+// Every page is in English at `<page>` and in each other language at
+// `<dir>/<page>` (`ko/`, `zh-hans/`, `zh-hant/`; web::lang): the chrome,
+// labels and dates in that language, a package's own text as written.
+
+pub use web::lang::Lang;
 
 use pkg::Site;
 use pkg::docs::Status;
@@ -15,6 +18,7 @@ use markdown::{Options, esc};
 use web::build;
 use web::chrome;
 use web::http;
+use web::lang;
 
 /// The address of output file `out`, root-relative and canonical: no
 /// `.html`, a directory index is the directory, no trailing slash
@@ -27,30 +31,43 @@ pub fn url(out: str) -> str {
 
 pub fn package_out(name: str) -> str { f"packages/{name}.html" }
 
-/// `en` or `kr`, by the page's language.
-pub fn tr(ko: bool, en: str, kr: str) -> str { if ko { kr } else { en } }
+/// The text in the page's language: English, Korean, Simplified or
+/// Traditional Chinese.
+pub fn tr(lg: Lang, en: str, kr: str, hans: str, hant: str) -> str {
+    match lg {
+        Lang::En => en,
+        Lang::Ko => kr,
+        Lang::ZhHans => hans,
+        Lang::ZhHant => hant,
+    }
+}
 
-/// Output file `out` in Korean when `ko`: `ko/<out>`.
-pub fn in_lang(out: str, ko: bool) -> str { if ko { "ko/" + out } else { out } }
+/// Output file `out` in `lg`: `<dir>/<out>` (`ko/packages/index.html`).
+pub fn in_lang(out: str, lg: Lang) -> str { lg.path(out) }
 
-/// Whether output file `out` (or a path without its `/`) is a Korean page.
-pub fn is_ko(out: str) -> bool { out == "ko" || out.starts_with("ko/") }
+/// The language of output file `out` (or of a path without its `/`).
+pub fn lang_of(out: str) -> Lang { lang::of_path(out) }
 
-/// Root-relative path `p` on the Korean pages when `ko`: `/ko/packages`,
-/// `/ko` for `/`. A query or fragment stays.
-pub fn lp(ko: bool, p: str) -> str {
-    if !ko { return p; }
-    if p == "/" { return "/ko"; }
-    if p.starts_with("/?") || p.starts_with("/#") { return "/ko" + p[1:]; }
-    "/ko" + p
+/// The root of the pages in `lg`, as a path prefix: `""`, `/ko`,
+/// `/zh-hans`, `/zh-hant`.
+pub fn lang_root(lg: Lang) -> str { if lg.is_en() { "" } else { "/" + lg.slug() } }
+
+/// Root-relative path `p` on the pages in `lg`: `/ko/packages`, `/ko`
+/// for `/`. A query or fragment stays.
+pub fn lp(lg: Lang, p: str) -> str {
+    if lg.is_en() { return p; }
+    let r = lang_root(lg);
+    if p == "/" { return r; }
+    if p.starts_with("/?") || p.starts_with("/#") { return r + p[1:]; }
+    r + p
 }
 
 /// The publishing guide's section on publishing (its heading's id in
-/// pages/publishing.md, pages/ko/publishing.md).
-pub fn publishing_href(ko: bool) -> str { if ko { "/ko/publishing#패키지-공개" } else { "/publishing#publishing" } }
+/// pages/publishing.md and pages/<dir>/publishing.md).
+pub fn publishing_href(lg: Lang) -> str { lp(lg, "/publishing#" + tr(lg, "publishing", "패키지-공개", "发布包", "發布套件")) }
 
-/// The address of output file `out` in Korean when `ko`.
-pub fn href(ko: bool, out: str) -> str { url(in_lang(out, ko)) }
+/// The address of output file `out` in `lg`.
+pub fn href(lg: Lang, out: str) -> str { url(in_lang(out, lg)) }
 
 /// A package's tab page: `versions`, `dependencies` or `dependents`.
 pub fn tab_out(name: str, tab: str) -> str { f"packages/{name}/{tab}.html" }
@@ -94,8 +111,10 @@ fn short(rev: str) -> str { if rev.len() > 8 { rev[:8] } else { rev } }
 
 fn plural(n: usize, one: str, many: str) -> str { if n == 1 { f"1 {one}" } else { f"{grouped(n)} {many}" } }
 
-/// `plural`, or in Korean `<noun> <n>개`.
-fn count_of(ko: bool, n: usize, one: str, many: str, noun: str) -> str { if ko { f"{noun} {grouped(n)}개" } else { plural(n, one, many) } }
+/// `plural`; in Korean `<noun> <n>개`, in Chinese `<n> <unit>` (`3 个版本`).
+fn count_of(lg: Lang, n: usize, one: str, many: str, noun: str, hans: str, hant: str) -> str {
+    tr(lg, plural(n, one, many), f"{noun} {grouped(n)}개", f"{grouped(n)} {hans}", f"{grouped(n)} {hant}")
+}
 
 /// `n` with thousands separators: `4812` -> `4,812`.
 fn grouped(n: usize) -> str {
@@ -111,12 +130,12 @@ fn grouped(n: usize) -> str {
 }
 
 /// A byte count in KiB / MiB, one decimal below 100.
-fn size(b: i64, ko: bool = false) -> str {
+fn size(b: i64, lg: Lang = Lang::En) -> str {
     let one = |x: i64, unit: str| {
         // x is tenths
         if x >= 1000i64 { f"{x / 10i64} {unit}" } else { f"{x / 10i64}.{x % 10i64} {unit}" }
     };
-    if b < 1024i64 { return if ko { f"{b}바이트" } else { f"{b} bytes" }; }
+    if b < 1024i64 { return tr(lg, f"{b} bytes", f"{b}바이트", f"{b} 字节", f"{b} 位元組"); }
     if b < 1048576i64 { return one((b * 10i64 + 512i64) / 1024i64, "KiB"); }
     one((b * 10i64 + 524288i64) / 1048576i64, "MiB")
 }
@@ -145,28 +164,25 @@ fn icon_search() -> str {
     "<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><circle cx=\"11\" cy=\"11\" r=\"7\"/><path d=\"M20 20l-4-4\"/></svg>"
 }
 
-fn search_box(ko: bool) -> str {
-    let (find, results) = if ko { ("패키지 검색", "검색 결과") } else { ("Search packages", "Search results") };
-    f"<form class=\"search\" role=\"search\" action=\"{lp(ko, "/packages")}\">{icon_search()}<input class=\"q\" name=\"q\" type=\"search\" placeholder=\"{find}\" aria-label=\"{find}\" aria-keyshortcuts=\"/ Control+K Meta+K\" autocomplete=\"off\" spellcheck=\"false\" role=\"combobox\" aria-autocomplete=\"list\" aria-expanded=\"false\" aria-controls=\"results\"><kbd class=\"kbd\" aria-hidden=\"true\">/</kbd><ul id=\"results\" class=\"results appear\" role=\"listbox\" aria-label=\"{results}\" hidden></ul><p class=\"sr-only\" role=\"status\"></p></form>"
+fn search_box(lg: Lang) -> str {
+    let find = tr(lg, "Search packages", "패키지 검색", "搜索包", "搜尋套件");
+    let results = tr(lg, "Search results", "검색 결과", "搜索结果", "搜尋結果");
+    f"<form class=\"search\" role=\"search\" action=\"{lp(lg, "/packages")}\">{icon_search()}<input class=\"q\" name=\"q\" type=\"search\" placeholder=\"{find}\" aria-label=\"{find}\" aria-keyshortcuts=\"/ Control+K Meta+K\" autocomplete=\"off\" spellcheck=\"false\" role=\"combobox\" aria-autocomplete=\"list\" aria-expanded=\"false\" aria-controls=\"results\"><kbd class=\"kbd\" aria-hidden=\"true\">/</kbd><ul id=\"results\" class=\"results appear\" role=\"listbox\" aria-label=\"{results}\" hidden></ul><p class=\"sr-only\" role=\"status\"></p></form>"
 }
-
-/// The slogan, in Korean as nabi-lang.org/ko has it.
-pub const TAGLINE: str = "Clear rules, free as a butterfly.";
-pub const TAGLINE_KO: str = "규칙은 분명하게, 나비처럼 자유롭게.";
 
 /// The footer every Nabi site shares (chrome::site_cols, legal links in
 /// its bar).
-fn footer(site: Site, ko: bool) -> str {
-    let l = chrome::Links { home: site.home + "/", docs: site.docs + "/latest/", docs_host: site.docs + "/", registry: lp(ko, "/"), playground: site.playground + "/" };
-    let home = site.home + (if ko { "/ko" } else { "" });
+fn footer(site: Site, lg: Lang) -> str {
+    let l = chrome::Links { home: site.home + "/", docs: site.docs + "/latest/", docs_host: site.docs + "/", registry: lp(lg, "/"), playground: site.playground + "/" };
+    let home = site.home + lang_root(lg);
     chrome::footer(chrome::Footer {
         home: home,
         logo: "/logo.svg",
-        tagline: tr(ko, TAGLINE, TAGLINE_KO),
-        cols: chrome::site_cols(l, ko),
-        sites: chrome::Sites { home: home, docs: site.docs + (if ko { "/latest/ko" } else { "/latest" }), registry: lp(ko, "/"), playground: site.playground + (if ko { "/ko" } else { "" }), current: "registry" },
+        tagline: lg.words().tagline,
+        cols: chrome::site_cols_for(l, lg),
+        sites: chrome::Sites { home: home, docs: site.docs + "/latest" + lang_root(lg), registry: lp(lg, "/"), playground: site.playground + lang_root(lg), current: "registry" },
         release: site.release,
-        ko: ko,
+        lang: lg,
     })
 }
 
@@ -174,17 +190,26 @@ fn footer(site: Site, ko: bool) -> str {
 /// menu (signed_in) on a request with a live session.
 pub const LOGIN_BUTTON: str = "<a class=\"btn-2 btn-sm login\" href=\"/login\">Log in<span class=\"wide\"> with GitHub</span></a>";
 
-/// LOGIN_BUTTON of the Korean pages: back to the Korean account page.
-pub const LOGIN_BUTTON_KO: str = "<a class=\"btn-2 btn-sm login\" href=\"/ko/login\"><span class=\"wide\">GitHub로 </span>로그인</a>";
+/// LOGIN_BUTTON of the pages in `lg`: back to the account page in `lg`.
+pub fn login_button(lg: Lang) -> str {
+    let text = tr(lg, "Log in<span class=\"wide\"> with GitHub</span>", "<span class=\"wide\">GitHub로 </span>로그인", "<span class=\"wide\">使用 GitHub </span>登录", "<span class=\"wide\">使用 GitHub </span>登入");
+    f"<a class=\"btn-2 btn-sm login\" href=\"{lp(lg, "/login")}\">{text}</a>"
+}
 
 /// `html` with the login button replaced by account `login`'s menu: its
 /// avatar and login, the account page, and a log-out form carrying the
 /// session's `csrf`. A `<details>`, so it needs no script.
 pub fn signed_in(html: str, login: str, id: i64, csrf: str) -> str {
-    let ko = html.contains(LOGIN_BUTTON_KO);
-    let (label, who, account, out) = if ko { (f"{esc(login)} 계정 메뉴", f"로그인 계정 <strong>{esc(login)}</strong>", "계정", "로그아웃") } else { (f"Account menu of {esc(login)}", f"Logged in as <strong>{esc(login)}</strong>", "Account", "Log out") };
-    let menu = f"<details class=\"user\"><summary class=\"btn-2 btn-sm\" aria-label=\"{label}\">{avatar(id, 20, false)}<span class=\"wide\">{esc(login)}</span></summary><div class=\"user-menu\"><p class=\"t-small\">{who}</p><a href=\"{lp(ko, "/me")}\">{account}</a><form method=\"post\" action=\"{lp(ko, "/logout")}\"><input type=\"hidden\" name=\"csrf\" value=\"{esc(csrf)}\"><button type=\"submit\">{out}</button></form></div></details>";
-    html.replace(if ko { LOGIN_BUTTON_KO } else { LOGIN_BUTTON }, menu)
+    let lg = Lang::En;
+    for l in lang::ALL {
+        if html.contains(login_button(l)) { lg = l; }
+    }
+    let label = tr(lg, f"Account menu of {esc(login)}", f"{esc(login)} 계정 메뉴", f"{esc(login)} 的账户菜单", f"{esc(login)} 的帳戶選單");
+    let who = tr(lg, f"Logged in as <strong>{esc(login)}</strong>", f"로그인 계정 <strong>{esc(login)}</strong>", f"已登录为 <strong>{esc(login)}</strong>", f"已登入為 <strong>{esc(login)}</strong>");
+    let account = tr(lg, "Account", "계정", "账户", "帳戶");
+    let out = tr(lg, "Log out", "로그아웃", "退出登录", "登出");
+    let menu = f"<details class=\"user\"><summary class=\"btn-2 btn-sm\" aria-label=\"{label}\">{avatar(id, 20, false)}<span class=\"wide\">{esc(login)}</span></summary><div class=\"user-menu\"><p class=\"t-small\">{who}</p><a href=\"{lp(lg, "/me")}\">{account}</a><form method=\"post\" action=\"{lp(lg, "/logout")}\"><input type=\"hidden\" name=\"csrf\" value=\"{esc(csrf)}\"><button type=\"submit\">{out}</button></form></div></details>";
+    html.replace(login_button(lg), menu)
 }
 
 /// GitHub's avatar of `id`, `px` square (drawn at twice that); "" when the
@@ -214,55 +239,57 @@ pub fn person_link(p: meta::Person, px: i32) -> str {
 /// `page` with a `<meta name="description">` of its own.
 pub fn page(site: Site, out: str, title: str, body: str) -> str { page_desc(site, out, title, "", body) }
 
-/// The page of output file `out` (`ko/..` is Korean: the chrome, `lang`
-/// and the description, which `about` gives as it is). `img` and `alt`
-/// are a package's card; the home card by default. Every card is drawn
-/// at the home card's size (og/render.ts). `ld` is its JSON-LD, `query`
-/// a search the language menu keeps.
+/// The page of output file `out` (`ko/..` is Korean, `zh-hans/..`
+/// Simplified Chinese: the chrome, `lang` and the description, which
+/// `about` gives as it is). `img` and `alt` are a package's card; the
+/// home card by default. Every card is drawn at the home card's size
+/// (og/render.ts). `ld` is its JSON-LD, `query` a search the language
+/// menu keeps.
 pub fn page_desc(site: Site, out: str, title: str, about: str, body: str, img: str = "", alt: str = "", ld: str = "", query: str = "") -> str {
-    let ko = is_ko(out);
-    let at = if out == "ko" { "index.html" } else if ko { out[3:] } else { out };
+    let (lg, rest) = lang::split(out);
+    let at = if rest.is_empty() { "index.html" } else { rest };
     let home = at == "index.html";
-    let name = tr(ko, site.title, "Nabi 패키지");
-    let full = if home { name + " - " + tr(ko, site.tagline, "Nabi 패키지 레지스트리") } else { title + " - " + name };
-    let desc = esc(if !about.is_empty() { build::clip(about, 160) } else if ko { "Nabi 패키지 레지스트리입니다. 패키지를 찾은 뒤 nabi add <이름>으로 추가합니다." } else { site.description });
+    let name = tr(lg, site.title, "Nabi 패키지", "Nabi 包", "Nabi 套件");
+    let full = if home { name + " - " + tr(lg, site.tagline, "Nabi 패키지 레지스트리", "Nabi 包注册表", "Nabi 套件登錄庫") } else { title + " - " + name };
+    let desc = esc(if !about.is_empty() { build::clip(about, 160) } else { tr(lg, site.description, "Nabi 패키지 레지스트리입니다. 패키지를 찾은 뒤 nabi add <이름>으로 추가합니다.", "Nabi 包注册表。找到包后，用 nabi add <名称> 添加。", "Nabi 套件登錄庫。找到套件後，用 nabi add <名稱> 新增。") });
     let canon = site.base_url + url(out);
-    // The same page in each language; search engines get both, English
-    // as the default.
+    // The same page in each language; search engines get every one,
+    // English as the default.
     let q = if query.is_empty() { "" } else { "?" + query };
-    let en_url = url(at);
-    let ko_url = url("ko/" + at);
-    let alts = f"<link rel=\"alternate\" hreflang=\"en\" href=\"{esc(site.base_url + en_url)}\">\n<link rel=\"alternate\" hreflang=\"ko\" href=\"{esc(site.base_url + ko_url)}\">\n<link rel=\"alternate\" hreflang=\"x-default\" href=\"{esc(site.base_url + en_url)}\">\n";
-    let langs = chrome::lang_menu(ko, [chrome::Lang { code: "en", name: "English", href: if ko { en_url + q } else { "" } }, chrome::Lang { code: "ko", name: "한국어", href: if ko { "" } else { ko_url + q } }]);
+    let alt_b = StrBuf::new();
+    for l in lang::ALL { alt_b.push_str(f"<link rel=\"alternate\" hreflang=\"{l.code()}\" href=\"{esc(site.base_url + url(l.path(at)))}\">\n"); }
+    alt_b.push_str(f"<link rel=\"alternate\" hreflang=\"x-default\" href=\"{esc(site.base_url + url(at))}\">\n");
+    let alts = alt_b.to_str();
+    let langs = chrome::lang_menu_for(lg, chrome::menu_items(lg, |m| url(m.path(at)) + q));
     // Heading permalinks are aria-hidden, so keep them out of the tab order too.
     let body = body.replace("class=\"anchor\" href=", "class=\"anchor\" tabindex=\"-1\" href=");
     let (ogimg, ogalt) = if img.is_empty() { (site.base_url + "/og.png" + (if site.og.is_empty() { "" } else { "?v=" + site.og }), f"{site.title}: {site.tagline}") } else { (img, alt) };
     let cur = |on: bool| if on { " aria-current=\"page\"" } else { "" };
     let browse = cur(at.starts_with("packages/") || at.starts_with("categories/") || at.starts_with("keywords/"));
     let publish = cur(at == "publishing.html" || at == "api.html");
-    let docs = site.docs + tr(ko, "/latest", "/latest/ko");
-    let nav = f"<a href=\"{esc(site.home + tr(ko, "", "/ko"))}\" title=\"nabi-lang.org\">{tr(ko, "Home", "홈")}</a><a href=\"{lp(ko, "/packages")}\"{browse}>{tr(ko, "Browse", "둘러보기")}</a><a href=\"{lp(ko, "/publishing")}\"{publish}>{tr(ko, "Publishing", "패키지 공개")}</a><a href=\"{esc(docs)}\" title=\"{tr(ko, "The guide, the language reference and the standard library, on docs.nabi-lang.org", "가이드, 언어 사양, 표준 라이브러리: docs.nabi-lang.org")}\">{tr(ko, "Nabi docs", "Nabi 문서")}</a><a href=\"{esc(site.playground + tr(ko, "", "/ko"))}\">{tr(ko, "Playground", "플레이그라운드")}</a>";
+    let docs = site.docs + "/latest" + lang_root(lg);
+    let nav = f"<a href=\"{esc(site.home + lang_root(lg))}\" title=\"nabi-lang.org\">{tr(lg, "Home", "홈", "首页", "首頁")}</a><a href=\"{lp(lg, "/packages")}\"{browse}>{tr(lg, "Browse", "둘러보기", "浏览", "瀏覽")}</a><a href=\"{lp(lg, "/publishing")}\"{publish}>{tr(lg, "Publishing", "패키지 공개", "发布包", "發布套件")}</a><a href=\"{esc(docs)}\" title=\"{tr(lg, "The guide, the language reference and the standard library, on docs.nabi-lang.org", "가이드, 언어 사양, 표준 라이브러리: docs.nabi-lang.org", "指南、语言参考和标准库：docs.nabi-lang.org", "指南、語言參考與標準函式庫：docs.nabi-lang.org")}\">{tr(lg, "Nabi docs", "Nabi 문서", "Nabi 文档", "Nabi 文件")}</a><a href=\"{esc(site.playground + lang_root(lg))}\">{tr(lg, "Playground", "플레이그라운드", "Playground", "Playground")}</a>";
     f"<!doctype html>
-<html lang=\"{tr(ko, "en", "ko")}\" class=\"nb lt\">
+<html lang=\"{lg.code()}\" class=\"nb lt\">
 <head>
-{chrome::head(chrome::Head { title: full, site: name, desc: desc, url: canon, img: ogimg, img_w: site.og_w, img_h: site.og_h, alt: ogalt, asset: |n| asset(site, n), extra: alts, ko: ko })}{ld}</head>
+{chrome::head(chrome::Head { title: full, site: name, desc: desc, url: canon, img: ogimg, img_w: site.og_w, img_h: site.og_h, alt: ogalt, asset: |n| asset(site, n), extra: alts, lang: lg })}{ld}</head>
 <body>
-<a class=\"skip\" href=\"#content\">{tr(ko, "Skip to content", "본문으로 건너뛰기")}</a>
+<a class=\"skip\" href=\"#content\">{lg.words().skip}</a>
 <header class=\"hdr\">
 <div class=\"frame in\">
-<a class=\"brand\" href=\"{lp(ko, "/")}\" lang=\"en\">{web::chrome::wordmark("Nabi")}<span class=\"sl\" aria-hidden=\"true\">/</span><span class=\"site\">packages</span></a>
-{search_box(ko)}
-<nav id=\"nav\" class=\"nav\" aria-label=\"{tr(ko, "Registry", "레지스트리")}\">{nav}</nav>
+<a class=\"brand\" href=\"{lp(lg, "/")}\" lang=\"en\">{web::chrome::wordmark("Nabi")}<span class=\"sl\" aria-hidden=\"true\">/</span><span class=\"site\">packages</span></a>
+{search_box(lg)}
+<nav id=\"nav\" class=\"nav\" aria-label=\"{tr(lg, "Registry", "레지스트리", "注册表", "登錄庫")}\">{nav}</nav>
 {langs}
-{chrome::theme_button(ko)}
-{if ko { LOGIN_BUTTON_KO } else { LOGIN_BUTTON }}
-<button class=\"ib menu\" type=\"button\" aria-label=\"{tr(ko, "Menu", "메뉴")}\" aria-expanded=\"false\" aria-controls=\"nav\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M4 7h16M4 12h16M4 17h16\"/></svg></button>
+{chrome::theme_button_for(lg)}
+{login_button(lg)}
+<button class=\"ib menu\" type=\"button\" aria-label=\"{tr(lg, "Menu", "메뉴", "菜单", "選單")}\" aria-expanded=\"false\" aria-controls=\"nav\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M4 7h16M4 12h16M4 17h16\"/></svg></button>
 </div>
 </header>
 <main id=\"content\">
 {body}
 </main>
-{footer(site, ko)}<script src=\"{asset(site, "keys.js")}\" defer></script>
+{footer(site, lg)}<script src=\"{asset(site, "keys.js")}\" defer></script>
 <script src=\"{asset(site, "copy.js")}\" defer></script>
 <script src=\"{asset(site, "search.js")}\" defer></script>
 </body>
@@ -296,35 +323,32 @@ pub fn row_of(s: Package) -> Row {
 }
 
 /// The mark of a package with an executable, in lists and search.
-pub fn bin_tag(ko: bool = false) -> str { f"<span class=\"tag bin\" title=\"{tr(ko, "Has an executable: nabi install installs it", "실행 파일이 있습니다. nabi install로 설치합니다")}\">bin</span>" }
+pub fn bin_tag(lg: Lang = Lang::En) -> str { f"<span class=\"tag bin\" title=\"{tr(lg, "Has an executable: nabi install installs it", "실행 파일이 있습니다. nabi install로 설치합니다", "包含可执行文件：用 nabi install 安装", "包含執行檔：用 nabi install 安裝")}\">bin</span>" }
 
 /// What a list shows in place of a standard library tier's version.
-const WITH_TOOLCHAIN: str = "with nabi";
-const WITH_TOOLCHAIN_KO: str = "nabi에 포함";
+fn with_toolchain(lg: Lang) -> str { tr(lg, "with nabi", "nabi에 포함", "随 nabi 提供", "隨 nabi 提供") }
 
-fn with_toolchain(ko: bool) -> str { if ko { WITH_TOOLCHAIN_KO } else { WITH_TOOLCHAIN } }
-
-/// A standard library tier's description in Korean (packages::
-/// library_desc has the English, which the site writes, not a package).
-pub fn library_desc_ko(name: str) -> str {
+/// A standard library tier's description in `lg` (packages::library_desc
+/// has the English, which the site writes, not a package).
+pub fn library_desc(name: str, desc: str, lg: Lang) -> str {
     match name {
-        "bare" => "표준 라이브러리의 가장 낮은 층: 포인터, 메모리, FFI. 도구 모음에 함께 들어 있습니다.",
-        "core" => "모든 대상에 있는 표준 라이브러리 층: 컬렉션, 수, 반복자, 서식, 태스크. 도구 모음에 함께 들어 있습니다.",
-        _ => "호스트 대상의 표준 라이브러리 층: 파일, 네트워크, 시간, 스레드, 프로세스. 도구 모음에 함께 들어 있습니다.",
+        "bare" => tr(lg, desc, "표준 라이브러리의 가장 낮은 층: 포인터, 메모리, FFI. 도구 모음에 함께 들어 있습니다.", "标准库的最底层：指针、内存、FFI。随工具链提供。", "標準函式庫的最底層：指標、記憶體、FFI。隨工具鏈提供。"),
+        "core" => tr(lg, desc, "모든 대상에 있는 표준 라이브러리 층: 컬렉션, 수, 반복자, 서식, 태스크. 도구 모음에 함께 들어 있습니다.", "每个目标上都有的标准库层级：集合类型、数值、迭代器、格式化、任务。随工具链提供。", "每個目標上都有的標準函式庫層級：集合型別、數值、迭代器、格式化、任務。隨工具鏈提供。"),
+        _ => tr(lg, desc, "호스트 대상의 표준 라이브러리 층: 파일, 네트워크, 시간, 스레드, 프로세스. 도구 모음에 함께 들어 있습니다.", "主机目标上的标准库层级：文件、网络、时间、线程、进程。随工具链提供。", "主機目標上的標準函式庫層級：檔案、網路、時間、執行緒、行程。隨工具鏈提供。"),
     }
 }
 
-/// `desc` of a package as a page in `ko` shows it: as written, but the
-/// site's own text of a standard library tier in Korean.
-fn desc_in(name: str, desc: str, library: bool, ko: bool) -> str { if library && ko { library_desc_ko(name) } else { desc } }
+/// `desc` of a package as a page in `lg` shows it: as written, but the
+/// site's own text of a standard library tier in `lg`.
+fn desc_in(name: str, desc: str, library: bool, lg: Lang) -> str { if library { library_desc(name, desc, lg) } else { desc } }
 
 /// A yanked version's tag.
-fn yanked_tag(ko: bool) -> str { tr(ko, "yanked", "철회됨") }
+fn yanked_tag(lg: Lang) -> str { tr(lg, "yanked", "철회됨", "已撤回", "已撤回") }
 
 /// The mark of an official package: a word, not only a colour, so screen
 /// readers and high-contrast modes read it too.
-pub fn official_badge(ko: bool = false) -> str {
-    f"<span class=\"official\" title=\"{tr(ko, "Published from the nabi-lang organization", "nabi-lang 조직에서 공개했습니다")}\"><svg aria-hidden=\"true\" viewBox=\"0 0 16 16\" width=\"12\" height=\"12\"><path d=\"M3.5 8.5l3 3 6-7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>{tr(ko, "Official", "공식")}</span>"
+pub fn official_badge(lg: Lang = Lang::En) -> str {
+    f"<span class=\"official\" title=\"{tr(lg, "Published from the nabi-lang organization", "nabi-lang 조직에서 공개했습니다", "由 nabi-lang 组织发布", "由 nabi-lang 組織發布")}\"><svg aria-hidden=\"true\" viewBox=\"0 0 16 16\" width=\"12\" height=\"12\"><path d=\"M3.5 8.5l3 3 6-7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>{tr(lg, "Official", "공식", "官方", "官方")}</span>"
 }
 
 /// A search result: how well it matched and where.
@@ -410,10 +434,13 @@ pub fn search(rows: List<Row>, q: str, sort: str) -> List<Hit> {
 }
 
 /// Where a search matched (Hit.why), in the page's language.
-fn why_text(why: str, ko: bool) -> str {
-    if !ko { return why; }
-    let w = why.replace("name", "이름").replace("description", "설명").replace("keywords", "키워드");
-    w.replace(" and ", ", ")
+fn why_text(why: str, lg: Lang) -> str {
+    match lg {
+        Lang::En => why,
+        Lang::Ko => why.replace("name", "이름").replace("description", "설명").replace("keywords", "키워드").replace(" and ", ", "),
+        Lang::ZhHans => why.replace("name", "名称").replace("description", "描述").replace("keywords", "关键词").replace(", ", "、").replace(" and ", "、"),
+        Lang::ZhHant => why.replace("name", "名稱").replace("description", "描述").replace("keywords", "關鍵字").replace(", ", "、").replace(" and ", "、"),
+    }
 }
 
 /// `text` escaped, each term wrapped in `<mark>`. Non-ASCII text is left
@@ -447,25 +474,25 @@ fn marked(text: str, terms: List<str>) -> str {
 
 /// `<li>` of a package in a list; `note` replaces the date, `terms` are
 /// marked and `why` says where they matched.
-fn package_row(s: Row, note: str, ko: bool, terms: List<str> = List::new(), why: str = "") -> str {
-    let href = esc(href(ko, package_out(s.name)));
-    let desc = if s.desc.is_empty() { f"<span class=\"desc none\">{tr(ko, "No description", "설명 없음")}</span>" } else { f"<span class=\"desc\">{marked(desc_in(s.name, s.desc, s.library, ko), terms)}</span>" };
-    let gone = (if s.official { official_badge(ko) } else { "" }) + (if s.bin { bin_tag(ko) } else { "" }) + (if s.yanked { f" <span class=\"tag\">{yanked_tag(ko)}</span>" } else { "" });
-    let matched = if why.is_empty() { "" } else if ko { f"<span class=\"why\">{why_text(why, true)}에서 일치</span>" } else { f"<span class=\"why\">matches {why}</span>" };
+fn package_row(s: Row, note: str, lg: Lang, terms: List<str> = List::new(), why: str = "") -> str {
+    let href = esc(href(lg, package_out(s.name)));
+    let desc = if s.desc.is_empty() { f"<span class=\"desc none\">{tr(lg, "No description", "설명 없음", "暂无描述", "沒有描述")}</span>" } else { f"<span class=\"desc\">{marked(desc_in(s.name, s.desc, s.library, lg), terms)}</span>" };
+    let gone = (if s.official { official_badge(lg) } else { "" }) + (if s.bin { bin_tag(lg) } else { "" }) + (if s.yanked { f" <span class=\"tag\">{yanked_tag(lg)}</span>" } else { "" });
+    let matched = if why.is_empty() { "" } else { tr(lg, f"<span class=\"why\">matches {why}</span>", f"<span class=\"why\">{why_text(why, lg)}에서 일치</span>", f"<span class=\"why\">匹配{why_text(why, lg)}</span>", f"<span class=\"why\">符合{why_text(why, lg)}</span>") };
     let when = if !note.is_empty() { f"<span class=\"when\">{note}</span>" } else if s.date.is_empty() { "<span class=\"when\"></span>" } else { when_tag(s.date, "when", true) };
-    f"<li{if s.yanked { " class=\"yanked\"" } else { "" }}><a class=\"st\" href=\"{href}\">{glyph(s.name, 34, "gl")}<span class=\"main\"><span class=\"nl\"><b class=\"nm\">{marked(s.name, terms)}</b>{gone}{matched}</span>{desc}</span><span class=\"ver\">{esc(if s.library { with_toolchain(ko) } else { s.version })}</span>{when}</a></li>"
+    f"<li{if s.yanked { " class=\"yanked\"" } else { "" }}><a class=\"st\" href=\"{href}\">{glyph(s.name, 34, "gl")}<span class=\"main\"><span class=\"nl\"><b class=\"nm\">{marked(s.name, terms)}</b>{gone}{matched}</span>{desc}</span><span class=\"ver\">{esc(if s.library { with_toolchain(lg) } else { s.version })}</span>{when}</a></li>"
 }
 
-fn package_rows(xs: List<Package>, empty: str, ko: bool, dependents: bool = false) -> str {
+fn package_rows(xs: List<Package>, empty: str, lg: Lang, dependents: bool = false) -> str {
     if xs.len() == 0 { return f"<p class=\"empty\">{esc(empty)}</p>"; }
     let b = StrBuf::new();
     b.push_str("<ul class=\"rows\">");
-    for s in xs { b.push_str(package_row(row_of(s), if dependents { count_of(ko, s.rdeps.len(), "dependent", "dependents", "의존하는 패키지") } else { "" }, ko)); }
+    for s in xs { b.push_str(package_row(row_of(s), if dependents { count_of(lg, s.rdeps.len(), "dependent", "dependents", "의존하는 패키지", "个依赖它的包", "個相依於它的套件") } else { "" }, lg)); }
     b.push_str("</ul>");
     b.to_str()
 }
 
-pub fn landing(all: List<Package>, ko: bool) -> str {
+pub fn landing(all: List<Package>, lg: Lang) -> str {
     let nv = 0usize;
     for s in all { nv += s.versions.len(); }
 
@@ -491,7 +518,7 @@ pub fn landing(all: List<Package>, ko: bool) -> str {
     let most = if ps.is_empty() {
         ""
     } else {
-        f"<section aria-labelledby=\"most\" class=\"block\"><div class=\"list-head\"><h2 class=\"t-h3\" id=\"most\">{tr(ko, "Most depended on", "의존이 가장 많은 패키지")}</h2></div>{package_rows(ps, "", ko, true)}</section>"
+        f"<section aria-labelledby=\"most\" class=\"block\"><div class=\"list-head\"><h2 class=\"t-h3\" id=\"most\">{tr(lg, "Most depended on", "의존이 가장 많은 패키지", "被依赖最多", "最多套件相依")}</h2></div>{package_rows(ps, "", lg, true)}</section>"
     };
     let official: List<Package> = List::new();
     for s in all {
@@ -500,15 +527,15 @@ pub fn landing(all: List<Package>, ko: bool) -> str {
     let off = if official.is_empty() {
         ""
     } else {
-        f"<section aria-labelledby=\"official\" class=\"block\"><div class=\"list-head\"><h2 class=\"t-h3\" id=\"official\">{tr(ko, "Official packages", "공식 패키지")}</h2><span class=\"t-small\">{tr(ko, "Published from the nabi-lang organization", "nabi-lang 조직에서 공개")} · <a href=\"{lp(ko, "/packages?q=official:yes")}\">{tr(ko, "see all", "모두 보기")}</a></span></div>
-{official_groups(official, ko)}</section>"
+        f"<section aria-labelledby=\"official\" class=\"block\"><div class=\"list-head\"><h2 class=\"t-h3\" id=\"official\">{tr(lg, "Official packages", "공식 패키지", "官方包", "官方套件")}</h2><span class=\"t-small\">{tr(lg, "Published from the nabi-lang organization", "nabi-lang 조직에서 공개", "由 nabi-lang 组织发布", "由 nabi-lang 組織發布")} · <a href=\"{lp(lg, "/packages?q=official:yes")}\">{tr(lg, "see all", "모두 보기", "查看全部", "查看全部")}</a></span></div>
+{official_groups(official, lg)}</section>"
     };
     // The biggest categories, for browsing.
     let cats = topics(all, true);
     cats.sort_by(|a: Topic, b: Topic| if a.packages.len() != b.packages.len() { b.packages.len().cmp(a.packages.len()) } else { a.slug.cmp(b.slug) });
     let cb = StrBuf::new();
-    for k in 0..cats.len().min(8) { cb.push_str(f"<li><a href=\"{esc(href(ko, topic_out(true, cats[k].slug)))}\">{esc(cats[k].label)}</a><span class=\"ct\">{grouped(cats[k].packages.len())}</span></li>"); }
-    let browse = if cats.is_empty() { "" } else { f"<section><h2 class=\"t-h3\">{tr(ko, "Browse by category", "카테고리별로 둘러보기")}</h2><ul class=\"topics compact\">{cb.to_str()}</ul><p><a href=\"{lp(ko, "/categories")}\">{tr(ko, "All categories", "모든 카테고리")}</a> · <a href=\"{lp(ko, "/keywords")}\">{tr(ko, "keywords", "키워드")}</a></p></section>\n" };
+    for k in 0..cats.len().min(8) { cb.push_str(f"<li><a href=\"{esc(href(lg, topic_out(true, cats[k].slug)))}\">{esc(cats[k].label)}</a><span class=\"ct\">{grouped(cats[k].packages.len())}</span></li>"); }
+    let browse = if cats.is_empty() { "" } else { f"<section><h2 class=\"t-h3\">{tr(lg, "Browse by category", "카테고리별로 둘러보기", "按分类浏览", "依分類瀏覽")}</h2><ul class=\"topics compact\">{cb.to_str()}</ul><p><a href=\"{lp(lg, "/categories")}\">{tr(lg, "All categories", "모든 카테고리", "所有分类", "所有分類")}</a> · <a href=\"{lp(lg, "/keywords")}\">{tr(lg, "keywords", "키워드", "关键词", "關鍵字")}</a></p></section>\n" };
     let example = if all.is_empty() { "json" } else { recent[0].name };
     let example_official = !all.is_empty() && recent[0].official;
     for s in all {
@@ -517,31 +544,31 @@ pub fn landing(all: List<Package>, ko: bool) -> str {
     // An official package comes in on `use`; `nabi add` stays the explicit way.
     let use_line = f"<code class=\"ic\">use {esc(example)}::..;</code>";
     let use_note = if example_official {
-        tr(ko, f"<p>Write {use_line} in your code: an official package is added on the first build. To add one yourself, run this in a package directory.</p>", f"<p>코드에 {use_line} 한 줄만 쓰면, 공식 패키지는 첫 빌드에서 추가됩니다. 직접 추가하려면 패키지 디렉터리에서 다음을 실행합니다.</p>")
+        tr(lg, f"<p>Write {use_line} in your code: an official package is added on the first build. To add one yourself, run this in a package directory.</p>", f"<p>코드에 {use_line} 한 줄만 쓰면, 공식 패키지는 첫 빌드에서 추가됩니다. 직접 추가하려면 패키지 디렉터리에서 다음을 실행합니다.</p>", f"<p>在代码中写 {use_line} 即可：官方包会在第一次构建时添加。要自己添加，在包目录中运行下面的命令。</p>", f"<p>在程式碼中寫 {use_line} 即可：官方套件會在第一次建置時新增。要自己新增，在套件目錄中執行下面的指令。</p>")
     } else {
-        tr(ko, f"<p>Run this in a package directory, then {use_line} in your code.</p>", f"<p>패키지 디렉터리에서 다음을 실행한 뒤, 코드에 {use_line} 줄을 씁니다.</p>")
+        tr(lg, f"<p>Run this in a package directory, then {use_line} in your code.</p>", f"<p>패키지 디렉터리에서 다음을 실행한 뒤, 코드에 {use_line} 줄을 씁니다.</p>", f"<p>在包目录中运行下面的命令，然后在代码中写 {use_line}。</p>", f"<p>在套件目錄中執行下面的指令，然後在程式碼中寫 {use_line}。</p>")
     };
     let add = f"<code class=\"ic\">nabi add {esc(example)}</code>";
-    let lead = tr(ko, f"packages.nabi-lang.org is the Nabi package registry. Add a package with {add}; the build pins its exact version in <code class=\"ic\">nabi.lock</code>.", f"packages.nabi-lang.org는 Nabi 패키지 레지스트리입니다. {add}로 패키지를 추가하면, 빌드가 정확한 버전을 <code class=\"ic\">nabi.lock</code>에 고정합니다.");
-    let counts = if ko { f"패키지 {grouped(all.len())}개, 버전 {grouped(nv)}개" } else { f"{plural(all.len(), "package", "packages")}, {plural(nv, "version", "versions")}" };
-    let publishing = tr(ko, "<p>Packages are published here with <code class=\"ic\">nabi publish</code>, or from GitHub Actions with trusted publishing. Publishing is not open to everyone yet.</p>", "<p>패키지는 <code class=\"ic\">nabi publish</code>로, 또는 GitHub Actions에서 신뢰할 수 있는 게시(trusted publishing)로 공개합니다. 아직 누구나 공개할 수 있지는 않습니다.</p>");
+    let lead = tr(lg, f"packages.nabi-lang.org is the Nabi package registry. Add a package with {add}; the build pins its exact version in <code class=\"ic\">nabi.lock</code>.", f"packages.nabi-lang.org는 Nabi 패키지 레지스트리입니다. {add}로 패키지를 추가하면, 빌드가 정확한 버전을 <code class=\"ic\">nabi.lock</code>에 고정합니다.", f"packages.nabi-lang.org 是 Nabi 包注册表。用 {add} 添加包，构建会把它的确切版本固定在 <code class=\"ic\">nabi.lock</code> 中。", f"packages.nabi-lang.org 是 Nabi 套件登錄庫。用 {add} 新增套件，建置會把它的確切版本固定在 <code class=\"ic\">nabi.lock</code> 中。");
+    let counts = tr(lg, f"{plural(all.len(), "package", "packages")}, {plural(nv, "version", "versions")}", f"패키지 {grouped(all.len())}개, 버전 {grouped(nv)}개", f"{grouped(all.len())} 个包，{grouped(nv)} 个版本", f"{grouped(all.len())} 個套件，{grouped(nv)} 個版本");
+    let publishing = tr(lg, "<p>Packages are published here with <code class=\"ic\">nabi publish</code>, or from GitHub Actions with trusted publishing. Publishing is not open to everyone yet.</p>", "<p>패키지는 <code class=\"ic\">nabi publish</code>로, 또는 GitHub Actions에서 신뢰할 수 있는 게시(trusted publishing)로 공개합니다. 아직 누구나 공개할 수 있지는 않습니다.</p>", "<p>包通过 <code class=\"ic\">nabi publish</code> 发布到这里，也可以通过可信发布从 GitHub Actions 发布。发布暂未向所有人开放。</p>", "<p>套件透過 <code class=\"ic\">nabi publish</code> 發布到這裡，也可以透過受信任發布從 GitHub Actions 發布。發布尚未對所有人開放。</p>");
 
     f"<section class=\"frame intro\">
-<h1 class=\"t-h1\">{tr(ko, "Packages for Nabi", "Nabi 패키지")}</h1>
+<h1 class=\"t-h1\">{tr(lg, "Packages for Nabi", "Nabi 패키지", "Nabi 包", "Nabi 套件")}</h1>
 <p class=\"t-lead\">{lead}</p>
 </section>
 <div class=\"frame home\">
 <div>
-{off}<section aria-labelledby=\"recent\" class=\"block\"><div class=\"list-head\"><h2 class=\"t-h3\" id=\"recent\">{tr(ko, "Recently updated", "최근 업데이트")}</h2><span class=\"t-small\">{counts} · <a href=\"{lp(ko, "/packages")}\">{tr(ko, "see all", "모두 보기")}</a></span></div>
-{package_rows(rs, tr(ko, "No packages published yet.", "아직 공개된 패키지가 없습니다."), ko)}</section>
+{off}<section aria-labelledby=\"recent\" class=\"block\"><div class=\"list-head\"><h2 class=\"t-h3\" id=\"recent\">{tr(lg, "Recently updated", "최근 업데이트", "最近更新", "最近更新")}</h2><span class=\"t-small\">{counts} · <a href=\"{lp(lg, "/packages")}\">{tr(lg, "see all", "모두 보기", "查看全部", "查看全部")}</a></span></div>
+{package_rows(rs, tr(lg, "No packages published yet.", "아직 공개된 패키지가 없습니다.", "还没有发布任何包。", "還沒有發布任何套件。"), lg)}</section>
 {most}</div>
 <aside class=\"side-notes\">
-<section><h2 class=\"t-h3\">{tr(ko, "Using a package", "패키지 사용하기")}</h2>
+<section><h2 class=\"t-h3\">{tr(lg, "Using a package", "패키지 사용하기", "使用包", "使用套件")}</h2>
 {use_note}
-<div class=\"inst\"><div class=\"ipanel on\"><pre class=\"sh\"><code><span class=\"p\" aria-hidden=\"true\">$ </span>nabi add {esc(example)}</code></pre>{chrome::copy_button("nabi add " + example, ko)}</div></div></section>
-{browse}<section><h2 class=\"t-h3\">{tr(ko, "Publishing", "패키지 공개")}</h2>
+<div class=\"inst\"><div class=\"ipanel on\"><pre class=\"sh\"><code><span class=\"p\" aria-hidden=\"true\">$ </span>nabi add {esc(example)}</code></pre>{chrome::copy_button_for("nabi add " + example, lg)}</div></div></section>
+{browse}<section><h2 class=\"t-h3\">{tr(lg, "Publishing", "패키지 공개", "发布包", "發布套件")}</h2>
 {publishing}
-<p><a href=\"{publishing_href(ko)}\">{tr(ko, "How publishing works", "공개하는 방법")}</a></p></section>
+<p><a href=\"{publishing_href(lg)}\">{tr(lg, "How publishing works", "공개하는 방법", "发布流程", "發布流程")}</a></p></section>
 </aside>
 </div>
 "
@@ -557,7 +584,7 @@ fn is_science(s: Package) -> bool {
 
 /// The official packages by shelf: the standard library, science and
 /// data, then the rest; a shelf with nothing on it is left out.
-fn official_groups(xs: List<Package>, ko: bool) -> str {
+fn official_groups(xs: List<Package>, lg: Lang) -> str {
     let lib: List<Package> = List::new();
     let sci: List<Package> = List::new();
     let rest: List<Package> = List::new();
@@ -565,20 +592,20 @@ fn official_groups(xs: List<Package>, ko: bool) -> str {
         if s.library { lib.push(s); } else if is_science(s) { sci.push(s); } else { rest.push(s); }
     }
     let b = StrBuf::new();
-    for (id, title, ps) in [("off-lib", tr(ko, "Standard library, with every toolchain", "표준 라이브러리, 모든 도구 모음에 포함"), lib), ("off-sci", tr(ko, "Science and data", "과학과 데이터"), sci), ("off-gen", tr(ko, "Formats, text and networking", "데이터 형식, 텍스트, 네트워킹"), rest)] {
+    for (id, title, ps) in [("off-lib", tr(lg, "Standard library, with every toolchain", "표준 라이브러리, 모든 도구 모음에 포함", "标准库，随每个工具链提供", "標準函式庫，隨每個工具鏈提供"), lib), ("off-sci", tr(lg, "Science and data", "과학과 데이터", "科学与数据", "科學與資料"), sci), ("off-gen", tr(lg, "Formats, text and networking", "데이터 형식, 텍스트, 네트워킹", "格式、文本与网络", "格式、文字與網路"), rest)] {
         if ps.is_empty() { continue; }
-        b.push_str(f"<div class=\"off-shelf\" role=\"group\" aria-labelledby=\"{id}\"><h3 class=\"t-label\" id=\"{id}\">{title}</h3>{official_grid(ps, ko)}</div>");
+        b.push_str(f"<div class=\"off-shelf\" role=\"group\" aria-labelledby=\"{id}\"><h3 class=\"t-label\" id=\"{id}\">{title}</h3>{official_grid(ps, lg)}</div>");
     }
     b.to_str()
 }
 
 /// The official packages, compact: name, version and description each.
-fn official_grid(xs: List<Package>, ko: bool) -> str {
+fn official_grid(xs: List<Package>, lg: Lang) -> str {
     let b = StrBuf::new();
     b.push_str("<ul class=\"off-grid\">");
     for s in xs {
-        let desc = if s.desc.is_empty() { "" } else { f"<span class=\"desc\">{esc(desc_in(s.name, s.desc, s.library, ko))}</span>" };
-        b.push_str(f"<li><a href=\"{esc(href(ko, package_out(s.name)))}\"><span class=\"nl\"><b class=\"nm\">{esc(s.name)}</b><span class=\"ver\">{esc(if s.library { with_toolchain(ko) } else { s.latest.version })}</span></span>{desc}</a></li>");
+        let desc = if s.desc.is_empty() { "" } else { f"<span class=\"desc\">{esc(desc_in(s.name, s.desc, s.library, lg))}</span>" };
+        b.push_str(f"<li><a href=\"{esc(href(lg, package_out(s.name)))}\"><span class=\"nl\"><b class=\"nm\">{esc(s.name)}</b><span class=\"ver\">{esc(if s.library { with_toolchain(lg) } else { s.latest.version })}</span></span>{desc}</a></li>");
     }
     b.push_str("</ul>");
     b.to_str()
@@ -676,11 +703,11 @@ pub fn closest(names: List<str>, name: str) -> List<str> {
 }
 
 /// The sorts the package list offers: value, label.
-const SORTS: [(str, str, str); 3] = [("relevance", "Relevance", "관련도"), ("name", "Name", "이름"), ("updated", "Recently updated", "최근 업데이트")];
+const SORTS: [(str, str, str, str, str); 3] = [("relevance", "Relevance", "관련도", "相关度", "相關度"), ("name", "Name", "이름", "名称", "名稱"), ("updated", "Recently updated", "최근 업데이트", "最近更新", "最近更新")];
 
 /// The package list, `/packages`: every package, or those matching `q`, in
 /// `sort` order. The page title and the body.
-pub fn list_page(rows: List<Row>, q: str, sort: str, ko: bool = false) -> (str, str) {
+pub fn list_page(rows: List<Row>, q: str, sort: str, lg: Lang = Lang::En) -> (str, str) {
     let q = q.trim();
     let terms = terms_of(q);
     let only = filter_of(q);
@@ -700,37 +727,37 @@ pub fn list_page(rows: List<Row>, q: str, sort: str, ko: bool = false) -> (str, 
             }
         }
     }
-    let order = if sort == "updated" { tr(ko, "recently updated first", "최근 업데이트 순") } else if sort == "name" { tr(ko, "sorted by name", "이름 순") } else { tr(ko, "best match first", "관련도 순") };
+    let order = if sort == "updated" { tr(lg, "recently updated first", "최근 업데이트 순", "按最近更新排序", "依最近更新排序") } else if sort == "name" { tr(lg, "sorted by name", "이름 순", "按名称排序", "依名稱排序") } else { tr(lg, "best match first", "관련도 순", "按相关度排序", "依相關度排序") };
     let opts = StrBuf::new();
-    for (v, label, label_ko) in SORTS {
+    for (v, label, label_ko, label_hans, label_hant) in SORTS {
         if v == "relevance" && terms.is_empty() { continue; }
-        opts.push_str(f"<option value=\"{v}\"{if v == sort { " selected" } else { "" }}>{tr(ko, label, label_ko)}</option>");
+        opts.push_str(f"<option value=\"{v}\"{if v == sort { " selected" } else { "" }}>{tr(lg, label, label_ko, label_hans, label_hant)}</option>");
     }
-    let list_url = lp(ko, "/packages");
-    let find = tr(ko, "Search packages", "패키지 검색");
-    let form = f"<form class=\"list-form\" role=\"search\" action=\"{list_url}\"><label class=\"sr-only\" for=\"list-q\">{find}</label><input id=\"list-q\" class=\"field\" name=\"q\" type=\"search\" value=\"{esc(q)}\" placeholder=\"{find}\" autocomplete=\"off\" spellcheck=\"false\"><label class=\"t-ui\" for=\"list-sort\">{tr(ko, "Sort", "정렬")}</label><select id=\"list-sort\" class=\"field\" name=\"sort\">{opts.to_str()}</select><button class=\"btn-2 btn-sm\" type=\"submit\">{tr(ko, "Search", "검색")}</button></form>";
+    let list_url = lp(lg, "/packages");
+    let find = tr(lg, "Search packages", "패키지 검색", "搜索包", "搜尋套件");
+    let form = f"<form class=\"list-form\" role=\"search\" action=\"{list_url}\"><label class=\"sr-only\" for=\"list-q\">{find}</label><input id=\"list-q\" class=\"field\" name=\"q\" type=\"search\" value=\"{esc(q)}\" placeholder=\"{find}\" autocomplete=\"off\" spellcheck=\"false\"><label class=\"t-ui\" for=\"list-sort\">{tr(lg, "Sort", "정렬", "排序", "排序")}</label><select id=\"list-sort\" class=\"field\" name=\"sort\">{opts.to_str()}</select><button class=\"btn-2 btn-sm\" type=\"submit\">{tr(lg, "Search", "검색", "搜索", "搜尋")}</button></form>";
     let qt = f"<q>{esc(q)}</q>";
-    let all_link = f"<a href=\"{list_url}\">{tr(ko, "Show all packages", "모든 패키지 보기")}</a>";
-    let search_title = tr(ko, f"Search: {q}", f"검색: {q}");
+    let all_link = f"<a href=\"{list_url}\">{tr(lg, "Show all packages", "모든 패키지 보기", "显示所有包", "顯示所有套件")}</a>";
+    let search_title = tr(lg, f"Search: {q}", f"검색: {q}", f"搜索：{q}", f"搜尋：{q}");
     let (title, note) = if terms.is_empty() && only == "yes" {
-        (tr(ko, "Official packages", "공식 패키지"), if ko { f"공식 패키지 {grouped(hits.len())}개, {order}. 공식 패키지는 nabi-lang 조직에서 공개합니다." } else { f"{plural(hits.len(), "official package", "official packages")}, {order}. Official packages are published from the nabi-lang organization." })
+        (tr(lg, "Official packages", "공식 패키지", "官方包", "官方套件"), tr(lg, f"{plural(hits.len(), "official package", "official packages")}, {order}. Official packages are published from the nabi-lang organization.", f"공식 패키지 {grouped(hits.len())}개, {order}. 공식 패키지는 nabi-lang 조직에서 공개합니다.", f"{grouped(hits.len())} 个官方包，{order}。官方包由 nabi-lang 组织发布。", f"{grouped(hits.len())} 個官方套件，{order}。官方套件由 nabi-lang 組織發布。"))
     } else if terms.is_empty() && only.is_empty() {
-        (tr(ko, "All packages", "모든 패키지"), if ko { f"패키지 {grouped(rows.len())}개, {order}. <a href=\"{lp(ko, "/categories")}\">카테고리</a>나 <a href=\"{lp(ko, "/keywords")}\">키워드</a>로 둘러볼 수도 있습니다." } else { f"{plural(rows.len(), "package", "packages")}, {order}. Browse by <a href=\"/categories\">category</a> or <a href=\"/keywords\">keyword</a>." })
+        (tr(lg, "All packages", "모든 패키지", "所有包", "所有套件"), tr(lg, f"{plural(rows.len(), "package", "packages")}, {order}. Browse by <a href=\"/categories\">category</a> or <a href=\"/keywords\">keyword</a>.", f"패키지 {grouped(rows.len())}개, {order}. <a href=\"{lp(lg, "/categories")}\">카테고리</a>나 <a href=\"{lp(lg, "/keywords")}\">키워드</a>로 둘러볼 수도 있습니다.", f"{grouped(rows.len())} 个包，{order}。也可以按<a href=\"{lp(lg, "/categories")}\">分类</a>或<a href=\"{lp(lg, "/keywords")}\">关键词</a>浏览。", f"{grouped(rows.len())} 個套件，{order}。也可以依<a href=\"{lp(lg, "/categories")}\">分類</a>或<a href=\"{lp(lg, "/keywords")}\">關鍵字</a>瀏覽。"))
     } else if hits.is_empty() {
-        (search_title, tr(ko, f"No packages match {qt}.", f"{qt}에 맞는 패키지가 없습니다."))
+        (search_title, tr(lg, f"No packages match {qt}.", f"{qt}에 맞는 패키지가 없습니다.", f"没有与 {qt} 匹配的包。", f"沒有符合 {qt} 的套件。"))
     } else if !fixed.is_empty() {
         let fhref = esc(list_url + "?q=" + http::pct_encode(fixed));
         let shown = f"<a class=\"fixed\" href=\"{fhref}\"><q>{esc(fixed)}</q></a>";
-        (search_title, if ko { f"{qt}에 맞는 패키지가 없습니다. {shown}의 결과를 보여 줍니다: 패키지 {grouped(hits.len())}개, {order}. {all_link}" } else { f"No packages match {qt}. Showing results for {shown}: {plural(hits.len(), "package", "packages")}, {order}. {all_link}" })
+        (search_title, tr(lg, f"No packages match {qt}. Showing results for {shown}: {plural(hits.len(), "package", "packages")}, {order}. {all_link}", f"{qt}에 맞는 패키지가 없습니다. {shown}의 결과를 보여 줍니다: 패키지 {grouped(hits.len())}개, {order}. {all_link}", f"没有与 {qt} 匹配的包。以下是 {shown} 的结果：{grouped(hits.len())} 个包，{order}。{all_link}", f"沒有符合 {qt} 的套件。以下是 {shown} 的結果：{grouped(hits.len())} 個套件，{order}。{all_link}"))
     } else {
-        (search_title, if ko { f"{qt}에 맞는 패키지 {grouped(hits.len())}개, {order}. {all_link}" } else { f"{if hits.len() == 1 { "1 package matches" } else { f"{grouped(hits.len())} packages match" }} {qt}, {order}. {all_link}" })
+        (search_title, tr(lg, f"{if hits.len() == 1 { "1 package matches" } else { f"{grouped(hits.len())} packages match" }} {qt}, {order}. {all_link}", f"{qt}에 맞는 패키지 {grouped(hits.len())}개, {order}. {all_link}", f"{grouped(hits.len())} 个包与 {qt} 匹配，{order}。{all_link}", f"{grouped(hits.len())} 個套件符合 {qt}，{order}。{all_link}"))
     };
     let list = if hits.is_empty() {
-        if terms.is_empty() && only.is_empty() { tr(ko, "<p class=\"empty\">No packages published yet.</p>", "<p class=\"empty\">아직 공개된 패키지가 없습니다.</p>") } else if ko { f"<p class=\"empty\">{qt}에 맞는 패키지가 없습니다. 더 짧은 단어로 찾거나, <a href=\"{list_url}\">모든 패키지</a>를 보십시오.</p>" } else { f"<p class=\"empty\">No packages match {qt}. Try a shorter word, or <a href=\"/packages\">see all packages</a>.</p>" }
+        if terms.is_empty() && only.is_empty() { tr(lg, "<p class=\"empty\">No packages published yet.</p>", "<p class=\"empty\">아직 공개된 패키지가 없습니다.</p>", "<p class=\"empty\">还没有发布任何包。</p>", "<p class=\"empty\">還沒有發布任何套件。</p>") } else { tr(lg, f"<p class=\"empty\">No packages match {qt}. Try a shorter word, or <a href=\"/packages\">see all packages</a>.</p>", f"<p class=\"empty\">{qt}에 맞는 패키지가 없습니다. 더 짧은 단어로 찾거나, <a href=\"{list_url}\">모든 패키지</a>를 보십시오.</p>", f"<p class=\"empty\">没有与 {qt} 匹配的包。试试更短的词，或<a href=\"{list_url}\">查看所有包</a>。</p>", f"<p class=\"empty\">沒有符合 {qt} 的套件。試試更短的詞，或<a href=\"{list_url}\">查看所有套件</a>。</p>") }
     } else {
         let b = StrBuf::new();
         b.push_str("<ul class=\"rows\">");
-        for h in hits { b.push_str(package_row(h.row, "", ko, terms, if terms.is_empty() { "" } else { h.why })); }
+        for h in hits { b.push_str(package_row(h.row, "", lg, terms, if terms.is_empty() { "" } else { h.why })); }
         b.push_str("</ul>");
         b.to_str()
     };
@@ -777,9 +804,9 @@ pub fn topic_out(cats: bool, slug: str) -> str { f"{if cats { "categories" } els
 
 /// Where a category or keyword links: its page, or a search when it has
 /// no slug.
-pub fn topic_href(cats: bool, word: str, ko: bool = false) -> str {
+pub fn topic_href(cats: bool, word: str, lg: Lang = Lang::En) -> str {
     let s = slug(word);
-    if s.is_empty() { lp(ko, "/packages?q=" + http::pct_encode(word)) } else { href(ko, topic_out(cats, s)) }
+    if s.is_empty() { lp(lg, "/packages?q=" + http::pct_encode(word)) } else { href(lg, topic_out(cats, s)) }
 }
 
 fn category_label(c: str) -> str {
@@ -823,25 +850,27 @@ pub fn topics(all: List<Package>, cats: bool) -> List<Topic> {
 }
 
 /// The links between the two indexes, the current one marked.
-fn topic_switch(cats: bool, ko: bool) -> str {
+fn topic_switch(cats: bool, lg: Lang) -> str {
     let cur = |on: bool| if on { " aria-current=\"page\"" } else { "" };
-    f"<nav class=\"topic-switch t-ui\" aria-label=\"{tr(ko, "Browse by", "둘러보기 기준")}\"><a href=\"{lp(ko, "/categories")}\"{cur(cats)}>{tr(ko, "Categories", "카테고리")}</a><a href=\"{lp(ko, "/keywords")}\"{cur(!cats)}>{tr(ko, "Keywords", "키워드")}</a><a href=\"{lp(ko, "/packages")}\">{tr(ko, "All packages", "모든 패키지")}</a></nav>"
+    f"<nav class=\"topic-switch t-ui\" aria-label=\"{tr(lg, "Browse by", "둘러보기 기준", "浏览方式", "瀏覽方式")}\"><a href=\"{lp(lg, "/categories")}\"{cur(cats)}>{tr(lg, "Categories", "카테고리", "分类", "分類")}</a><a href=\"{lp(lg, "/keywords")}\"{cur(!cats)}>{tr(lg, "Keywords", "키워드", "关键词", "關鍵字")}</a><a href=\"{lp(lg, "/packages")}\">{tr(lg, "All packages", "모든 패키지", "所有包", "所有套件")}</a></nav>"
 }
 
 /// `/categories` or `/keywords`: every one with how many packages have
 /// it. The page title and the body.
-pub fn topics_page(ts: List<Topic>, cats: bool, ko: bool = false) -> (str, str) {
-    let title = if cats { tr(ko, "Categories", "카테고리") } else { tr(ko, "Keywords", "키워드") };
+pub fn topics_page(ts: List<Topic>, cats: bool, lg: Lang = Lang::En) -> (str, str) {
+    let title = if cats { tr(lg, "Categories", "카테고리", "分类", "分類") } else { tr(lg, "Keywords", "키워드", "关键词", "關鍵字") };
     let what = if cats { "category" } else { "keyword" };
     let b = StrBuf::new();
-    for t in ts { b.push_str(f"<li><a href=\"{esc(href(ko, topic_out(cats, t.slug)))}\">{esc(t.label)}</a><span class=\"ct\">{grouped(t.packages.len())}</span></li>"); }
-    let list = if ts.is_empty() { if ko { f"<p class=\"empty\">아직 {title}를 밝힌 패키지가 없습니다.</p>" } else { f"<p class=\"empty\">No package names a {what} yet.</p>" } } else { f"<ul class=\"topics\">{b.to_str()}</ul>" };
-    let note = if ko {
-        if cats { "패키지가 매니페스트(<code class=\"ic\">categories</code>)에 밝힌 카테고리와, 카테고리마다 속한 패키지 수입니다." } else { "패키지가 매니페스트(<code class=\"ic\">keywords</code>)에 밝힌 키워드와, 키워드마다 그 키워드를 쓴 패키지 수입니다." }
-    } else if cats { "The categories packages name in their manifest (<code class=\"ic\">categories</code>), with how many packages are in each." } else { "The keywords packages name in their manifest (<code class=\"ic\">keywords</code>), with how many packages have each." };
+    for t in ts { b.push_str(f"<li><a href=\"{esc(href(lg, topic_out(cats, t.slug)))}\">{esc(t.label)}</a><span class=\"ct\">{grouped(t.packages.len())}</span></li>"); }
+    let list = if ts.is_empty() { tr(lg, f"<p class=\"empty\">No package names a {what} yet.</p>", f"<p class=\"empty\">아직 {title}를 밝힌 패키지가 없습니다.</p>", f"<p class=\"empty\">还没有包声明{title}。</p>", f"<p class=\"empty\">還沒有套件宣告{title}。</p>") } else { f"<ul class=\"topics\">{b.to_str()}</ul>" };
+    let note = if cats {
+        tr(lg, "The categories packages name in their manifest (<code class=\"ic\">categories</code>), with how many packages are in each.", "패키지가 매니페스트(<code class=\"ic\">categories</code>)에 밝힌 카테고리와, 카테고리마다 속한 패키지 수입니다.", "包在清单（<code class=\"ic\">categories</code>）中声明的分类，以及每个分类下的包数。", "套件在清單（<code class=\"ic\">categories</code>）中宣告的分類，以及每個分類下的套件數。")
+    } else {
+        tr(lg, "The keywords packages name in their manifest (<code class=\"ic\">keywords</code>), with how many packages have each.", "패키지가 매니페스트(<code class=\"ic\">keywords</code>)에 밝힌 키워드와, 키워드마다 그 키워드를 쓴 패키지 수입니다.", "包在清单（<code class=\"ic\">keywords</code>）中声明的关键词，以及使用每个关键词的包数。", "套件在清單（<code class=\"ic\">keywords</code>）中宣告的關鍵字，以及使用每個關鍵字的套件數。")
+    };
     (title, f"<div class=\"frame list-page\">
-<div class=\"page-head\"><h1 class=\"t-h2\">{title}</h1><p class=\"t-small\">{count_of(ko, ts.len(), what, if cats { "categories" } else { "keywords" }, title)}. {note}</p></div>
-{topic_switch(cats, ko)}
+<div class=\"page-head\"><h1 class=\"t-h2\">{title}</h1><p class=\"t-small\">{count_of(lg, ts.len(), what, if cats { "categories" } else { "keywords" }, title, if cats { "个分类" } else { "个关键词" }, if cats { "個分類" } else { "個關鍵字" })}. {note}</p></div>
+{topic_switch(cats, lg)}
 {list}
 </div>
 ")
@@ -849,25 +878,25 @@ pub fn topics_page(ts: List<Topic>, cats: bool, ko: bool = false) -> (str, str) 
 
 /// `/categories/<slug>` or `/keywords/<slug>`: its packages. The page
 /// title, its description and the body.
-pub fn topic_page(t: Topic, cats: bool, ko: bool = false) -> (str, str, str) {
-    let title = if ko { f"{if cats { "카테고리" } else { "키워드" }}: {t.label}" } else if cats { f"Category: {t.label}" } else { f"Keyword: {t.label}" };
-    let about = if ko { f"{if cats { "카테고리" } else { "키워드" }} {t.label}의 Nabi 패키지입니다." } else { f"Nabi packages {if cats { "in the category" } else { "with the keyword" }} {t.label}." };
+pub fn topic_page(t: Topic, cats: bool, lg: Lang = Lang::En) -> (str, str, str) {
+    let title = if cats { tr(lg, f"Category: {t.label}", f"카테고리: {t.label}", f"分类：{t.label}", f"分類：{t.label}") } else { tr(lg, f"Keyword: {t.label}", f"키워드: {t.label}", f"关键词：{t.label}", f"關鍵字：{t.label}") };
+    let about = tr(lg, f"Nabi packages {if cats { "in the category" } else { "with the keyword" }} {t.label}.", f"{if cats { "카테고리" } else { "키워드" }} {t.label}의 Nabi 패키지입니다.", f"{if cats { "分类" } else { "关键词" }}为 {t.label} 的 Nabi 包。", f"{if cats { "分類" } else { "關鍵字" }}為 {t.label} 的 Nabi 套件。");
     let b = StrBuf::new();
     b.push_str("<ul class=\"rows\">");
-    for s in t.packages { b.push_str(package_row(row_of(s), "", ko)); }
+    for s in t.packages { b.push_str(package_row(row_of(s), "", lg)); }
     b.push_str("</ul>");
-    let index = lp(ko, if cats { "/categories" } else { "/keywords" });
-    let all = f"<a href=\"{index}\">{if cats { tr(ko, "All categories", "모든 카테고리") } else { tr(ko, "All keywords", "모든 키워드") }}</a>";
-    let order = if ko { f"패키지 {grouped(t.packages.len())}개, 공식 패키지 먼저, 그다음 이름 순입니다." } else { f"{plural(t.packages.len(), "package", "packages")}, official first, then by name." };
+    let index = lp(lg, if cats { "/categories" } else { "/keywords" });
+    let all = f"<a href=\"{index}\">{if cats { tr(lg, "All categories", "모든 카테고리", "所有分类", "所有分類") } else { tr(lg, "All keywords", "모든 키워드", "所有关键词", "所有關鍵字") }}</a>";
+    let order = tr(lg, f"{plural(t.packages.len(), "package", "packages")}, official first, then by name.", f"패키지 {grouped(t.packages.len())}개, 공식 패키지 먼저, 그다음 이름 순입니다.", f"{grouped(t.packages.len())} 个包，官方包在前，其余按名称排序。", f"{grouped(t.packages.len())} 個套件，官方套件在前，其餘依名稱排序。");
     (title, about, f"<div class=\"frame list-page\">
-<nav class=\"crumbs\" aria-label=\"{tr(ko, "Breadcrumb", "이동 경로")}\"><a href=\"{index}\">{if cats { tr(ko, "categories", "카테고리") } else { tr(ko, "keywords", "키워드") }}</a> / {esc(t.slug)}</nav>
+<nav class=\"crumbs\" aria-label=\"{tr(lg, "Breadcrumb", "이동 경로", "导航路径", "導覽路徑")}\"><a href=\"{index}\">{if cats { tr(lg, "categories", "카테고리", "分类", "分類") } else { tr(lg, "keywords", "키워드", "关键词", "關鍵字") }}</a> / {esc(t.slug)}</nav>
 <div class=\"page-head\"><h1 class=\"t-h2\">{esc(title)}</h1><p class=\"t-small\">{order} {all}</p></div>
 {b.to_str()}
 </div>
 ")
 }
 
-/// The registry's policies (`pages/<name>.md`, `pages/ko/<name>.md`);
+/// The registry's policies (`pages/<name>.md`, `pages/<dir>/<name>.md`);
 /// the header's language menu leads to the other language.
 pub fn legal(doc: markdown::Doc) -> str {
     f"<div class=\"frame doc\">
@@ -879,12 +908,12 @@ pub fn legal(doc: markdown::Doc) -> str {
 
 /// Body of `publishing.html`: the guide in `pages/publishing.md`; of
 /// `api.html`, with another `title`, the reference in `pages/api.md`.
-pub fn guide(doc: markdown::Doc, title: str, ko: bool) -> str {
+pub fn guide(doc: markdown::Doc, title: str, lg: Lang) -> str {
     let toc = StrBuf::new();
     for h in doc.headings {
         if h.level == 2 { toc.push_str(f"<a href=\"#{esc(h.id)}\">{esc(h.text)}</a>"); }
     }
-    let on = tr(ko, "On this page", "이 페이지의 내용");
+    let on = tr(lg, "On this page", "이 페이지의 내용", "本页内容", "本頁內容");
     f"<div class=\"frame doc\">
 <article class=\"prose md\">
 <h1 class=\"t-h1\">{esc(title)}</h1>
@@ -924,37 +953,53 @@ fn commit_link(v: Version) -> str {
     if tree.is_empty() { f"<code title=\"{esc(v.rev)}\">{short(v.rev)}</code>" } else { f"<a href=\"{esc(tree)}\" title=\"{esc(v.rev)}\"><code>{short(v.rev)}</code></a>" }
 }
 
-fn package_head(site: Site, s: Package, tab: str, ko: bool) -> str {
+fn package_head(site: Site, s: Package, tab: str, lg: Lang) -> str {
     let l = s.latest;
     // One plain line for narrow screens, where the side panel comes last.
     let sum: List<str> = List::new();
-    if !l.date.is_empty() { sum.push(tr(ko, f"published {when_tag(l.date, "", false)}", f"{when_tag(l.date, "", false)} 공개")); }
+    if !l.date.is_empty() { sum.push(tr(lg, f"published {when_tag(l.date, "", false)}", f"{when_tag(l.date, "", false)} 공개", f"发布于 {when_tag(l.date, "", false)}", f"發布於 {when_tag(l.date, "", false)}")); }
     if !s.meta.license.is_empty() { sum.push(esc(s.meta.license)); }
-    sum.push(count_of(ko, count_deps(l, "normal"), "dependency", "dependencies", "의존성"));
+    sum.push(count_of(lg, count_deps(l, "normal"), "dependency", "dependencies", "의존성", "个依赖", "個相依套件"));
     let about = if s.desc.is_empty() { "" } else { f"<p class=\"t-lead\">{esc(s.desc)}</p>" };
-    let home = esc(href(ko, package_out(s.name)));
+    let home = esc(href(lg, package_out(s.name)));
     let notice = if !s.at.is_empty() && s.at != s.top {
         let older = packages::cmp_vers(s.at, s.top) == Ordering::Less;
         let which = if older { "an old version" } else { "not the latest release" };
-        let yb = actor_link(l.yanked_by, "", ko);
+        let yb = actor_link(l.yanked_by, "", lg);
         let latest = f"<a href=\"{home}\">{esc(s.top)}</a>";
-        let text = if ko {
-            let who = if yb.is_empty() { "" } else { f"({yb})" };
-            let why = if l.yank_message.is_empty() { "" } else { f" 이유: {esc(l.yank_message)}." };
-            let gone = if l.yanked { f" 이 버전은 철회되었습니다{who}. 이 버전을 고정한 프로젝트는 계속 빌드되지만, 새 프로젝트는 이 버전을 쓰지 않습니다.{why}" } else { "" };
-            f"{esc(s.name)}의 {if older { "이전 버전" } else { "최신 릴리스가 아닌 버전" }}입니다. 최신 버전은 {latest}입니다.{gone}"
-        } else {
-            let who = if yb.is_empty() { "" } else { f" by {yb}" };
-            let why = if l.yank_message.is_empty() { "" } else { f" Reason: {esc(l.yank_message)}." };
-            let gone = if l.yanked { f" It is yanked{who}: projects that pinned it keep building, new ones will not resolve it.{why}" } else { "" };
-            f"This is {which} of {esc(s.name)}; the latest is {latest}.{gone}"
+        let msg = esc(l.yank_message);
+        let text = match lg {
+            Lang::En => {
+                let who = if yb.is_empty() { "" } else { f" by {yb}" };
+                let why = if l.yank_message.is_empty() { "" } else { f" Reason: {msg}." };
+                let gone = if l.yanked { f" It is yanked{who}: projects that pinned it keep building, new ones will not resolve it.{why}" } else { "" };
+                f"This is {which} of {esc(s.name)}; the latest is {latest}.{gone}"
+            }
+            Lang::Ko => {
+                let who = if yb.is_empty() { "" } else { f"({yb})" };
+                let why = if l.yank_message.is_empty() { "" } else { f" 이유: {msg}." };
+                let gone = if l.yanked { f" 이 버전은 철회되었습니다{who}. 이 버전을 고정한 프로젝트는 계속 빌드되지만, 새 프로젝트는 이 버전을 쓰지 않습니다.{why}" } else { "" };
+                f"{esc(s.name)}의 {if older { "이전 버전" } else { "최신 릴리스가 아닌 버전" }}입니다. 최신 버전은 {latest}입니다.{gone}"
+            }
+            Lang::ZhHans => {
+                let who = if yb.is_empty() { "" } else { f"（由 {yb} 撤回）" };
+                let why = if l.yank_message.is_empty() { "" } else { f"原因：{msg}。" };
+                let gone = if l.yanked { f"此版本已撤回{who}。已固定此版本的项目仍可构建，新项目不会解析到它。{why}" } else { "" };
+                f"这是 {esc(s.name)} 的{if older { "旧版本" } else { "非最新发布版本" }}，最新版本是 {latest}。{gone}"
+            }
+            Lang::ZhHant => {
+                let who = if yb.is_empty() { "" } else { f"（由 {yb} 撤回）" };
+                let why = if l.yank_message.is_empty() { "" } else { f"原因：{msg}。" };
+                let gone = if l.yanked { f"此版本已撤回{who}。已固定此版本的專案仍可建置，新專案不會解析到它。{why}" } else { "" };
+                f"這是 {esc(s.name)} 的{if older { "舊版本" } else { "非最新發行版本" }}，最新版本是 {latest}。{gone}"
+            }
         };
-        f"<p class=\"callout help\"><span class=\"lab\">{if l.yanked { yanked_tag(ko) } else { tr(ko, "old version", "이전 버전") }}</span><span>{text}</span></p>"
+        f"<p class=\"callout help\"><span class=\"lab\">{if l.yanked { yanked_tag(lg) } else { tr(lg, "old version", "이전 버전", "旧版本", "舊版本") }}</span><span>{text}</span></p>"
     } else if l.yanked {
-        f"<p class=\"callout help\"><span class=\"lab\">{yanked_tag(ko)}</span><span>{tr(ko, "Every version is yanked. Projects that pinned one in <code class=\"ic\">nabi.lock</code> keep building; new ones will not resolve this package.", "모든 버전이 철회되었습니다. <code class=\"ic\">nabi.lock</code>에 버전을 고정한 프로젝트는 계속 빌드되지만, 새 프로젝트는 이 패키지를 쓰지 않습니다.")}</span></p>"
+        f"<p class=\"callout help\"><span class=\"lab\">{yanked_tag(lg)}</span><span>{tr(lg, "Every version is yanked. Projects that pinned one in <code class=\"ic\">nabi.lock</code> keep building; new ones will not resolve this package.", "모든 버전이 철회되었습니다. <code class=\"ic\">nabi.lock</code>에 버전을 고정한 프로젝트는 계속 빌드되지만, 새 프로젝트는 이 패키지를 쓰지 않습니다.", "所有版本都已撤回。在 <code class=\"ic\">nabi.lock</code> 中固定了某个版本的项目仍可构建，新项目不会解析到这个包。", "所有版本都已撤回。在 <code class=\"ic\">nabi.lock</code> 中固定了某個版本的專案仍可建置，新專案不會解析到這個套件。")}</span></p>"
     } else { "" };
     // Narrow screens: install right under the title (the side panel ends up last).
-    let inst = if l.yanked { "" } else { f"<section class=\"inst-head\" aria-label=\"{tr(ko, "Install", "설치")}\">{install_box(s, "h", ko)}</section>\n" };
+    let inst = if l.yanked { "" } else { f"<section class=\"inst-head\" aria-label=\"{tr(lg, "Install", "설치", "安装", "安裝")}\">{install_box(s, "h", lg)}</section>\n" };
     let tabs = StrBuf::new();
     let t = |key: str, label: str, href: str, n: str| {
         let ct = if n.is_empty() { "" } else { f"<span class=\"ct\">{n}</span>" };
@@ -964,33 +1009,33 @@ fn package_head(site: Site, s: Package, tab: str, ko: bool) -> str {
             f"<a href=\"{esc(href)}\">{label}{ct}</a>"
         }
     };
-    tabs.push_str(t("readme", tr(ko, "Readme", "읽어보기"), href(ko, readme_out(s)), ""));
+    tabs.push_str(t("readme", tr(lg, "Readme", "읽어보기", "README", "README"), href(lg, readme_out(s)), ""));
     // An executable alone has no API: no Docs tab, as on crates.io.
-    if s.has_lib { tabs.push_str(f"<a href=\"{esc(docs_url(site, s.name, if s.at.is_empty() { "latest" } else { s.at }))}\">{tr(ko, "Docs", "문서")} <span aria-hidden=\"true\">↗</span></a>"); }
-    tabs.push_str(t("versions", tab_title("versions", ko), href(ko, tab_out(s.name, "versions")), f"{s.versions.len()}"));
+    if s.has_lib { tabs.push_str(f"<a href=\"{esc(docs_url(site, s.name, if s.at.is_empty() { "latest" } else { s.at }))}\">{tr(lg, "Docs", "문서", "文档", "文件")} <span aria-hidden=\"true\">↗</span></a>"); }
+    tabs.push_str(t("versions", tab_title("versions", lg), href(lg, tab_out(s.name, "versions")), f"{s.versions.len()}"));
     // A version page lists its dependencies in the side panel; these two
     // tabs are the latest version's.
     if s.at.is_empty() {
-        tabs.push_str(t("dependencies", tab_title("dependencies", ko), href(ko, tab_out(s.name, "dependencies")), f"{l.deps.len()}"));
-        tabs.push_str(t("dependents", tab_title("dependents", ko), href(ko, tab_out(s.name, "dependents")), f"{s.rdeps.len()}"));
+        tabs.push_str(t("dependencies", tab_title("dependencies", lg), href(lg, tab_out(s.name, "dependencies")), f"{l.deps.len()}"));
+        tabs.push_str(t("dependents", tab_title("dependents", lg), href(lg, tab_out(s.name, "dependents")), f"{s.rdeps.len()}"));
     }
     let tree = packages::tree_link(l.url, l.rev);
-    if !tree.is_empty() { tabs.push_str(f"<a href=\"{esc(tree)}\">{tr(ko, "Source", "소스")} <span aria-hidden=\"true\">↗</span></a>"); }
+    if !tree.is_empty() { tabs.push_str(f"<a href=\"{esc(tree)}\">{tr(lg, "Source", "소스", "源代码", "原始碼")} <span aria-hidden=\"true\">↗</span></a>"); }
     f"<div class=\"frame package-head\">
-<nav class=\"crumbs\" aria-label=\"{tr(ko, "Breadcrumb", "이동 경로")}\"><a href=\"{lp(ko, "/packages")}\">{tr(ko, "packages", "패키지")}</a> / {crumbs(s, tab, ko)}</nav>
-<div class=\"title\"><span class=\"gl-box {hue_class(s.name)}\">{glyph(s.name, 44, "gl")}</span><div class=\"what\"><div class=\"name-line\"><h1>{esc(s.name)}</h1><span class=\"ver{if l.yanked { " gone" } else { "" }}\">{esc(l.version)}</span>{if s.official { official_badge(ko) } else { "" }}</div>{about}</div></div>
+<nav class=\"crumbs\" aria-label=\"{tr(lg, "Breadcrumb", "이동 경로", "导航路径", "導覽路徑")}\"><a href=\"{lp(lg, "/packages")}\">{tr(lg, "packages", "패키지", "包", "套件")}</a> / {crumbs(s, tab, lg)}</nav>
+<div class=\"title\"><span class=\"gl-box {hue_class(s.name)}\">{glyph(s.name, 44, "gl")}</span><div class=\"what\"><div class=\"name-line\"><h1>{esc(s.name)}</h1><span class=\"ver{if l.yanked { " gone" } else { "" }}\">{esc(l.version)}</span>{if s.official { official_badge(lg) } else { "" }}</div>{about}</div></div>
 <p class=\"sum t-small\"><span>{sum.join("</span> · <span>")}</span></p>
-{notice}{osv::banner(s.advisories, s.name, l.version, ko)}{inst}<div class=\"tabs-line\"><nav class=\"tabs\" aria-label=\"{tr(ko, "Package sections", "패키지 섹션")}\">{tabs.to_str()}</nav></div>
+{notice}{osv::banner(s.advisories, s.name, l.version, lg)}{inst}<div class=\"tabs-line\"><nav class=\"tabs\" aria-label=\"{tr(lg, "Package sections", "패키지 섹션", "包的各个部分", "套件各部分")}\">{tabs.to_str()}</nav></div>
 </div>
 "
 }
 
 /// The breadcrumb after `packages /`: the package, the version, the tab;
 /// each but the last a link.
-fn crumbs(s: Package, tab: str, ko: bool) -> str {
-    let parts: List<(str, str)> = [(esc(s.name), href(ko, package_out(s.name)))];
-    if !s.at.is_empty() { parts.push((esc(s.at), href(ko, ver_out(s.name, s.at)))); }
-    if tab != "readme" { parts.push((tr(ko, tab, tab_title(tab, true)), "")); }
+fn crumbs(s: Package, tab: str, lg: Lang) -> str {
+    let parts: List<(str, str)> = [(esc(s.name), href(lg, package_out(s.name)))];
+    if !s.at.is_empty() { parts.push((esc(s.at), href(lg, ver_out(s.name, s.at)))); }
+    if tab != "readme" { parts.push((if lg.is_en() { tab } else { tab_title(tab, lg) }, "")); }
     let b: List<str> = List::new();
     for k in 0..parts.len() {
         let (text, href) = parts[k];
@@ -1003,9 +1048,9 @@ fn crumbs(s: Package, tab: str, ko: bool) -> str {
 /// writes for a library, `nabi install` for an executable (`--bin` when
 /// the package has both). `id` keeps the ids apart: the box is in the
 /// heading on narrow screens and in the side panel on wide ones.
-fn install_box(s: Package, id: str, ko: bool) -> str {
+fn install_box(s: Package, id: str, lg: Lang) -> str {
     let l = s.latest;
-    if l.yanked { return if s.at.is_empty() { tr(ko, "<p class=\"t-ui muted\">Not installable: every version is yanked.</p>", "<p class=\"t-ui muted\">설치할 수 없습니다. 모든 버전이 철회되었습니다.</p>") } else { tr(ko, "<p class=\"t-ui muted\">Not installable: this version is yanked.</p>", "<p class=\"t-ui muted\">설치할 수 없습니다. 이 버전은 철회되었습니다.</p>") }; }
+    if l.yanked { return if s.at.is_empty() { tr(lg, "<p class=\"t-ui muted\">Not installable: every version is yanked.</p>", "<p class=\"t-ui muted\">설치할 수 없습니다. 모든 버전이 철회되었습니다.</p>", "<p class=\"t-ui muted\">无法安装：所有版本都已撤回。</p>", "<p class=\"t-ui muted\">無法安裝：所有版本都已撤回。</p>") } else { tr(lg, "<p class=\"t-ui muted\">Not installable: this version is yanked.</p>", "<p class=\"t-ui muted\">설치할 수 없습니다. 이 버전은 철회되었습니다.</p>", "<p class=\"t-ui muted\">无法安装：此版本已撤回。</p>", "<p class=\"t-ui muted\">無法安裝：此版本已撤回。</p>") }; }
     // An old version is asked for exactly.
     let old = !s.at.is_empty() && s.at != s.top;
     let req = if old { "=" + l.version } else { packages::add_req(l.version) };
@@ -1016,18 +1061,18 @@ fn install_box(s: Package, id: str, ko: bool) -> str {
     let manifest = f"deps: {{\n    \"{s.name}\": Dep::version(\"{req}\"),\n}},";
     let tabs: List<(str, str, str)> = List::new();
     if s.has_lib {
-        tabs.push(("add", "nabi add", f"<pre class=\"sh\"><code><span class=\"p\" aria-hidden=\"true\">$ </span>{esc(add)}</code></pre>{chrome::copy_button(add, ko)}"));
-        tabs.push(("nabion", "nabi.nabion", f"<pre><code class=\"language-nabion\">{nabi_syntax::highlight_nabion(manifest)}</code></pre>{chrome::copy_button(manifest, ko)}"));
+        tabs.push(("add", "nabi add", f"<pre class=\"sh\"><code><span class=\"p\" aria-hidden=\"true\">$ </span>{esc(add)}</code></pre>{chrome::copy_button_for(add, lg)}"));
+        tabs.push(("nabion", "nabi.nabion", f"<pre><code class=\"language-nabion\">{nabi_syntax::highlight_nabion(manifest)}</code></pre>{chrome::copy_button_for(manifest, lg)}"));
     }
     if packages::has_bin(s) {
-        tabs.push(("bin", "nabi install", f"<pre class=\"sh\"><code><span class=\"p\" aria-hidden=\"true\">$ </span>{esc(install)}</code></pre>{chrome::copy_button(install, ko)}"));
+        tabs.push(("bin", "nabi install", f"<pre class=\"sh\"><code><span class=\"p\" aria-hidden=\"true\">$ </span>{esc(install)}</code></pre>{chrome::copy_button_for(install, lg)}"));
     }
     // From the package's own API (apidoc::import_line): the library's
     // tabs only.
-    let use_line = if s.import.is_empty() || !s.has_lib { "" } else { f"<div class=\"iuse\"><p class=\"t-small\">{tr(ko, "Then in your code", "그다음 코드에서")}</p><pre><code class=\"language-nabi\">{nabi_syntax::highlight_nabi(s.import)}</code></pre>{chrome::copy_button(s.import, ko)}</div>" };
+    let use_line = if s.import.is_empty() || !s.has_lib { "" } else { f"<div class=\"iuse\"><p class=\"t-small\">{tr(lg, "Then in your code", "그다음 코드에서", "然后在代码中", "然後在程式碼中")}</p><pre><code class=\"language-nabi\">{nabi_syntax::highlight_nabi(s.import)}</code></pre>{chrome::copy_button_for(s.import, lg)}</div>" };
     // The newest version of an official package comes in on `use` alone.
     let use_code = f"<code class=\"ic\">use {esc(s.name.replace("-", "_"))}::..;</code>";
-    let auto = if s.official && s.has_lib && !old && !packages::is_pre(l.version) { tr(ko, f"<p class=\"inst-note\">Official: {use_code} alone is enough, the first build adds it. Or:</p>", f"<p class=\"inst-note\">공식 패키지: {use_code}만 쓰면 첫 빌드가 추가합니다. 또는:</p>") } else { "" };
+    let auto = if s.official && s.has_lib && !old && !packages::is_pre(l.version) { tr(lg, f"<p class=\"inst-note\">Official: {use_code} alone is enough, the first build adds it. Or:</p>", f"<p class=\"inst-note\">공식 패키지: {use_code}만 쓰면 첫 빌드가 추가합니다. 또는:</p>", f"<p class=\"inst-note\">官方包：只写 {use_code} 就够了，第一次构建会添加它。或者：</p>", f"<p class=\"inst-note\">官方套件：只寫 {use_code} 就夠了，第一次建置會新增它。或者：</p>") } else { "" };
     let heads = StrBuf::new();
     let panels = StrBuf::new();
     for k in 0..tabs.len() {
@@ -1040,18 +1085,18 @@ fn install_box(s: Package, id: str, ko: bool) -> str {
         if first && key == "add" { panels.push_str(use_line); }
     }
     f"<div class=\"inst\">{auto}
-<div class=\"itabs\" role=\"tablist\" aria-label=\"{tr(ko, "Install with", "설치 방법")}\">{heads.to_str()}</div>{panels.to_str()}
+<div class=\"itabs\" role=\"tablist\" aria-label=\"{tr(lg, "Install with", "설치 방법", "安装方式", "安裝方式")}\">{heads.to_str()}</div>{panels.to_str()}
 </div>"
 }
 
 /// A GitHub login, linked to its profile; a trusted publisher
 /// (`github:owner/repo/.github/workflows/<file>@<ref>`), to its workflow.
-pub fn login_link(login: str, ko: bool = false) -> str {
+pub fn login_link(login: str, lg: Lang = Lang::En) -> str {
     if let w: str = login.strip_prefix("github:") {
         let path = (w.split_once("@") ?? (w, "")).0;
         if let (repo, file) = path.split_once("/.github/workflows/") ?? ("", "") {
             if !repo.is_empty() {
-                return f"<a href=\"https://github.com/{esc(repo)}/actions/workflows/{esc(http::pct_encode(file))}\" title=\"{esc(w)}\">{esc(repo)}</a> <span class=\"muted\">({tr(ko, "trusted publishing", "신뢰할 수 있는 게시")})</span>";
+                return f"<a href=\"https://github.com/{esc(repo)}/actions/workflows/{esc(http::pct_encode(file))}\" title=\"{esc(w)}\">{esc(repo)}</a> <span class=\"muted\">({tr(lg, "trusted publishing", "신뢰할 수 있는 게시", "可信发布", "受信任發布")})</span>";
             }
         }
         return esc(w);
@@ -1073,9 +1118,9 @@ fn when_tag(iso: str, class: str, short: bool) -> str {
 /// Who did it, after "by": a GitHub user, or for a trusted publish the
 /// repository's owner "via GitHub Actions", the repository and the run;
 /// "" when not known.
-pub fn actor_link(a: meta::Actor | none, name: str = "", ko: bool = false) -> str {
+pub fn actor_link(a: meta::Actor | none, name: str = "", lg: Lang = Lang::En) -> str {
     let x = a ?? { return ""; };
-    let who = by_link(x, name, ko);
+    let who = by_link(x, name, lg);
     let v = x.via ?? { return who; };
     let repo = f"https://github.com/{esc(v.repository)}";
     let run = meta::run_url(v);
@@ -1083,14 +1128,14 @@ pub fn actor_link(a: meta::Actor | none, name: str = "", ko: bool = false) -> st
     let (href, title) = if run.is_empty() { (f"{repo}/actions/workflows/{wf}", v.ref) } else { (esc(run), f"{v.ref}, run {v.run_id}") };
     let tip = if title.is_empty() { "" } else { f" title=\"{esc(title)}\"" };
     let how = f"GitHub Actions (<a href=\"{repo}\">{esc(v.repository)}</a>, <a href=\"{href}\"{tip}>{esc(v.workflow)}</a>)";
-    if ko { f"{who}, {how} 경유" } else { f"{who} via {how}" }
+    tr(lg, f"{who} via {how}", f"{who}, {how} 경유", f"{who}，通过 {how}", f"{who}，透過 {how}")
 }
 
 /// Who did it, short: the account or the repository's owner with its
 /// avatar, `name` its display name; "" when not known.
-pub fn by_link(x: meta::Actor, name: str = "", ko: bool = false) -> str {
+pub fn by_link(x: meta::Actor, name: str = "", lg: Lang = Lang::En) -> str {
     // Recorded before the run was: the workflow ref as the login.
-    if x.login.starts_with("github:") { return login_link(x.login, ko); }
+    if x.login.starts_with("github:") { return login_link(x.login, lg); }
     let p = meta::person_of(x);
     if p.login.is_empty() { return ""; }
     if x.via is none { p.name = name; }
@@ -1098,43 +1143,43 @@ pub fn by_link(x: meta::Actor, name: str = "", ko: bool = false) -> str {
 }
 
 /// `actor_link` as plain text, for a title attribute.
-pub fn actor_text(a: meta::Actor | none, ko: bool = false) -> str {
+pub fn actor_text(a: meta::Actor | none, lg: Lang = Lang::En) -> str {
     let x = a ?? { return ""; };
     let v = x.via ?? { return x.login; };
-    if ko { f"{meta::owner_of(v)}, GitHub Actions ({v.repository}, {v.workflow}) 경유" } else { f"{meta::owner_of(v)} via GitHub Actions ({v.repository}, {v.workflow})" }
+    tr(lg, f"{meta::owner_of(v)} via GitHub Actions ({v.repository}, {v.workflow})", f"{meta::owner_of(v)}, GitHub Actions ({v.repository}, {v.workflow}) 경유", f"{meta::owner_of(v)}，通过 GitHub Actions（{v.repository}，{v.workflow}）", f"{meta::owner_of(v)}，透過 GitHub Actions（{v.repository}，{v.workflow}）")
 }
 
-fn side(site: Site, s: Package, ko: bool) -> str {
+fn side(site: Site, s: Package, lg: Lang) -> str {
     let l = s.latest;
     let m = s.meta;
     // The source the registry fetched the commit from; the manifest's
     // `repository` is only what the package says.
     let repo = packages::web_of(l.url);
     let shown = esc(bare_url(l.url)).replace("/", "/<wbr>");
-    let repo_html = (if repo.is_empty() { f"<code>{shown}</code>" } else { f"<a href=\"{esc(repo)}\">{shown}</a>" }) + provenance(l, ko);
+    let repo_html = (if repo.is_empty() { f"<code>{shown}</code>" } else { f"<a href=\"{esc(repo)}\">{shown}</a>" }) + provenance(l, lg);
     let stated = if m.repository.is_empty() || bare_url(m.repository).to_lowercase() == bare_url(l.url).to_lowercase() { "" } else {
         let t = esc(bare_url(m.repository)).replace("/", "/<wbr>");
         let shown_stated = if m.repository.starts_with("https://") { f"<a href=\"{esc(m.repository)}\" rel=\"nofollow ugc\">{t}</a>" } else { f"<code>{t}</code>" };
-        f"<dt title=\"{tr(ko, "From the package's nabi.nabion; the registry did not check it", "패키지의 nabi.nabion에 적힌 것으로, 레지스트리가 확인하지 않았습니다")}\">{tr(ko, "Stated repository", "밝힌 저장소")}</dt><dd>{shown_stated}</dd>"
+        f"<dt title=\"{tr(lg, "From the package's nabi.nabion; the registry did not check it", "패키지의 nabi.nabion에 적힌 것으로, 레지스트리가 확인하지 않았습니다", "来自包的 nabi.nabion，注册表未核实", "來自套件的 nabi.nabion，登錄庫未核實")}\">{tr(lg, "Stated repository", "밝힌 저장소", "声明的仓库", "宣告的儲存庫")}</dt><dd>{shown_stated}</dd>"
     };
     let kv = StrBuf::new();
-    let pb = actor_link(l.by, l.by_name, ko);
+    let pb = actor_link(l.by, l.by_name, lg);
     if !l.date.is_empty() || !pb.is_empty() {
         let when = if l.date.is_empty() { "" } else { when_tag(l.date, "", false) };
-        let who = if pb.is_empty() { "" } else if ko { f"{if when.is_empty() { "" } else { " · " }}{pb}" } else { f"{if when.is_empty() { "by" } else { " by" }} {pb}" };
-        kv.push_str(f"<dt>{tr(ko, "Published", "공개")}</dt><dd>{when}{who}</dd>");
+        let who = if pb.is_empty() { "" } else { tr(lg, f"{if when.is_empty() { "by" } else { " by" }} {pb}", f"{if when.is_empty() { "" } else { " · " }}{pb}", f"{if when.is_empty() { "" } else { " · " }}{pb}", f"{if when.is_empty() { "" } else { " · " }}{pb}") };
+        kv.push_str(f"<dt>{tr(lg, "Published", "공개", "发布", "發布")}</dt><dd>{when}{who}</dd>");
     }
-    kv.push_str(downloads_kv(s, ko));
-    kv.push_str(osv::side_kv(s.advisories, s.name, l.version, ko));
-    if !m.license.is_empty() { kv.push_str(f"<dt>{tr(ko, "License", "라이선스")}</dt><dd>{esc(m.license)}</dd>"); }
-    if !l.nabi_version.is_empty() { kv.push_str(f"<dt>{tr(ko, "Requires", "필요한 버전")}</dt><dd>{esc(admits(l.nabi_version, ko))}</dd>"); }
-    if !m.links.is_empty() { kv.push_str(f"<dt>{tr(ko, "Links", "링크")}</dt><dd title=\"{tr(ko, "The native library it links", "링크하는 네이티브 라이브러리")}\"><code class=\"ic\">{esc(m.links)}</code></dd>"); }
+    kv.push_str(downloads_kv(s, lg));
+    kv.push_str(osv::side_kv(s.advisories, s.name, l.version, lg));
+    if !m.license.is_empty() { kv.push_str(f"<dt>{tr(lg, "License", "라이선스", "许可证", "授權條款")}</dt><dd>{esc(m.license)}</dd>"); }
+    if !l.nabi_version.is_empty() { kv.push_str(f"<dt>{tr(lg, "Requires", "필요한 버전", "需要", "需要")}</dt><dd>{esc(admits(l.nabi_version, lg))}</dd>"); }
+    if !m.links.is_empty() { kv.push_str(f"<dt>{tr(lg, "Links", "링크", "链接", "連結")}</dt><dd title=\"{tr(lg, "The native library it links", "링크하는 네이티브 라이브러리", "它链接的原生库", "它連結的原生函式庫")}\"><code class=\"ic\">{esc(m.links)}</code></dd>"); }
     let nd = count_deps(l, "normal");
-    let deps_dt = tr(ko, "Dependencies", "의존성");
+    let deps_dt = tr(lg, "Dependencies", "의존성", "依赖", "相依套件");
     if nd == 0 {
-        kv.push_str(f"<dt>{deps_dt}</dt><dd>{tr(ko, "None", "없음")}</dd>");
+        kv.push_str(f"<dt>{deps_dt}</dt><dd>{tr(lg, "None", "없음", "无", "無")}</dd>");
     } else if s.at.is_empty() {
-        kv.push_str(f"<dt>{deps_dt}</dt><dd><a href=\"{esc(href(ko, tab_out(s.name, "dependencies")))}\">{nd}</a></dd>");
+        kv.push_str(f"<dt>{deps_dt}</dt><dd><a href=\"{esc(href(lg, tab_out(s.name, "dependencies")))}\">{nd}</a></dd>");
     } else {
         let ds: List<str> = List::new();
         for d in l.deps {
@@ -1147,25 +1192,25 @@ fn side(site: Site, s: Package, ko: bool) -> str {
     let old = !s.at.is_empty() && s.at != s.top;
     if !m.keywords.is_empty() {
         let ks: List<str> = List::new();
-        for k in m.keywords { ks.push(f"<a href=\"{esc(if old { lp(ko, "/packages?q=" + http::pct_encode(k)) } else { topic_href(false, k, ko) })}\">{esc(k)}</a>"); }
-        kv.push_str(f"<dt>{tr(ko, "Keywords", "키워드")}</dt><dd class=\"kws\">{ks.join(" ")}</dd>");
+        for k in m.keywords { ks.push(f"<a href=\"{esc(if old { lp(lg, "/packages?q=" + http::pct_encode(k)) } else { topic_href(false, k, lg) })}\">{esc(k)}</a>"); }
+        kv.push_str(f"<dt>{tr(lg, "Keywords", "키워드", "关键词", "關鍵字")}</dt><dd class=\"kws\">{ks.join(" ")}</dd>");
     }
     if !m.categories.is_empty() {
         let cs: List<str> = List::new();
-        for c in m.categories { cs.push(f"<a href=\"{esc(if old { lp(ko, "/packages?q=" + http::pct_encode(c)) } else { topic_href(true, c, ko) })}\">{esc(c)}</a>"); }
-        kv.push_str(f"<dt>{if ko { "카테고리" } else if cs.len() == 1 { "Category" } else { "Categories" }}</dt><dd class=\"kws\">{cs.join(" ")}</dd>");
+        for c in m.categories { cs.push(f"<a href=\"{esc(if old { lp(lg, "/packages?q=" + http::pct_encode(c)) } else { topic_href(true, c, lg) })}\">{esc(c)}</a>"); }
+        kv.push_str(f"<dt>{tr(lg, if cs.len() == 1 { "Category" } else { "Categories" }, "카테고리", "分类", "分類")}</dt><dd class=\"kws\">{cs.join(" ")}</dd>");
     }
     if !m.authors.is_empty() {
         let au: List<str> = List::new();
         for a in m.authors { au.push(esc(a)); }
-        kv.push_str(f"<dt>{if ko { "저자" } else if au.len() == 1 { "Author" } else { "Authors" }}</dt><dd>{au.join(", ")}</dd>");
+        kv.push_str(f"<dt>{tr(lg, if au.len() == 1 { "Author" } else { "Authors" }, "저자", "作者", "作者")}</dt><dd>{au.join(", ")}</dd>");
     }
-    if !m.homepage.is_empty() { kv.push_str(f"<dt>{tr(ko, "Homepage", "홈페이지")}</dt><dd><a href=\"{esc(m.homepage)}\">{esc(bare(m.homepage))}</a></dd>"); }
-    if !m.documentation.is_empty() { kv.push_str(f"<dt>{tr(ko, "Documentation", "문서")}</dt><dd><a href=\"{esc(m.documentation)}\">{esc(bare(m.documentation))}</a></dd>"); }
-    kv.push_str(badge_kv(site, s, ko));
+    if !m.homepage.is_empty() { kv.push_str(f"<dt>{tr(lg, "Homepage", "홈페이지", "主页", "首頁")}</dt><dd><a href=\"{esc(m.homepage)}\">{esc(bare(m.homepage))}</a></dd>"); }
+    if !m.documentation.is_empty() { kv.push_str(f"<dt>{tr(lg, "Documentation", "문서", "文档", "文件")}</dt><dd><a href=\"{esc(m.documentation)}\">{esc(bare(m.documentation))}</a></dd>"); }
+    kv.push_str(badge_kv(site, s, lg));
     if let f: packages::Facts = s.facts {
-        kv.push_str(if ko { f"<dt>크기</dt><dd>{size(f.bytes, true)}, 파일 {grouped(f.files)}개</dd>" } else { f"<dt>Size</dt><dd>{size(f.bytes)} in {plural(f.files, "file", "files")}</dd>" });
-        if f.nabi_files > 0 { kv.push_str(if ko { f"<dt>Nabi 코드</dt><dd title=\".nabi 파일에서 빈 줄을 뺀 줄 수\">{grouped(f.nabi_lines)}줄, 파일 {grouped(f.nabi_files)}개</dd>" } else { f"<dt>Nabi code</dt><dd title=\"Lines that are not blank, in .nabi files\">{plural(f.nabi_lines, "line", "lines")} in {plural(f.nabi_files, "file", "files")}</dd>" }); }
+        kv.push_str(tr(lg, f"<dt>Size</dt><dd>{size(f.bytes)} in {plural(f.files, "file", "files")}</dd>", f"<dt>크기</dt><dd>{size(f.bytes, lg)}, 파일 {grouped(f.files)}개</dd>", f"<dt>大小</dt><dd>{size(f.bytes, lg)}，{grouped(f.files)} 个文件</dd>", f"<dt>大小</dt><dd>{size(f.bytes, lg)}，{grouped(f.files)} 個檔案</dd>"));
+        if f.nabi_files > 0 { kv.push_str(tr(lg, f"<dt>Nabi code</dt><dd title=\"Lines that are not blank, in .nabi files\">{plural(f.nabi_lines, "line", "lines")} in {plural(f.nabi_files, "file", "files")}</dd>", f"<dt>Nabi 코드</dt><dd title=\".nabi 파일에서 빈 줄을 뺀 줄 수\">{grouped(f.nabi_lines)}줄, 파일 {grouped(f.nabi_files)}개</dd>", f"<dt>Nabi 代码</dt><dd title=\".nabi 文件中的非空行数\">{grouped(f.nabi_lines)} 行，{grouped(f.nabi_files)} 个文件</dd>", f"<dt>Nabi 程式碼</dt><dd title=\".nabi 檔案中的非空白行數\">{grouped(f.nabi_lines)} 行，{grouped(f.nabi_files)} 個檔案</dd>")); }
     }
     let vs = sorted_versions(s);
     let vb = StrBuf::new();
@@ -1173,27 +1218,27 @@ fn side(site: Site, s: Package, ko: bool) -> str {
     for v in vs {
         if k == 5 { break; }
         k += 1;
-        let mark = if v.version == (if s.at.is_empty() { l.version } else { s.top }) && !v.yanked { f"<span class=\"dot\" title=\"{tr(ko, "latest", "최신")}\"></span>" } else { "<span class=\"dot off\"></span>" };
-        let tag = if v.yanked { f"<span class=\"tag\">{yanked_tag(ko)}</span>" } else if packages::is_pre(v.version) { f"<span class=\"tag\">{tr(ko, "pre-release", "프리릴리스")}</span>" } else { "" };
+        let mark = if v.version == (if s.at.is_empty() { l.version } else { s.top }) && !v.yanked { f"<span class=\"dot\" title=\"{tr(lg, "latest", "최신", "最新", "最新")}\"></span>" } else { "<span class=\"dot off\"></span>" };
+        let tag = if v.yanked { f"<span class=\"tag\">{yanked_tag(lg)}</span>" } else if packages::is_pre(v.version) { f"<span class=\"tag\">{tr(lg, "pre-release", "프리릴리스", "预发布", "預發行")}</span>" } else { "" };
         let when = if v.date.is_empty() { "" } else { when_tag(v.date, "c", false) };
         let cur = if v.version == s.at { " aria-current=\"page\"" } else { "" };
-        vb.push_str(f"<li{if v.yanked { " class=\"yanked\"" } else { "" }}>{mark}<a class=\"v\" href=\"{esc(href(ko, ver_out(s.name, v.version)))}\"{cur}>{esc(v.version)}</a>{tag}{when}</li>");
+        vb.push_str(f"<li{if v.yanked { " class=\"yanked\"" } else { "" }}>{mark}<a class=\"v\" href=\"{esc(href(lg, ver_out(s.name, v.version)))}\"{cur}>{esc(v.version)}</a>{tag}{when}</li>");
     }
-    let more = if s.versions.len() > 5 { f"<a href=\"{esc(href(ko, tab_out(s.name, "versions")))}\" class=\"t-ui\">{tr(ko, f"All {s.versions.len()} versions", f"버전 {s.versions.len()}개 모두")}</a>" } else { "" };
-    f"<aside class=\"meta\" aria-label=\"{tr(ko, "Package details", "패키지 정보")}\">
-<section class=\"inst-side\"><h2 class=\"t-label\">{tr(ko, "Install", "설치")}</h2>{install_box(s, "i", ko)}</section>
-<dl class=\"kv\">{kv.to_str()}<dt>{tr(ko, "Repository", "저장소")}</dt><dd>{repo_html}</dd>{stated}<dt>{tr(ko, "Commit", "커밋")}</dt><dd class=\"mono\">{commit_link(l)}</dd><dt>{tr(ko, "Tree hash", "트리 해시")}</dt><dd class=\"mono\"><code title=\"{esc(l.tree)}\">{short(l.tree)}</code></dd><dt>{tr(ko, "Index file", "index 파일")}</dt><dd class=\"mono\"><a href=\"{esc(site.index_repo)}/blob/main/{esc(s.file)}\">{esc(s.file)}</a></dd></dl>
-{owners_box(s, ko)}{publishers_box(s, ko)}<section class=\"vers\"><h2 class=\"t-label\">{tr(ko, "Versions", "버전")}</h2><ul>{vb.to_str()}</ul>{dates_note(s, ko)}{more}</section>
+    let more = if s.versions.len() > 5 { f"<a href=\"{esc(href(lg, tab_out(s.name, "versions")))}\" class=\"t-ui\">{tr(lg, f"All {s.versions.len()} versions", f"버전 {s.versions.len()}개 모두", f"全部 {s.versions.len()} 个版本", f"全部 {s.versions.len()} 個版本")}</a>" } else { "" };
+    f"<aside class=\"meta\" aria-label=\"{tr(lg, "Package details", "패키지 정보", "包详情", "套件詳細資訊")}\">
+<section class=\"inst-side\"><h2 class=\"t-label\">{tr(lg, "Install", "설치", "安装", "安裝")}</h2>{install_box(s, "i", lg)}</section>
+<dl class=\"kv\">{kv.to_str()}<dt>{tr(lg, "Repository", "저장소", "仓库", "儲存庫")}</dt><dd>{repo_html}</dd>{stated}<dt>{tr(lg, "Commit", "커밋", "提交", "提交")}</dt><dd class=\"mono\">{commit_link(l)}</dd><dt>{tr(lg, "Tree hash", "트리 해시", "树哈希", "樹雜湊")}</dt><dd class=\"mono\"><code title=\"{esc(l.tree)}\">{short(l.tree)}</code></dd><dt>{tr(lg, "Index file", "index 파일", "索引文件", "索引檔案")}</dt><dd class=\"mono\"><a href=\"{esc(site.index_repo)}/blob/main/{esc(s.file)}\">{esc(s.file)}</a></dd></dl>
+{owners_box(s, lg)}{publishers_box(s, lg)}<section class=\"vers\"><h2 class=\"t-label\">{tr(lg, "Versions", "버전", "版本", "版本")}</h2><ul>{vb.to_str()}</ul>{dates_note(s, lg)}{more}</section>
 </aside>
 "
 }
 
 /// packages::admits in the page's language: `nabi 0.2.0 or a later 0.2.x`.
-fn admits(nabi_version: str, ko: bool) -> str {
+fn admits(nabi_version: str, lg: Lang) -> str {
     let en = packages::admits(nabi_version);
-    if !ko { return en; }
+    if lg.is_en() { return en; }
     // `nabi 0.2.0 or a later 0.2.x`, or another form left as it is.
-    if let (a, b): (str, str) = en.split_once(" or a later ") { return f"{a} 이상 {b}"; }
+    if let (a, b): (str, str) = en.split_once(" or a later ") { return tr(lg, en, f"{a} 이상 {b}", f"{a} 或更高的 {b}", f"{a} 或更新的 {b}"); }
     en
 }
 
@@ -1220,10 +1265,10 @@ pub fn breadcrumb_ld(site: Site, items: List<(str, str)>) -> str {
 /// The JSON-LD of a package's page or tab `tab` (`readme`, `versions`,
 /// ..): the package as SoftwareSourceCode (the version a version page
 /// shows), and the page's breadcrumbs.
-pub fn package_ld(site: Site, s: Package, tab: str, ko: bool = false) -> str {
+pub fn package_ld(site: Site, s: Package, tab: str, lg: Lang = Lang::En) -> str {
     let l = s.latest;
     let m = s.meta;
-    let page = href(ko, readme_out(s));
+    let page = href(lg, readme_out(s));
     let f: List<str> = ["\"@context\":\"https://schema.org\"", "\"@type\":\"SoftwareSourceCode\"", f"\"name\":{js(s.name)}", f"\"url\":{js(site.base_url + page)}", f"\"version\":{js(l.version)}", "\"programmingLanguage\":{\"@type\":\"ComputerLanguage\",\"name\":\"Nabi\",\"url\":\"https://nabi-lang.org\"}"];
     if !s.desc.is_empty() { f.push(f"\"description\":{js(s.desc)}"); }
     let repo = packages::web_of(l.url);
@@ -1249,17 +1294,17 @@ pub fn package_ld(site: Site, s: Package, tab: str, ko: bool = false) -> str {
         if !v.date.is_empty() && (first.is_empty() || v.date < first) { first = v.date; }
     }
     if !first.is_empty() { f.push(f"\"datePublished\":{js(first)}"); }
-    let crumbs: List<(str, str)> = [(tr(ko, "Packages", "패키지"), lp(ko, "/packages")), (s.name, href(ko, package_out(s.name)))];
-    if !s.at.is_empty() { crumbs.push((s.at, href(ko, ver_out(s.name, s.at)))); }
-    if tab != "readme" { crumbs.push((tab_title(tab, ko), href(ko, tab_out(s.name, tab)))); }
+    let crumbs: List<(str, str)> = [(tr(lg, "Packages", "패키지", "包", "套件"), lp(lg, "/packages")), (s.name, href(lg, package_out(s.name)))];
+    if !s.at.is_empty() { crumbs.push((s.at, href(lg, ver_out(s.name, s.at)))); }
+    if tab != "readme" { crumbs.push((tab_title(tab, lg), href(lg, tab_out(s.name, tab)))); }
     ld_script("{" + f.join(",") + "}") + breadcrumb_ld(site, crumbs)
 }
 
-fn tab_title(tab: str, ko: bool = false) -> str {
+fn tab_title(tab: str, lg: Lang = Lang::En) -> str {
     match tab {
-        "versions" => tr(ko, "Versions", "버전"),
-        "dependencies" => tr(ko, "Dependencies", "의존성"),
-        "dependents" => tr(ko, "Dependents", "의존하는 패키지"),
+        "versions" => tr(lg, "Versions", "버전", "版本", "版本"),
+        "dependencies" => tr(lg, "Dependencies", "의존성", "依赖", "相依套件"),
+        "dependents" => tr(lg, "Dependents", "의존하는 패키지", "被依赖", "被相依"),
         _ => tab,
     }
 }
@@ -1308,12 +1353,12 @@ pub fn badge(s: Package) -> str {
 }
 
 /// The side panel's badge: the image and its Markdown to copy.
-fn badge_kv(site: Site, s: Package, ko: bool) -> str {
+fn badge_kv(site: Site, s: Package, lg: Lang) -> str {
     if !s.at.is_empty() && s.at != s.top { return ""; }
     let page = site.base_url + url(package_out(s.name));
     let src = url(badge_out(s.name));
     let md = f"[![{s.name} on packages.nabi-lang.org]({site.base_url}{src})]({page})";
-    f"<dt>{tr(ko, "Badge", "배지")}</dt><dd class=\"badge\"><img src=\"{esc(src)}\" alt=\"{esc(s.name)} {esc(if s.latest.yanked { "yanked" } else { "v" + s.latest.version })}\" height=\"20\" loading=\"lazy\">{chrome::copy_button(md, ko)}</dd>"
+    f"<dt>{tr(lg, "Badge", "배지", "徽章", "徽章")}</dt><dd class=\"badge\"><img src=\"{esc(src)}\" alt=\"{esc(s.name)} {esc(if s.latest.yanked { "yanked" } else { "v" + s.latest.version })}\" height=\"20\" loading=\"lazy\">{chrome::copy_button_for(md, lg)}</dd>"
 }
 
 /// A count of downloads, grouped by thousands.
@@ -1321,7 +1366,7 @@ fn count_text(n: i64) -> str { grouped(if n < 0i64 { 0usize } else { n as usize 
 
 /// The side panel's Downloads: every version's on the package's pages,
 /// the version's own on a version page; "" when none were counted.
-fn downloads_kv(s: Package, ko: bool) -> str {
+fn downloads_kv(s: Package, lg: Lang) -> str {
     let (total, recent) = if s.at.is_empty() {
         let t = -1i64;
         let r = 0i64;
@@ -1333,12 +1378,14 @@ fn downloads_kv(s: Package, ko: bool) -> str {
         (t, r)
     } else { (s.latest.downloads, s.latest.recent) };
     if total < 0i64 { return ""; }
-    if ko {
-        let what = if s.at.is_empty() { "모든 버전의 소스 보관본 내려받기 수" } else { "이 버전의 소스 보관본 내려받기 수" };
-        return f"<dt>내려받기</dt><dd title=\"{what}\">{count_text(total)} <span class=\"muted\">· 최근 90일 {count_text(recent)}</span></dd>";
-    }
-    let what = if s.at.is_empty() { "Downloads of the source archive, every version" } else { "Downloads of this version's source archive" };
-    f"<dt>Downloads</dt><dd title=\"{what}\">{count_text(total)} <span class=\"muted\">· {count_text(recent)} in the last 90 days</span></dd>"
+    let what = if s.at.is_empty() {
+        tr(lg, "Downloads of the source archive, every version", "모든 버전의 소스 보관본 내려받기 수", "所有版本源代码压缩包的下载次数", "所有版本原始碼壓縮檔的下載次數")
+    } else {
+        tr(lg, "Downloads of this version's source archive", "이 버전의 소스 보관본 내려받기 수", "此版本源代码压缩包的下载次数", "此版本原始碼壓縮檔的下載次數")
+    };
+    let rc = count_text(recent);
+    let last = tr(lg, f"{rc} in the last 90 days", f"최근 90일 {rc}", f"最近 90 天 {rc}", f"最近 90 天 {rc}");
+    f"<dt>{tr(lg, "Downloads", "내려받기", "下载", "下載")}</dt><dd title=\"{what}\">{count_text(total)} <span class=\"muted\">· {last}</span></dd>"
 }
 
 /// An address without `https://` and `.git`.
@@ -1358,28 +1405,28 @@ pub fn verified(v: Version) -> bool {
 }
 
 /// The mark after the side panel's Repository.
-fn provenance(v: Version, ko: bool) -> str {
+fn provenance(v: Version, lg: Lang) -> str {
     if verified(v) {
-        return f" <span class=\"tag acc\" title=\"{tr(ko, "Published by GitHub Actions in this repository", "이 저장소의 GitHub Actions가 공개했습니다")}\">{tr(ko, "verified", "확인됨")}</span>";
+        return f" <span class=\"tag acc\" title=\"{tr(lg, "Published by GitHub Actions in this repository", "이 저장소의 GitHub Actions가 공개했습니다", "由此仓库中的 GitHub Actions 发布", "由此儲存庫中的 GitHub Actions 發布")}\">{tr(lg, "verified", "확인됨", "已验证", "已驗證")}</span>";
     }
-    f" <span class=\"tag\" title=\"{tr(ko, "The commit is on a branch or tag of this repository; nothing shows that its owners published it", "커밋이 이 저장소의 브랜치나 태그에 있습니다. 저장소 소유자가 공개했다는 근거는 없습니다")}\">{tr(ko, "not verified", "확인되지 않음")}</span>"
+    f" <span class=\"tag\" title=\"{tr(lg, "The commit is on a branch or tag of this repository; nothing shows that its owners published it", "커밋이 이 저장소의 브랜치나 태그에 있습니다. 저장소 소유자가 공개했다는 근거는 없습니다", "该提交位于此仓库的某个分支或标签上；没有证据表明是仓库所有者发布的", "該提交位於此儲存庫的某個分支或標籤上；沒有證據顯示是儲存庫擁有者發布的")}\">{tr(lg, "not verified", "확인되지 않음", "未验证", "未驗證")}</span>"
 }
 
 /// The side panel's Owners: each with its avatar, linked to GitHub; ""
 /// when none is known.
-fn owners_box(s: Package, ko: bool) -> str {
+fn owners_box(s: Package, lg: Lang) -> str {
     if s.owners.is_empty() { return ""; }
     let b = StrBuf::new();
     for p in s.owners {
-        let note = if p.derived { f" <span class=\"t-small muted\" title=\"{tr(ko, "Owner of a trusted publisher's repository", "신뢰할 수 있는 게시자 저장소의 소유자")}\">{tr(ko, "trusted publishing", "신뢰할 수 있는 게시")}</span>" } else { "" };
+        let note = if p.derived { f" <span class=\"t-small muted\" title=\"{tr(lg, "Owner of a trusted publisher's repository", "신뢰할 수 있는 게시자 저장소의 소유자", "可信发布者仓库的所有者", "受信任發布者儲存庫的擁有者")}\">{tr(lg, "trusted publishing", "신뢰할 수 있는 게시", "可信发布", "受信任發布")}</span>" } else { "" };
         b.push_str(f"<li>{person_link(p, 24)}{note}</li>");
     }
-    f"<section class=\"owners\" aria-labelledby=\"owners\"><h2 class=\"t-label\" id=\"owners\">{tr(ko, "Owners", "소유자")}</h2><ul class=\"people\">{b.to_str()}</ul></section>\n"
+    f"<section class=\"owners\" aria-labelledby=\"owners\"><h2 class=\"t-label\" id=\"owners\">{tr(lg, "Owners", "소유자", "所有者", "擁有者")}</h2><ul class=\"people\">{b.to_str()}</ul></section>\n"
 }
 
 /// Everyone who published a version, with how many, when more than one
 /// did; "" otherwise.
-fn publishers_box(s: Package, ko: bool) -> str {
+fn publishers_box(s: Package, lg: Lang) -> str {
     let order: List<str> = List::new();
     let link: Dict<str, str> = Dict::new();
     let count: Dict<str, usize> = Dict::new();
@@ -1389,15 +1436,15 @@ fn publishers_box(s: Package, ko: bool) -> str {
         if key.is_empty() { continue; }
         if !link.contains_key(key) {
             order.push(key);
-            link.insert(key, by_link(a, v.by_name, ko));
+            link.insert(key, by_link(a, v.by_name, lg));
             count.insert(key, 0usize);
         }
         count[key] = count[key] + 1;
     }
     if order.len() < 2 { return ""; }
     let b = StrBuf::new();
-    for k in order { b.push_str(f"<li>{link[k]} <span class=\"t-small muted\">{count_of(ko, count[k], "version", "versions", "버전")}</span></li>"); }
-    f"<section class=\"publishers\" aria-labelledby=\"published-by\"><h2 class=\"t-label\" id=\"published-by\">{tr(ko, "Published by", "공개한 사람")}</h2><ul class=\"people\">{b.to_str()}</ul></section>\n"
+    for k in order { b.push_str(f"<li>{link[k]} <span class=\"t-small muted\">{count_of(lg, count[k], "version", "versions", "버전", "个版本", "個版本")}</span></li>"); }
+    f"<section class=\"publishers\" aria-labelledby=\"published-by\"><h2 class=\"t-label\" id=\"published-by\">{tr(lg, "Published by", "공개한 사람", "发布者", "發布者")}</h2><ul class=\"people\">{b.to_str()}</ul></section>\n"
 }
 
 /// `https://x.org/a/` as `x.org/a`.
@@ -1407,25 +1454,25 @@ fn bare(u: str) -> str {
 }
 
 /// What the version dates are, under a list that shows them.
-fn dates_note(s: Package, ko: bool) -> str {
+fn dates_note(s: Package, lg: Lang) -> str {
     for v in s.versions {
-        if !v.date.is_empty() { return tr(ko, "<p class=\"t-small\">Dates: when the version was added to the index.</p>", "<p class=\"t-small\">날짜: 버전이 index에 추가된 때입니다.</p>"); }
+        if !v.date.is_empty() { return tr(lg, "<p class=\"t-small\">Dates: when the version was added to the index.</p>", "<p class=\"t-small\">날짜: 버전이 index에 추가된 때입니다.</p>", "<p class=\"t-small\">日期：版本加入索引的时间。</p>", "<p class=\"t-small\">日期：版本加入索引的時間。</p>"); }
     }
     ""
 }
 
-fn package_frame(site: Site, s: Package, tab: str, main: str, ko: bool) -> str {
-    f"{package_head(site, s, tab, ko)}<div class=\"frame package-body\">
+fn package_frame(site: Site, s: Package, tab: str, main: str, lg: Lang) -> str {
+    f"{package_head(site, s, tab, lg)}<div class=\"frame package-body\">
 <div class=\"main\">
 {main}</div>
-{side(site, s, ko)}</div>
+{side(site, s, lg)}</div>
 "
 }
 
 /// The page of a standard library tier: it ships with the toolchain, so
 /// there is nothing to install and no versions; its API is in the docs.
-pub fn library_page(site: Site, s: Package, ko: bool = false) -> str {
-    let docs = f"{site.docs}/latest/{if ko { "ko/" } else { "" }}std/{s.name}";
+pub fn library_page(site: Site, s: Package, lg: Lang = Lang::En) -> str {
+    let docs = f"{site.docs}/latest/{lg.dir()}std/{s.name}";
     let code = s.name.replace("-", "_");
     let example = match s.name {
         "bare" => "use bare::mem::size_of;",
@@ -1434,22 +1481,31 @@ pub fn library_page(site: Site, s: Package, ko: bool = false) -> str {
     };
     let n = f"<code class=\"ic\">{esc(s.name)}</code>";
     let line = f"<code class=\"ic\">\"{esc(code)}\"</code>";
-    let text = if ko {
-        f"<p>{n}은 Nabi 표준 라이브러리의 일부로, 모든 도구 모음에 함께 들어 있습니다. 추가하거나 설치할 것이 없고, 여기에는 버전도 없습니다. API는 빌드에 쓰는 도구 모음을 따릅니다.</p>
+    let text = match lg {
+        Lang::Ko => f"<p>{n}은 Nabi 표준 라이브러리의 일부로, 모든 도구 모음에 함께 들어 있습니다. 추가하거나 설치할 것이 없고, 여기에는 버전도 없습니다. API는 빌드에 쓰는 도구 모음을 따릅니다.</p>
 <p>어느 패키지에서든 경로로 씁니다.</p>
 <pre><code class=\"language-nabi\">{nabi_syntax::highlight_nabi(example)}</code></pre>
 <p>매니페스트의 <code class=\"ic\">deps</code>에 {line} 줄이 있으면 에러입니다. {esc(code)}는 도구 모음에 들어 있으니 그 줄을 지우십시오. 이 이름으로는 어떤 패키지도 공개할 수 없습니다.</p>
-<p><a href=\"{esc(docs)}\">{esc(s.name)} API 문서</a></p>"
-    } else {
-        f"<p>{n} is part of the Nabi standard library and ships with every toolchain: there is nothing to add or install, and it has no versions here. Its API follows the toolchain you build with.</p>
+<p><a href=\"{esc(docs)}\">{esc(s.name)} API 문서</a></p>",
+        Lang::ZhHans => f"<p>{n} 是 Nabi 标准库的一部分，随每个工具链提供：无需添加或安装，这里也没有版本。它的 API 跟随你构建时使用的工具链。</p>
+<p>在任何包中都可以通过路径使用它：</p>
+<pre><code class=\"language-nabi\">{nabi_syntax::highlight_nabi(example)}</code></pre>
+<p>清单的 <code class=\"ic\">deps</code> 中出现 {line} 这一行是错误：{esc(code)} 随工具链提供，删除这一行即可。任何包都不能以这个名称发布。</p>
+<p><a href=\"{esc(docs)}\">{esc(s.name)} 的 API 文档</a></p>",
+        Lang::ZhHant => f"<p>{n} 是 Nabi 標準函式庫的一部分，隨每個工具鏈提供：不需要新增或安裝，這裡也沒有版本。它的 API 依照你建置時使用的工具鏈。</p>
+<p>在任何套件中都可以透過路徑使用它：</p>
+<pre><code class=\"language-nabi\">{nabi_syntax::highlight_nabi(example)}</code></pre>
+<p>清單的 <code class=\"ic\">deps</code> 中出現 {line} 這一行是錯誤：{esc(code)} 隨工具鏈提供，刪除這一行即可。任何套件都不能以這個名稱發布。</p>
+<p><a href=\"{esc(docs)}\">{esc(s.name)} 的 API 文件</a></p>",
+        Lang::En => f"<p>{n} is part of the Nabi standard library and ships with every toolchain: there is nothing to add or install, and it has no versions here. Its API follows the toolchain you build with.</p>
 <p>Use it by its path, from any package:</p>
 <pre><code class=\"language-nabi\">{nabi_syntax::highlight_nabi(example)}</code></pre>
 <p>A {line} line in a manifest's <code class=\"ic\">deps</code> is an error: {esc(code)} ships with the toolchain; remove the line. No package can be published under this name.</p>
-<p><a href=\"{esc(docs)}\">API documentation of {esc(s.name)}</a></p>"
+<p><a href=\"{esc(docs)}\">API documentation of {esc(s.name)}</a></p>",
     };
     f"<div class=\"frame package-head\">
-<nav class=\"crumbs\" aria-label=\"{tr(ko, "Breadcrumb", "이동 경로")}\"><a href=\"{lp(ko, "/packages")}\">{tr(ko, "packages", "패키지")}</a> / {esc(s.name)}</nav>
-<div class=\"title\"><span class=\"gl-box {hue_class(s.name)}\">{glyph(s.name, 44, "gl")}</span><div class=\"what\"><div class=\"name-line\"><h1>{esc(s.name)}</h1><span class=\"ver\">{with_toolchain(ko)}</span>{official_badge(ko)}</div><p class=\"t-lead\">{esc(desc_in(s.name, s.desc, true, ko))}</p></div></div>
+<nav class=\"crumbs\" aria-label=\"{tr(lg, "Breadcrumb", "이동 경로", "导航路径", "導覽路徑")}\"><a href=\"{lp(lg, "/packages")}\">{tr(lg, "packages", "패키지", "包", "套件")}</a> / {esc(s.name)}</nav>
+<div class=\"title\"><span class=\"gl-box {hue_class(s.name)}\">{glyph(s.name, 44, "gl")}</span><div class=\"what\"><div class=\"name-line\"><h1>{esc(s.name)}</h1><span class=\"ver\">{with_toolchain(lg)}</span>{official_badge(lg)}</div><p class=\"t-lead\">{esc(desc_in(s.name, s.desc, true, lg))}</p></div></div>
 </div>
 <div class=\"frame package-body\">
 <div class=\"main\">
@@ -1457,42 +1513,42 @@ pub fn library_page(site: Site, s: Package, ko: bool = false) -> str {
 {text}
 </article>
 </div>
-<aside class=\"meta\" aria-label=\"{tr(ko, "Package details", "패키지 정보")}\">
-<dl class=\"kv\"><dt>{tr(ko, "Ships with", "포함")}</dt><dd>{tr(ko, "every nabi toolchain", "모든 nabi 도구 모음")}</dd><dt>{tr(ko, "Docs", "문서")}</dt><dd><a href=\"{esc(docs)}\">{esc(bare(docs))}</a></dd><dt>{tr(ko, "Index file", "index 파일")}</dt><dd class=\"mono\"><a href=\"{esc(site.index_repo)}/blob/main/{esc(s.file)}\">{esc(s.file)}</a></dd></dl>
-<section class=\"owners\" aria-labelledby=\"owners\"><h2 class=\"t-label\" id=\"owners\">{tr(ko, "Owners", "소유자")}</h2><ul class=\"people\"><li><a href=\"https://github.com/nabi-lang\">nabi-lang</a></li></ul></section>
+<aside class=\"meta\" aria-label=\"{tr(lg, "Package details", "패키지 정보", "包详情", "套件詳細資訊")}\">
+<dl class=\"kv\"><dt>{tr(lg, "Ships with", "포함", "随附于", "隨附於")}</dt><dd>{tr(lg, "every nabi toolchain", "모든 nabi 도구 모음", "每个 nabi 工具链", "每個 nabi 工具鏈")}</dd><dt>{tr(lg, "Docs", "문서", "文档", "文件")}</dt><dd><a href=\"{esc(docs)}\">{esc(bare(docs))}</a></dd><dt>{tr(lg, "Index file", "index 파일", "索引文件", "索引檔案")}</dt><dd class=\"mono\"><a href=\"{esc(site.index_repo)}/blob/main/{esc(s.file)}\">{esc(s.file)}</a></dd></dl>
+<section class=\"owners\" aria-labelledby=\"owners\"><h2 class=\"t-label\" id=\"owners\">{tr(lg, "Owners", "소유자", "所有者", "擁有者")}</h2><ul class=\"people\"><li><a href=\"https://github.com/nabi-lang\">nabi-lang</a></li></ul></section>
 </aside>
 </div>
 "
 }
 
-pub fn package_page(site: Site, s: Package, ko: bool = false) -> str {
+pub fn package_page(site: Site, s: Package, lg: Lang = Lang::En) -> str {
     let l = s.latest;
     let readme = if s.readme.is_empty() {
-        tr(ko, "<p class=\"empty\">No README to show: the repository has none, or the build was offline.</p>", "<p class=\"empty\">보여 줄 README가 없습니다. 저장소에 README가 없거나, 빌드가 오프라인이었습니다.</p>")
+        tr(lg, "<p class=\"empty\">No README to show: the repository has none, or the build was offline.</p>", "<p class=\"empty\">보여 줄 README가 없습니다. 저장소에 README가 없거나, 빌드가 오프라인이었습니다.</p>", "<p class=\"empty\">没有可显示的 README：仓库中没有 README，或者构建时处于离线状态。</p>", "<p class=\"empty\">沒有可顯示的 README：儲存庫中沒有 README，或者建置時處於離線狀態。</p>")
     } else {
         let src = packages::web_of(l.url).replace("https://", "");
-        let from = if src.is_empty() { "" } else if ko { f"<p class=\"from t-small\">README 출처: {esc(src)}, 커밋 <span class=\"mono\">{short(l.rev)}</span>.</p>" } else { f"<p class=\"from t-small\">Readme from {esc(src)} at <span class=\"mono\">{short(l.rev)}</span>.</p>" };
+        let from = if src.is_empty() { "" } else { tr(lg, f"<p class=\"from t-small\">Readme from {esc(src)} at <span class=\"mono\">{short(l.rev)}</span>.</p>", f"<p class=\"from t-small\">README 출처: {esc(src)}, 커밋 <span class=\"mono\">{short(l.rev)}</span>.</p>", f"<p class=\"from t-small\">README 来自 {esc(src)}，提交 <span class=\"mono\">{short(l.rev)}</span>。</p>", f"<p class=\"from t-small\">README 來自 {esc(src)}，提交 <span class=\"mono\">{short(l.rev)}</span>。</p>") };
         // The README as its author wrote it, whatever the page's language.
-        f"<article class=\"prose md readme\"{if ko { " lang=\"en\"" } else { "" }}>\n{s.readme}</article>\n{from}"
+        f"<article class=\"prose md readme\"{tr(lg, "", " lang=\"en\"", " lang=\"en\"", " lang=\"en\"")}>\n{s.readme}</article>\n{from}"
     };
-    package_frame(site, s, "readme", readme, ko)
+    package_frame(site, s, "readme", readme, lg)
 }
 
 /// The Versions table's Docs cell of version `v`.
-fn docs_cell(site: Site, s: Package, v: str, ko: bool) -> str {
+fn docs_cell(site: Site, s: Package, v: str, lg: Lang) -> str {
     for x in s.views {
         if x.at != v { continue; }
         let href = esc(docs_url(site, s.name, v));
-        if x.api_none == "" { return f"<a href=\"{href}\">{tr(ko, "docs", "문서")}</a>"; }
+        if x.api_none == "" { return f"<a href=\"{href}\">{tr(lg, "docs", "문서", "文档", "文件")}</a>"; }
         if x.api_none == "failed" {
             let why = if let st: Status = x.docs { st.message } else { "" };
-            return f"<a href=\"{href}\" class=\"tag\" title=\"{esc(why)}\">{tr(ko, "failed", "실패")}</a>";
+            return f"<a href=\"{href}\" class=\"tag\" title=\"{esc(why)}\">{tr(lg, "failed", "실패", "失败", "失敗")}</a>";
         }
     }
-    f"<span class=\"muted\">{tr(ko, "none", "없음")}</span>"
+    f"<span class=\"muted\">{tr(lg, "none", "없음", "无", "無")}</span>"
 }
 
-pub fn versions_page(site: Site, s: Package, ko: bool = false) -> str {
+pub fn versions_page(site: Site, s: Package, lg: Lang = Lang::En) -> str {
     let b = StrBuf::new();
     let counted = false;
     for v in s.versions {
@@ -1500,112 +1556,111 @@ pub fn versions_page(site: Site, s: Package, ko: bool = false) -> str {
     }
     for v in sorted_versions(s) {
         let tags = StrBuf::new();
-        if v.version == s.latest.version && !v.yanked { tags.push_str(f"<span class=\"tag acc\">{tr(ko, "latest", "최신")}</span>"); }
-        let page = esc(href(ko, ver_out(s.name, v.version)));
+        if v.version == s.latest.version && !v.yanked { tags.push_str(f"<span class=\"tag acc\">{tr(lg, "latest", "최신", "最新", "最新")}</span>"); }
+        let page = esc(href(lg, ver_out(s.name, v.version)));
         if v.yanked {
             let why = if v.yank_message.is_empty() { "" } else { f": {v.yank_message}" };
-            let yb = actor_text(v.yanked_by, ko);
-            let said = if ko { f"철회{if yb.is_empty() { "" } else { f" ({yb})" }}{why}" } else { f"yanked{if yb.is_empty() { "" } else { f" by {yb}" }}{why}" };
+            let yb = actor_text(v.yanked_by, lg);
+            let said = tr(lg, f"yanked{if yb.is_empty() { "" } else { f" by {yb}" }}{why}", f"철회{if yb.is_empty() { "" } else { f" ({yb})" }}{why}", f"已撤回{if yb.is_empty() { "" } else { f"（{yb}）" }}{why}", f"已撤回{if yb.is_empty() { "" } else { f"（{yb}）" }}{why}");
             let by = if yb.is_empty() && why.is_empty() { "" } else { f" title=\"{esc(said)}\"" };
-            tags.push_str(f"<span class=\"tag\"{by}>{yanked_tag(ko)}</span>");
+            tags.push_str(f"<span class=\"tag\"{by}>{yanked_tag(lg)}</span>");
         }
-        if packages::is_pre(v.version) { tags.push_str(f"<span class=\"tag\">{tr(ko, "pre-release", "프리릴리스")}</span>"); }
-        if !osv::affecting(s.advisories, s.name, v.version).is_empty() { tags.push_str(f"<span class=\"tag vuln\" title=\"{tr(ko, "A security advisory affects it", "보안 권고가 이 버전에 해당합니다")}\">{tr(ko, "advisory", "보안 권고")}</span>"); }
+        if packages::is_pre(v.version) { tags.push_str(f"<span class=\"tag\">{tr(lg, "pre-release", "프리릴리스", "预发布", "預發行")}</span>"); }
+        if !osv::affecting(s.advisories, s.name, v.version).is_empty() { tags.push_str(f"<span class=\"tag vuln\" title=\"{tr(lg, "A security advisory affects it", "보안 권고가 이 버전에 해당합니다", "有安全公告影响此版本", "有安全性公告影響此版本")}\">{tr(lg, "advisory", "보안 권고", "安全公告", "安全性公告")}</span>"); }
         // The day; the time is in the title.
-        let none_yet = f"<span class=\"muted\">{tr(ko, "unknown", "알 수 없음")}</span>";
+        let none_yet = f"<span class=\"muted\">{tr(lg, "unknown", "알 수 없음", "未知", "不明")}</span>";
         let when = if v.date.is_empty() { none_yet } else { when_tag(v.date, "", true).replace("<time ", f"<time title=\"{esc(when_text(v.date))}\" ") };
         let who = if let a: meta::Actor = v.by {
-            let pb = by_link(a, v.by_name, ko);
-            if pb.is_empty() { none_yet } else if a.via is none { pb } else { f"<span class=\"via\" title=\"{esc(actor_text(a, ko))}\">{pb}</span>" }
+            let pb = by_link(a, v.by_name, lg);
+            if pb.is_empty() { none_yet } else if a.via is none { pb } else { f"<span class=\"via\" title=\"{esc(actor_text(a, lg))}\">{pb}</span>" }
         } else { none_yet };
-        let sz = if let n: i64 = v.meta.size { size(n, ko) } else { none_yet };
-        let tc = if v.nabi_version.is_empty() { f"<span class=\"muted\">{tr(ko, "any", "제한 없음")}</span>" } else { f"<span title=\"{esc(admits(v.nabi_version, ko))}\">{esc(v.nabi_version)}+</span>" };
-        let lic = if v.license.is_empty() { f"<span class=\"muted\">{tr(ko, "none", "없음")}</span>" } else { license_short(v.license) };
-        let dl = if counted { f"<td class=\"num\" title=\"{tr(ko, f"{count_text(v.recent)} in the last 90 days", f"최근 90일 {count_text(v.recent)}")}\">{count_text(v.downloads)}</td>" } else { "" };
-        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td class=\"ver\"><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{lic}</td><td class=\"num\">{sz}</td>{dl}<td>{tc}</td><td class=\"links\">{docs_cell(site, s, v.version, ko)}<span class=\"sep\" aria-hidden=\"true\"> · </span>{commit_link(v)}</td></tr>");
+        let sz = if let n: i64 = v.meta.size { size(n, lg) } else { none_yet };
+        let tc = if v.nabi_version.is_empty() { f"<span class=\"muted\">{tr(lg, "any", "제한 없음", "不限", "不限")}</span>" } else { f"<span title=\"{esc(admits(v.nabi_version, lg))}\">{esc(v.nabi_version)}+</span>" };
+        let lic = if v.license.is_empty() { f"<span class=\"muted\">{tr(lg, "none", "없음", "无", "無")}</span>" } else { license_short(v.license) };
+        let dl = if counted { f"<td class=\"num\" title=\"{tr(lg, f"{count_text(v.recent)} in the last 90 days", f"최근 90일 {count_text(v.recent)}", f"最近 90 天 {count_text(v.recent)}", f"最近 90 天 {count_text(v.recent)}")}\">{count_text(v.downloads)}</td>" } else { "" };
+        b.push_str(f"<tr{if v.yanked { " class=\"yanked\"" } else { "" }}><td class=\"ver\"><a class=\"v\" href=\"{page}\">{esc(v.version)}</a>{tags.to_str()}</td><td>{when}</td><td class=\"by\">{who}</td><td>{lic}</td><td class=\"num\">{sz}</td>{dl}<td>{tc}</td><td class=\"links\">{docs_cell(site, s, v.version, lg)}<span class=\"sep\" aria-hidden=\"true\"> · </span>{commit_link(v)}</td></tr>");
     }
-    let (summary, about) = if ko {
-        ("새 버전부터, 시각은 UTC입니다. 열 설명", f"공개는 버전의 줄이 index에 추가된 때입니다. 크기는 <code class=\"ic\">nabi publish</code>가 묶은 패키지의 크기입니다{if counted { ". 내려받기는 소스 보관본의 전체 기간 수이며, 마우스를 올리면 최근 90일 수가 보입니다" } else { "" }}. Nabi는 빌드할 수 있는 가장 오래된 도구 모음입니다. <code class=\"ic\">0.1.0+</code>는 0.1.0 이상의 0.1.x를 뜻합니다. 커밋의 제목에 전체 해시가 있고, 트리 해시는 버전 페이지에 있습니다. 철회된 버전은 그 버전을 고정한 프로젝트를 위해 index에 남고, 새로 의존성을 풀 때는 건너뜁니다.")
-    } else {
-        ("Newest first, times in UTC. About these columns", f"Published is when the version's line was added to the index. Size is the package as <code class=\"ic\">nabi publish</code> packed it{if counted { "; downloads are of its source archive, all time (hover for the last 90 days)" } else { "" }}. Nabi is the oldest toolchain it builds with: <code class=\"ic\">0.1.0+</code> means 0.1.0 or a later 0.1.x. The commit's title holds its full hash; the version's page has its tree hash. A yanked version stays in the index for the projects that pinned it; new resolves skip it.")
+    let dl_note = if counted { tr(lg, "; downloads are of its source archive, all time (hover for the last 90 days)", ". 내려받기는 소스 보관본의 전체 기간 수이며, 마우스를 올리면 최근 90일 수가 보입니다", "；下载次数是源代码压缩包的累计下载量（悬停可查看最近 90 天）", "；下載次數是原始碼壓縮檔的累計下載量（滑鼠移上去可查看最近 90 天）") } else { "" };
+    let (summary, about) = match lg {
+        Lang::Ko => ("새 버전부터, 시각은 UTC입니다. 열 설명", f"공개는 버전의 줄이 index에 추가된 때입니다. 크기는 <code class=\"ic\">nabi publish</code>가 묶은 패키지의 크기입니다{dl_note}. Nabi는 빌드할 수 있는 가장 오래된 도구 모음입니다. <code class=\"ic\">0.1.0+</code>는 0.1.0 이상의 0.1.x를 뜻합니다. 커밋의 제목에 전체 해시가 있고, 트리 해시는 버전 페이지에 있습니다. 철회된 버전은 그 버전을 고정한 프로젝트를 위해 index에 남고, 새로 의존성을 풀 때는 건너뜁니다."),
+        Lang::ZhHans => ("从新到旧，时间为 UTC。关于这些列", f"发布时间是该版本的行加入索引的时间。大小是 <code class=\"ic\">nabi publish</code> 打包后的包大小{dl_note}。Nabi 是能构建它的最旧工具链：<code class=\"ic\">0.1.0+</code> 表示 0.1.0 或更高的 0.1.x。提交的标题里有完整哈希，版本页面上有树哈希。已撤回的版本仍留在索引中，供固定了它的项目使用；新的依赖解析会跳过它。"),
+        Lang::ZhHant => ("由新到舊，時間為 UTC。關於這些欄位", f"發布時間是該版本的行加入索引的時間。大小是 <code class=\"ic\">nabi publish</code> 打包後的套件大小{dl_note}。Nabi 是能建置它的最舊工具鏈：<code class=\"ic\">0.1.0+</code> 表示 0.1.0 或更新的 0.1.x。提交的標題裡有完整雜湊，版本頁面上有樹雜湊。已撤回的版本仍留在索引中，供固定了它的專案使用；新的相依解析會跳過它。"),
+        Lang::En => ("Newest first, times in UTC. About these columns", f"Published is when the version's line was added to the index. Size is the package as <code class=\"ic\">nabi publish</code> packed it{dl_note}. Nabi is the oldest toolchain it builds with: <code class=\"ic\">0.1.0+</code> means 0.1.0 or a later 0.1.x. The commit's title holds its full hash; the version's page has its tree hash. A yanked version stays in the index for the projects that pinned it; new resolves skip it."),
     };
-    let th = |en: str, kr: str, cls: str| f"<th scope=\"col\"{cls}>{tr(ko, en, kr)}</th>";
+    let th = |text: str, cls: str| f"<th scope=\"col\"{cls}>{text}</th>";
     let num = " class=\"num\"";
-    let head = th("Version", "버전", "") + th("Published", "공개", "") + th("By", "공개한 사람", "") + th("License", "라이선스", "") + th("Size", "크기", num) + (if counted { th("Downloads", "내려받기", num) } else { "" }) + th("Nabi", "Nabi", "") + th("Docs · commit", "문서 · 커밋", "");
-    let body = f"<h2 class=\"t-h3\">{count_of(ko, s.versions.len(), "version", "versions", "버전")}</h2>
+    let head = th(tr(lg, "Version", "버전", "版本", "版本"), "") + th(tr(lg, "Published", "공개", "发布", "發布"), "") + th(tr(lg, "By", "공개한 사람", "发布者", "發布者"), "") + th(tr(lg, "License", "라이선스", "许可证", "授權條款"), "") + th(tr(lg, "Size", "크기", "大小", "大小"), num) + (if counted { th(tr(lg, "Downloads", "내려받기", "下载", "下載"), num) } else { "" }) + th("Nabi", "") + th(tr(lg, "Docs · commit", "문서 · 커밋", "文档 · 提交", "文件 · 提交"), "");
+    let body = f"<h2 class=\"t-h3\">{count_of(lg, s.versions.len(), "version", "versions", "버전", "个版本", "個版本")}</h2>
 <details class=\"about t-ui\"><summary>{summary}</summary><p class=\"muted\">{about}</p></details>
 <div class=\"table-wrap\"><table class=\"tbl vtbl\"><thead><tr>{head}</tr></thead><tbody>{b.to_str()}</tbody></table></div>
 ";
-    package_frame(site, s, "versions", body, ko)
+    package_frame(site, s, "versions", body, lg)
 }
 
-fn dep_rows(have: Set<str>, deps: List<packages::Req>, kind: str, ko: bool) -> str {
+fn dep_rows(have: Set<str>, deps: List<packages::Req>, kind: str, lg: Lang) -> str {
     let b = StrBuf::new();
     for d in deps {
         if d.kind != kind { continue; }
         let dn = packages::real(d);
         let name = if !d.registry.is_empty() {
-            f"<span class=\"mono\">{esc(dn)}</span> <span class=\"tag\" title=\"{esc(d.registry)}\">{tr(ko, "other index", "다른 index")}</span>"
+            f"<span class=\"mono\">{esc(dn)}</span> <span class=\"tag\" title=\"{esc(d.registry)}\">{tr(lg, "other index", "다른 index", "其他索引", "其他索引")}</span>"
         } else if have.contains(dn) {
-            f"<a class=\"mono\" href=\"{esc(href(ko, package_out(dn)))}\">{esc(dn)}</a>"
+            f"<a class=\"mono\" href=\"{esc(href(lg, package_out(dn)))}\">{esc(dn)}</a>"
         } else {
-            f"<span class=\"mono\">{esc(dn)}</span> <span class=\"tag\">{tr(ko, "not in index", "index에 없음")}</span>"
+            f"<span class=\"mono\">{esc(dn)}</span> <span class=\"tag\">{tr(lg, "not in index", "index에 없음", "不在索引中", "不在索引中")}</span>"
         };
-        let alias = if dn == d.name { "" } else { f" <span class=\"muted\">{tr(ko, "as", "별칭")}</span> <span class=\"mono\">{esc(d.name)}</span>" };
-        let only = if d.target.is_empty() { "" } else { f" <span class=\"tag\" title=\"{tr(ko, "only for this target", "이 대상에서만")}\">{esc(d.target)}</span>" };
+        let alias = if dn == d.name { "" } else { f" <span class=\"muted\">{tr(lg, "as", "별칭", "别名", "別名")}</span> <span class=\"mono\">{esc(d.name)}</span>" };
+        let only = if d.target.is_empty() { "" } else { f" <span class=\"tag\" title=\"{tr(lg, "only for this target", "이 대상에서만", "仅用于此目标", "僅用於此目標")}\">{esc(d.target)}</span>" };
         b.push_str(f"<tr><td>{name}{alias}{only}</td><td class=\"mono\">{esc(d.req)}</td></tr>");
     }
     b.to_str()
 }
 
-fn dep_table(rows: str, ko: bool) -> str {
-    f"<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">{tr(ko, "Package", "패키지")}</th><th scope=\"col\">{tr(ko, "Requirement", "요구 버전")}</th></tr></thead><tbody>{rows}</tbody></table></div>"
+fn dep_table(rows: str, lg: Lang) -> str {
+    f"<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">{tr(lg, "Package", "패키지", "包", "套件")}</th><th scope=\"col\">{tr(lg, "Requirement", "요구 버전", "版本要求", "版本需求")}</th></tr></thead><tbody>{rows}</tbody></table></div>"
 }
 
-pub fn deps_page(site: Site, s: Package, have: Set<str>, ko: bool = false) -> str {
+pub fn deps_page(site: Site, s: Package, have: Set<str>, lg: Lang = Lang::En) -> str {
     let l = s.latest;
-    let deps = dep_rows(have, l.deps, "normal", ko);
-    let dev = dep_rows(have, l.deps, "dev", ko);
+    let deps = dep_rows(have, l.deps, "normal", lg);
+    let dev = dep_rows(have, l.deps, "dev", lg);
     let b = StrBuf::new();
-    b.push_str(f"<h2 class=\"t-h3\">{tr(ko, f"Dependencies of {esc(l.version)}", f"{esc(l.version)}의 의존성")}</h2>\n");
-    b.push_str(if deps.is_empty() { tr(ko, "<p class=\"empty\">None. This package builds on the standard library alone.</p>\n", "<p class=\"empty\">없습니다. 이 패키지는 표준 라이브러리만으로 빌드됩니다.</p>\n") } else { dep_table(deps, ko) });
-    if !dev.is_empty() { b.push_str(f"<h2 class=\"t-h3\">{tr(ko, "Dev dependencies", "개발 의존성")}</h2>\n<p class=\"t-ui muted\">{tr(ko, "Used by its tests and examples only.", "테스트와 예제에서만 씁니다.")}</p>\n{dep_table(dev, ko)}"); }
+    b.push_str(f"<h2 class=\"t-h3\">{tr(lg, f"Dependencies of {esc(l.version)}", f"{esc(l.version)}의 의존성", f"{esc(l.version)} 的依赖", f"{esc(l.version)} 的相依套件")}</h2>\n");
+    b.push_str(if deps.is_empty() { tr(lg, "<p class=\"empty\">None. This package builds on the standard library alone.</p>\n", "<p class=\"empty\">없습니다. 이 패키지는 표준 라이브러리만으로 빌드됩니다.</p>\n", "<p class=\"empty\">无。此包只依赖标准库构建。</p>\n", "<p class=\"empty\">無。此套件只靠標準函式庫建置。</p>\n") } else { dep_table(deps, lg) });
+    if !dev.is_empty() { b.push_str(f"<h2 class=\"t-h3\">{tr(lg, "Dev dependencies", "개발 의존성", "开发依赖", "開發相依套件")}</h2>\n<p class=\"t-ui muted\">{tr(lg, "Used by its tests and examples only.", "테스트와 예제에서만 씁니다.", "仅用于测试和示例。", "僅用於測試與範例。")}</p>\n{dep_table(dev, lg)}"); }
     if !l.features.is_empty() {
         let fs = StrBuf::new();
         for (name, on) in l.features {
             let what = StrBuf::new();
             for e in on { what.push_str(f"<code class=\"ic\">{esc(e)}</code> "); }
-            fs.push_str(f"<tr><td class=\"mono\">{esc(name)}</td><td>{if what.is_empty() { f"<span class=\"muted\">{tr(ko, "nothing else", "다른 것 없음")}</span>" } else { what.to_str() }}</td></tr>");
+            fs.push_str(f"<tr><td class=\"mono\">{esc(name)}</td><td>{if what.is_empty() { f"<span class=\"muted\">{tr(lg, "nothing else", "다른 것 없음", "无其他", "無其他")}</span>" } else { what.to_str() }}</td></tr>");
         }
-        b.push_str(f"<h2 class=\"t-h3\">{tr(ko, "Features", "기능")}</h2>\n<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">{tr(ko, "Feature", "기능")}</th><th scope=\"col\">{tr(ko, "Turns on", "함께 켜는 것")}</th></tr></thead><tbody>{fs.to_str()}</tbody></table></div>\n");
+        b.push_str(f"<h2 class=\"t-h3\">{tr(lg, "Features", "기능", "特性", "功能特性")}</h2>\n<div class=\"table-wrap\"><table class=\"tbl\"><thead><tr><th scope=\"col\">{tr(lg, "Feature", "기능", "特性", "功能特性")}</th><th scope=\"col\">{tr(lg, "Turns on", "함께 켜는 것", "同时启用", "一併啟用")}</th></tr></thead><tbody>{fs.to_str()}</tbody></table></div>\n");
     }
-    package_frame(site, s, "dependencies", b.to_str(), ko)
+    package_frame(site, s, "dependencies", b.to_str(), lg)
 }
 
-pub fn dependents_page(site: Site, s: Package, ko: bool = false) -> str {
+pub fn dependents_page(site: Site, s: Package, lg: Lang = Lang::En) -> str {
     let b = StrBuf::new();
-    b.push_str(f"<h2 class=\"t-h3\">{tr(ko, f"Packages that depend on {esc(s.name)}", f"{esc(s.name)}에 의존하는 패키지")}</h2>\n<p class=\"t-ui muted\">{tr(ko, "Counted from the latest version of every package in the index.", "index에 있는 모든 패키지의 최신 버전에서 셉니다.")}</p>\n");
+    b.push_str(f"<h2 class=\"t-h3\">{tr(lg, f"Packages that depend on {esc(s.name)}", f"{esc(s.name)}에 의존하는 패키지", f"依赖 {esc(s.name)} 的包", f"相依於 {esc(s.name)} 的套件")}</h2>\n<p class=\"t-ui muted\">{tr(lg, "Counted from the latest version of every package in the index.", "index에 있는 모든 패키지의 최신 버전에서 셉니다.", "根据索引中每个包的最新版本统计。", "根據索引中每個套件的最新版本統計。")}</p>\n");
     if s.rdeps.is_empty() {
-        b.push_str(tr(ko, "<p class=\"empty\">None yet.</p>\n", "<p class=\"empty\">아직 없습니다.</p>\n"));
+        b.push_str(tr(lg, "<p class=\"empty\">None yet.</p>\n", "<p class=\"empty\">아직 없습니다.</p>\n", "<p class=\"empty\">暂无。</p>\n", "<p class=\"empty\">目前沒有。</p>\n"));
     } else {
         let rows = StrBuf::new();
         for d in s.rdeps {
-            rows.push_str(f"<tr><td><a class=\"mono\" href=\"{esc(href(ko, package_out(d.name)))}\">{esc(d.name)}</a></td><td class=\"mono\">{esc(d.req)}</td></tr>");
+            rows.push_str(f"<tr><td><a class=\"mono\" href=\"{esc(href(lg, package_out(d.name)))}\">{esc(d.name)}</a></td><td class=\"mono\">{esc(d.req)}</td></tr>");
         }
-        b.push_str(dep_table(rows.to_str(), ko));
+        b.push_str(dep_table(rows.to_str(), lg));
     }
-    package_frame(site, s, "dependents", b.to_str(), ko)
+    package_frame(site, s, "dependents", b.to_str(), lg)
 }
 
-/// Body of `404.html` (`ko/404.html` in Korean), the 404 every Nabi site
-/// shares; search.js names the path.
-pub fn not_found(ko: bool = false) -> str {
-    if ko {
-        let sentence = "이 주소에는 패키지나 페이지가 없습니다: <code id=\"lost-path\">이 주소</code>. <kbd class=\"kbd\">/</kbd>로 검색하거나, 다음으로 이동하십시오.";
-        return f"<div class=\"frame lost-page\">{chrome::not_found("페이지를 찾을 수 없습니다", sentence, [("/ko/packages", "모든 패키지"), ("/ko/publishing", "패키지 공개"), ("/ko", "레지스트리 홈")])}</div>\n";
-    }
-    let sentence = "There is no package or page at <code id=\"lost-path\">this address</code>. Search with <kbd class=\"kbd\">/</kbd>, or go to:";
-    f"<div class=\"frame lost-page\">{chrome::not_found("Page not found", sentence, [("/packages", "All packages"), ("/publishing", "Publishing"), ("/", "Registry home")])}</div>\n"
+/// Body of `404.html` (`ko/404.html` and so on in each language), the
+/// 404 every Nabi site shares; search.js names the path.
+pub fn not_found(lg: Lang = Lang::En) -> str {
+    let sentence = tr(lg, "There is no package or page at <code id=\"lost-path\">this address</code>. Search with <kbd class=\"kbd\">/</kbd>, or go to:", "이 주소에는 패키지나 페이지가 없습니다: <code id=\"lost-path\">이 주소</code>. <kbd class=\"kbd\">/</kbd>로 검색하거나, 다음으로 이동하십시오.", "<code id=\"lost-path\">这个地址</code>上没有包或页面。按 <kbd class=\"kbd\">/</kbd> 搜索，或前往：", "<code id=\"lost-path\">這個網址</code>上沒有套件或頁面。按 <kbd class=\"kbd\">/</kbd> 搜尋，或前往：");
+    let links: List<(str, str)> = [(lp(lg, "/packages"), tr(lg, "All packages", "모든 패키지", "所有包", "所有套件")), (lp(lg, "/publishing"), tr(lg, "Publishing", "패키지 공개", "发布包", "發布套件")), (lp(lg, "/"), tr(lg, "Registry home", "레지스트리 홈", "注册表首页", "登錄庫首頁"))];
+    f"<div class=\"frame lost-page\">{chrome::not_found(lg.words().not_found, sentence, links)}</div>\n"
 }
 
 #[cfg(test)]
@@ -1685,6 +1740,18 @@ fn publishers() {
     assert(actor_link(anon) == w2, actor_link(anon));
     let wf = meta::Actor { id: 0i64, login: "github:acme/geom/.github/workflows/publish.yml@refs/tags/v1", at: 1i64 };
     assert(actor_link(wf).contains("(trusted publishing)"), actor_link(wf));
+}
+
+#[test]
+fn languages() {
+    assert(lp(Lang::ZhHant, "/") == "/zh-hant" && lp(Lang::ZhHans, "/?q=x") == "/zh-hans?q=x" && lp(Lang::En, "/me") == "/me" && in_lang("index.html", Lang::Ko) == "ko/index.html", "paths");
+    assert(lang_of("zh-hans/packages/json.html") == Lang::ZhHans && lang_of("kolkata.html") == Lang::En && publishing_href(Lang::ZhHant) == "/zh-hant/publishing#發布套件", "languages of paths");
+    assert(login_button(Lang::En) == LOGIN_BUTTON && login_button(Lang::ZhHans).contains("href=\"/zh-hans/login\""), "login buttons");
+    let menu = signed_in(f"<header>{login_button(Lang::ZhHant)}</header>", "ann", 5i64, "c");
+    assert(menu.contains("aria-label=\"ann 的帳戶選單\"") && menu.contains("<a href=\"/zh-hant/me\">帳戶</a>") && menu.contains("action=\"/zh-hant/logout\""), menu);
+    let (title, body) = list_page([row("json", "JSON values", List::new(), 1i64)], "json", "", Lang::ZhHans);
+    assert(title == "搜索：json" && body.contains("1 个包与 <q>json</q> 匹配") && body.contains("action=\"/zh-hans/packages\""), body);
+    assert(why_text("name, description and keywords", Lang::ZhHant) == "名稱、描述、關鍵字" && size(10i64, Lang::ZhHans) == "10 字节", "words");
 }
 
 #[test]

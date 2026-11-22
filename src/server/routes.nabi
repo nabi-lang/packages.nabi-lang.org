@@ -5,16 +5,18 @@
 use pkg::Site;
 use pkg::json;
 use pkg::layout;
+use pkg::layout::{Lang, lp, tr};
 use pkg::server::account::account_route;
 use pkg::server::api::{api_route, open_to_all, wants_json};
 use pkg::server::auth::{callback, login};
 use pkg::server::limit;
-use pkg::server::{Cfg, Resp, html, HTML_CACHE, IMMUTABLE, ko_path, message, shared_html};
+use pkg::server::{Cfg, Resp, html, HTML_CACHE, IMMUTABLE, lang_path, message, shared_html};
 use std::fs;
 use std::nabion;
 use std::thread;
 use web::http;
 use web::http::Request;
+use web::lang;
 use web::url;
 
 /// An OG card asked for by the version render.ts drew it from (the `.v`
@@ -59,8 +61,8 @@ pub fn health(site: Site) -> Resp {
 /// case, else a 404 naming the package (or its missing version) and the
 /// closest names. None when `name` is a package and the page is something
 /// else.
-fn missing_package(site: Site, p: str, rest: str, query: str, ko: bool) -> Resp | none {
-    let at = |x: str| layout::lp(ko, x);
+fn missing_package(site: Site, p: str, rest: str, query: str, lg: Lang) -> Resp | none {
+    let at = |x: str| layout::lp(lg, x);
     let (raw, tail) = rest.split_once("/") ?? (rest, "");
     let name = http::pct_decode(raw, false) ?? raw;
     let names: List<str> = List::new();
@@ -75,20 +77,18 @@ fn missing_package(site: Site, p: str, rest: str, query: str, ko: bool) -> Resp 
         }
         let near: List<(str, str)> = List::new();
         for n in layout::closest(names, name) { near.push((at("/packages/" + n), n)); }
-        let sentence = if ko {
-            if near.is_empty() { "index에 그런 이름은 없습니다. <kbd class=\"kbd\">/</kbd>로 검색하거나, 다음으로 이동하십시오." } else { "이름이 비슷한 패키지:" }
-        } else if near.is_empty() { "Nothing in the index has that name. Search with <kbd class=\"kbd\">/</kbd>, or go to:" } else { "Packages with a similar name:" };
-        near.push((at("/packages"), layout::tr(ko, "All packages", "모든 패키지")));
-        near.push((at("/publishing"), layout::tr(ko, "Publishing a package", "패키지 공개하기")));
-        let title = layout::tr(ko, f"No package named {name}", f"{name}(이)라는 패키지가 없습니다");
+        let sentence = if near.is_empty() { tr(lg, "Nothing in the index has that name. Search with <kbd class=\"kbd\">/</kbd>, or go to:", "index에 그런 이름은 없습니다. <kbd class=\"kbd\">/</kbd>로 검색하거나, 다음으로 이동하십시오.", "索引中没有这个名称。按 <kbd class=\"kbd\">/</kbd> 搜索，或前往：", "索引中沒有這個名稱。按 <kbd class=\"kbd\">/</kbd> 搜尋，或前往：") } else { tr(lg, "Packages with a similar name:", "이름이 비슷한 패키지:", "名称相近的包：", "名稱相近的套件：") };
+        near.push((at("/packages"), layout::tr(lg, "All packages", "모든 패키지", "所有包", "所有套件")));
+        near.push((at("/publishing"), layout::tr(lg, "Publishing a package", "패키지 공개하기", "发布包", "發布套件")));
+        let title = layout::tr(lg, f"No package named {name}", f"{name}(이)라는 패키지가 없습니다", f"没有名为 {name} 的包", f"沒有名為 {name} 的套件");
         let body = f"<div class=\"frame lost-page\">{web::chrome::not_found(title, sentence, near)}</div>\n";
         return html(404, layout::page(site, p[1:], title, body));
     }
     let ver = (tail.split_once("/") ?? (tail, "")).0;
     if !ver.is_empty() && ver.byte(0) >= 48u8 && ver.byte(0) <= 57u8 {
-        let links: List<(str, str)> = [(at(f"/packages/{name}/versions"), layout::tr(ko, f"Versions of {name}", f"{name}의 버전")), (at(f"/packages/{name}"), layout::tr(ko, f"{name}, latest version", f"{name} 최신 버전"))];
-        let title = layout::tr(ko, f"No version {ver} of {name}", f"{name}에는 {ver} 버전이 없습니다");
-        let body = f"<div class=\"frame lost-page\">{web::chrome::not_found(title, layout::tr(ko, "The index has no such version. Go to:", "index에 그런 버전이 없습니다. 다음으로 이동하십시오."), links)}</div>\n";
+        let links: List<(str, str)> = [(at(f"/packages/{name}/versions"), layout::tr(lg, f"Versions of {name}", f"{name}의 버전", f"{name} 的版本", f"{name} 的版本")), (at(f"/packages/{name}"), layout::tr(lg, f"{name}, latest version", f"{name} 최신 버전", f"{name} 的最新版本", f"{name} 的最新版本"))];
+        let title = layout::tr(lg, f"No version {ver} of {name}", f"{name}에는 {ver} 버전이 없습니다", f"{name} 没有 {ver} 版本", f"{name} 沒有 {ver} 版本");
+        let body = f"<div class=\"frame lost-page\">{web::chrome::not_found(title, layout::tr(lg, "The index has no such version. Go to:", "index에 그런 버전이 없습니다. 다음으로 이동하십시오.", "索引中没有这个版本。前往：", "索引中沒有這個版本。前往："), links)}</div>\n";
         return html(404, layout::page(site, p[1:], title, body));
     }
     none
@@ -113,8 +113,11 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     }
     // One privacy notice and one set of terms for every Nabi site, on
     // nabi-lang.org (web::chrome::legal_links).
-    for (from, to) in [("/privacy", "https://nabi-lang.org/privacy"), ("/terms", "https://nabi-lang.org/terms"), ("/ko/privacy", "https://nabi-lang.org/ko/privacy"), ("/ko/terms", "https://nabi-lang.org/ko/terms")] {
-        if p == from { return Resp { status: 301, headers: ["Location: " + to, "Cache-Control: public, max-age=86400"], body: "", file: "" }; }
+    for lg in lang::ALL {
+        for page in ["/privacy", "/terms"] {
+            let from = lp(lg, page);
+            if p == from { return Resp { status: 301, headers: ["Location: https://nabi-lang.org" + from, "Cache-Control: public, max-age=86400"], body: "", file: "" }; }
+        }
     }
     if p.starts_with("/api/") { return api_route(cfg, r, client); }
     if p.starts_with("/img/") {
@@ -138,12 +141,12 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     }
     let post = r.method == "POST";
     let get = r.method == "GET" || r.method == "HEAD";
-    // The Korean pages: `/ko` and `/ko/..`, routed as the English path
-    // (`bare`) with Korean chrome.
-    let ko = ko_path(p);
-    let bare = unko(p);
+    // The pages in another language: `/ko`, `/zh-hans/..` and the like,
+    // routed as the English path (`bare`) with the chrome in that language.
+    let lg = lang_path(p);
+    let bare = unlang(p);
     if (bare == "/login" || p == "/auth/github/callback") && get && !limit::allow("login:" + client, limit::LOGINS) {
-        let m = message(site, p, 429, "Too many logins", "Wait a minute, then log in again.", "로그인이 너무 많습니다", "1분 기다린 뒤 다시 로그인하십시오.");
+        let m = message(site, p, 429, tr(lg, "Too many logins", "로그인이 너무 많습니다", "登录次数过多", "登入次數過多"), tr(lg, "Wait a minute, then log in again.", "1분 기다린 뒤 다시 로그인하십시오.", "请等一分钟，然后重新登录。", "請等一分鐘，然後重新登入。"));
         m.headers.push("Retry-After: 60");
         return m;
     }
@@ -152,11 +155,11 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     if (bare == "/me" && get) || (post && is_account_form(bare)) {
         return try account_route(cfg, site, r, client);
     }
-    if !get { return message(site, p, 405, "Method not allowed", "Only GET here: pages are read with GET, and forms are sent from the account page.", "허용되지 않는 메서드", "여기서는 GET만 받습니다. 페이지는 GET으로 읽고, 양식은 계정 페이지에서 보냅니다."); }
+    if !get { return message(site, p, 405, tr(lg, "Method not allowed", "허용되지 않는 메서드", "不允许的请求方法", "不允許的請求方法"), tr(lg, "Only GET here: pages are read with GET, and forms are sent from the account page.", "여기서는 GET만 받습니다. 페이지는 GET으로 읽고, 양식은 계정 페이지에서 보냅니다.", "这里只接受 GET：页面用 GET 读取，表单从账户页面提交。", "這裡只接受 GET：頁面用 GET 讀取，表單從帳戶頁面送出。")); }
     // A search or a misspelt package name scans every name.
     let costly = (bare == "/packages" && !r.query.is_empty()) || (bare.starts_with("/packages/") && http::page_file(site.out, p) is none);
     if costly && !limit::allow("read:" + client, limit::READS) {
-        let m = message(site, p, 429, "Too many requests", "Wait a minute, then try again.", "요청이 너무 많습니다", "1분 기다린 뒤 다시 시도하십시오.");
+        let m = message(site, p, 429, tr(lg, "Too many requests", "요청이 너무 많습니다", "请求过多", "請求過多"), tr(lg, "Wait a minute, then try again.", "1분 기다린 뒤 다시 시도하십시오.", "请等一分钟，然后重试。", "請等一分鐘，然後再試一次。"));
         m.headers.push("Retry-After: 60");
         return m;
     }
@@ -170,8 +173,8 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
         let q = f.get("q") ?? "";
         let sort = f.get("sort") ?? "";
         if !q.trim().is_empty() || !sort.is_empty() {
-            let (title, body) = layout::list_page(rows(site), q, sort, ko);
-            let out = layout::in_lang("packages/index.html", ko);
+            let (title, body) = layout::list_page(rows(site), q, sort, lg);
+            let out = layout::in_lang("packages/index.html", lg);
             return shared_html(200, layout::page_desc(site, out, title, "", body, "", "", "", r.query));
         }
     }
@@ -180,7 +183,7 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     if let rest: str = bare.strip_prefix("/packages/") {
         let seg = (rest.split_once("/") ?? (rest, "")).0;
         if seg != seg.to_lowercase() {
-            if let m: Resp = missing_package(site, p, rest, r.query, ko) { return m; }
+            if let m: Resp = missing_package(site, p, rest, r.query, lg) { return m; }
         }
     }
     // A rebuild renames `public/` away and the new site into its place
@@ -195,20 +198,16 @@ pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
         }
     }
     if let rest: str = bare.strip_prefix("/packages/") {
-        if let m: Resp = missing_package(site, p, rest, r.query, ko) { return m; }
+        if let m: Resp = missing_package(site, p, rest, r.query, lg) { return m; }
     }
     // The 404 every Nabi site shares, as public/404.html has it.
-    html(404, layout::page(site, p[1:], layout::tr(ko, "Not found", "페이지 없음"), layout::not_found(ko)))
+    html(404, layout::page(site, p[1:], layout::tr(lg, "Not found", "페이지 없음", "页面不存在", "找不到頁面"), layout::not_found(lg)))
 }
 
-/// `p` without its `/ko` (`/ko` is `/`).
-pub fn unko(p: str) -> str {
-    if p == "/ko" { return "/"; }
-    if let x: str = p.strip_prefix("/ko/") { return "/" + x; }
-    p
-}
+/// `p` without its language directory (`/ko`, `/zh-hans`; alone, `/`).
+pub fn unlang(p: str) -> str { lang::split(p).1 }
 
-/// Whether `p` (without `/ko`) is a form the account pages take.
+/// Whether `p` (without its language) is a form the account pages take.
 fn is_account_form(p: str) -> bool {
     p == "/logout" || p == "/me/tokens" || (p.starts_with("/me/tokens/") && p.ends_with("/revoke")) || p == "/me/trusted" || (p.starts_with("/me/trusted/") && p.ends_with("/remove")) || p == "/me/owners" || p == "/me/owners/remove" || p == "/me/invites/accept" || p == "/me/invites/decline" || p == "/me/notices" || p == "/me/versions/delete" || p == "/me/sessions/logout-all" || (p.starts_with("/me/sessions/") && p.ends_with("/logout"))
 }

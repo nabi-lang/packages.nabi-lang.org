@@ -1,11 +1,12 @@
 // The account pages: `/me` with its tokens, trusted publishers and
-// owners, and the forms that change them; in Korean under `/ko/me`, whose
-// forms post to `/ko/me/..` and lead back there.
+// owners, and the forms that change them; in each other language under
+// `/ko/me`, `/zh-hans/me` and the like, whose forms post to `/ko/me/..`
+// and lead back there. Mail notices stay in English.
 
 use pkg::Site;
 use pkg::index;
 use pkg::layout;
-use pkg::layout::{lp, tr};
+use pkg::layout::{Lang, lp, tr};
 use pkg::meta;
 use pkg::secret;
 use pkg::server::admin::{Audit, audit};
@@ -13,9 +14,9 @@ use pkg::server::delete;
 use pkg::server::limit;
 use pkg::server::mail;
 use pkg::server::owners::{accept_invite, add_owner, add_trusted, managed, may_manage, remove_owner, remove_trusted};
-use pkg::server::routes::unko;
+use pkg::server::routes::unlang;
 use pkg::server::store::{Account, Db, Event, SCOPE_ADMIN, SESSION_COOKIE, SESSION_IDLE, SESSION_SECS, Session, TOKEN_DAYS, TOKEN_DAYS_MAX, Token, account_of, default_scopes, events_of, invites_of, load_db, now_secs, owned_by, record, save_db, scopes, seen_at, session_end, session_id, session_of};
-use pkg::server::{Cfg, Resp, cookie, is_admin, ko_path, LOCK, may_act, message, page, redirect, refusal};
+use pkg::server::{Cfg, Resp, cookie, is_admin, lang_path, LOCK, may_act, message, page, redirect, refusal};
 use pkg::trust;
 use pkg::trust::TrustedPublisher;
 use markdown::esc;
@@ -41,31 +42,29 @@ pub fn date(t: i64) -> str {
     f"{y}-{p2(m)}-{p2(d)}"
 }
 
-/// date() on a page: `never` is `없음` in Korean.
-fn day(t: i64, ko: bool) -> str { if t <= 0i64 { tr(ko, "never", "없음") } else { date(t) } }
+/// date() on a page: `never` in the page's language.
+fn day(t: i64, lg: Lang) -> str { if t <= 0i64 { tr(lg, "never", "없음", "从未", "從未") } else { date(t) } }
 
 /// What a token scope lets it do, as the account page says it.
-fn scope_text(name: str, what: str, ko: bool) -> str {
-    if !ko { return what; }
+fn scope_text(name: str, what: str, lg: Lang) -> str {
     match name {
-        "publish-update" => "패키지의 새 버전 공개",
-        "publish-new" => "새 패키지(첫 버전) 공개",
-        "yank" => "버전 철회와 철회 취소",
-        "owners" => "소유자와 신뢰할 수 있는 게시자 변경",
-        "admin" => "관리(관리자만)",
+        "publish-update" => tr(lg, what, "패키지의 새 버전 공개", "发布包的新版本", "發布套件的新版本"),
+        "publish-new" => tr(lg, what, "새 패키지(첫 버전) 공개", "发布新包（第一个版本）", "發布新套件（第一個版本）"),
+        "yank" => tr(lg, what, "버전 철회와 철회 취소", "撤回和取消撤回版本", "撤回與取消撤回版本"),
+        "owners" => tr(lg, what, "소유자와 신뢰할 수 있는 게시자 변경", "更改所有者和可信发布者", "變更擁有者與受信任的發布者"),
+        "admin" => tr(lg, what, "관리(관리자만)", "内容管理（仅限管理员）", "內容管理（僅限管理員）"),
         _ => what,
     }
 }
 
 /// What a kind of notice is about, as the account page says it.
-fn kind_text(k: str, what: str, ko: bool) -> str {
-    if !ko { return what; }
+fn kind_text(k: str, what: str, lg: Lang) -> str {
     match k {
-        "publish" => "내 패키지의 버전이 공개될 때",
-        "yank" => "내 패키지의 버전이 철회, 철회 취소, 삭제될 때",
-        "owners" => "내 패키지의 소유자가 초대, 추가, 제거될 때",
-        "trusted" => "내 패키지의 신뢰할 수 있는 게시자가 추가, 제거될 때",
-        "token" => "내 계정에 공개 토큰이 만들어질 때",
+        "publish" => tr(lg, what, "내 패키지의 버전이 공개될 때", "我的包有版本发布时", "我的套件有版本發布時"),
+        "yank" => tr(lg, what, "내 패키지의 버전이 철회, 철회 취소, 삭제될 때", "我的包有版本被撤回、取消撤回或删除时", "我的套件有版本被撤回、取消撤回或刪除時"),
+        "owners" => tr(lg, what, "내 패키지의 소유자가 초대, 추가, 제거될 때", "我的包有所有者被邀请、添加或移除时", "我的套件有擁有者被邀請、新增或移除時"),
+        "trusted" => tr(lg, what, "내 패키지의 신뢰할 수 있는 게시자가 추가, 제거될 때", "我的包有可信发布者被添加或移除时", "我的套件有受信任的發布者被新增或移除時"),
+        "token" => tr(lg, what, "내 계정에 공개 토큰이 만들어질 때", "我的账户创建了发布令牌时", "我的帳戶建立了發布權杖時"),
         _ => what,
     }
 }
@@ -74,108 +73,114 @@ fn kind_text(k: str, what: str, ko: bool) -> str {
 fn csrf_field(csrf: str) -> str { f"<input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">" }
 
 fn me_page(cfg: Cfg, site: Site, path: str, db: Db, s: Session, fresh: str) -> Resp {
-    let ko = ko_path(path);
+    let lg = lang_path(path);
     let a = account_of(db, s.account) ?? Account { id: 0i64, login: "", created: 0i64 };
     let csrf = esc(s.csrf);
     let b = StrBuf::new();
     let shown = if a.name.is_empty() { a.login } else { a.name };
     let gh = f"https://github.com/{esc(http::pct_encode(a.login))}";
     let as_login = f"<a href=\"{gh}\"><strong>{esc(a.login)}</strong></a>";
-    b.push_str(f"<h1 class=\"t-h1\">{tr(ko, "Account", "계정")}</h1>\n<section class=\"profile\" aria-labelledby=\"profile\"><h2 class=\"sr-only\" id=\"profile\">{tr(ko, "Profile", "프로필")}</h2>{layout::avatar(a.id, 80, false)}<div class=\"who-is\"><p class=\"t-h3\">{esc(shown)}</p><p>{tr(ko, f"Logged in with GitHub as {as_login}", f"로그인한 GitHub 계정: {as_login}")}</p></div></section>\n");
-    b.push_str(tr(ko, "<p class=\"t-small muted\">Your name, login and avatar come from your GitHub account; they are updated each time you log in.</p>\n", "<p class=\"t-small muted\">이름, 로그인, 아바타는 GitHub 계정에서 가져오며, 로그인할 때마다 새로 반영됩니다.</p>\n"));
-    b.push_str(f"<form method=\"post\" action=\"{lp(ko, "/logout")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(ko, "Log out", "로그아웃")}</button></form>\n");
-    invites_section(b, csrf, db, a.id, ko);
-    sessions_section(b, csrf, db, s, ko);
-    notices_section(cfg, b, csrf, a, ko);
-    b.push_str(f"<h2 class=\"t-h3\">{tr(ko, "Publish tokens", "공개 토큰")}</h2>\n");
+    b.push_str(f"<h1 class=\"t-h1\">{tr(lg, "Account", "계정", "账户", "帳戶")}</h1>\n<section class=\"profile\" aria-labelledby=\"profile\"><h2 class=\"sr-only\" id=\"profile\">{tr(lg, "Profile", "프로필", "个人资料", "個人資料")}</h2>{layout::avatar(a.id, 80, false)}<div class=\"who-is\"><p class=\"t-h3\">{esc(shown)}</p><p>{tr(lg, f"Logged in with GitHub as {as_login}", f"로그인한 GitHub 계정: {as_login}", f"已用 GitHub 账户 {as_login} 登录", f"已用 GitHub 帳戶 {as_login} 登入")}</p></div></section>\n");
+    b.push_str(tr(lg, "<p class=\"t-small muted\">Your name, login and avatar come from your GitHub account; they are updated each time you log in.</p>\n", "<p class=\"t-small muted\">이름, 로그인, 아바타는 GitHub 계정에서 가져오며, 로그인할 때마다 새로 반영됩니다.</p>\n", "<p class=\"t-small muted\">你的名称、登录名和头像来自你的 GitHub 账户，每次登录时都会更新。</p>\n", "<p class=\"t-small muted\">你的名稱、登入名稱和大頭貼來自你的 GitHub 帳戶，每次登入時都會更新。</p>\n"));
+    b.push_str(f"<form method=\"post\" action=\"{lp(lg, "/logout")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(lg, "Log out", "로그아웃", "退出登录", "登出")}</button></form>\n");
+    invites_section(b, csrf, db, a.id, lg);
+    sessions_section(b, csrf, db, s, lg);
+    notices_section(cfg, b, csrf, a, lg);
+    b.push_str(f"<h2 class=\"t-h3\">{tr(lg, "Publish tokens", "공개 토큰", "发布令牌", "發布權杖")}</h2>\n");
     let admin = is_admin(cfg, a.id);
-    let title = tr(ko, "Account", "계정");
+    let title = tr(lg, "Account", "계정", "账户", "帳戶");
     if !may_act(cfg, a.id) {
-        b.push_str(tr(ko, "<p>Publishing is not open yet: this account can log in, but cannot create tokens, add trusted publishers or owners, publish or yank. <a href=\"/publishing#publishing\">Publishing</a> says how it works.</p>\n", "<p>아직 공개가 열리지 않았습니다. 이 계정은 로그인할 수 있지만, 토큰을 만들거나 신뢰할 수 있는 게시자나 소유자를 추가하거나, 공개하거나 철회할 수는 없습니다. <a href=\"/ko/publishing#패키지-공개\">패키지 공개</a>에서 방법을 볼 수 있습니다.</p>\n"));
+        b.push_str(tr(lg, "<p>Publishing is not open yet: this account can log in, but cannot create tokens, add trusted publishers or owners, publish or yank. <a href=\"/publishing#publishing\">Publishing</a> says how it works.</p>\n", "<p>아직 공개가 열리지 않았습니다. 이 계정은 로그인할 수 있지만, 토큰을 만들거나 신뢰할 수 있는 게시자나 소유자를 추가하거나, 공개하거나 철회할 수는 없습니다. <a href=\"/ko/publishing#패키지-공개\">패키지 공개</a>에서 방법을 볼 수 있습니다.</p>\n", "<p>发布暂未开放：此账户可以登录，但还不能创建令牌、添加可信发布者或所有者、发布或撤回。<a href=\"/zh-hans/publishing#发布包\">发布包</a>介绍了具体做法。</p>\n", "<p>發布尚未開放：此帳戶可以登入，但還不能建立權杖、新增受信任的發布者或擁有者、發布或撤回。<a href=\"/zh-hant/publishing#發布套件\">發布套件</a>說明了具體做法。</p>\n"));
         return page(site, path, title, b.to_str(), 200);
     }
     let trusted = managed(db, a.id, admin);
     if !fresh.is_empty() {
-        b.push_str(f"<div class=\"callout help\"><span class=\"lab\">{tr(ko, "New token, shown once: copy it now", "새 토큰은 한 번만 보입니다. 지금 복사하십시오")}</span><pre class=\"cmd\"><code>{esc(fresh)}</code></pre><p>{tr(ko, "Save it with <code class=\"ic\">nabi login</code>, which reads it from stdin.", "<code class=\"ic\">nabi login</code>으로 저장합니다. 토큰은 표준 입력에서 읽습니다.")}</p></div>\n");
+        b.push_str(f"<div class=\"callout help\"><span class=\"lab\">{tr(lg, "New token, shown once: copy it now", "새 토큰은 한 번만 보입니다. 지금 복사하십시오", "新令牌只显示一次：请现在复制", "新權杖只顯示一次：請現在複製")}</span><pre class=\"cmd\"><code>{esc(fresh)}</code></pre><p>{tr(lg, "Save it with <code class=\"ic\">nabi login</code>, which reads it from stdin.", "<code class=\"ic\">nabi login</code>으로 저장합니다. 토큰은 표준 입력에서 읽습니다.", "用 <code class=\"ic\">nabi login</code> 保存，它从标准输入读取令牌。", "用 <code class=\"ic\">nabi login</code> 儲存，它從標準輸入讀取權杖。")}</p></div>\n");
     }
     let mine: List<Token> = List::new();
     for t in db.tokens {
         if t.account == a.id { mine.push(t); }
     }
     if mine.is_empty() {
-        b.push_str(tr(ko, "<p>No tokens yet.</p>\n", "<p>아직 토큰이 없습니다.</p>\n"));
+        b.push_str(tr(lg, "<p>No tokens yet.</p>\n", "<p>아직 토큰이 없습니다.</p>\n", "<p>还没有令牌。</p>\n", "<p>還沒有權杖。</p>\n"));
     } else {
-        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">{tr(ko, "Name", "이름")}</th><th scope=\"col\">{tr(ko, "Packages", "패키지")}</th><th scope=\"col\">{tr(ko, "May", "권한")}</th><th scope=\"col\">{tr(ko, "Created", "만든 날")}</th><th scope=\"col\">{tr(ko, "Expires", "만료")}</th><th scope=\"col\">{tr(ko, "Last used", "마지막 사용")}</th><th scope=\"col\"><span class=\"sr-only\">{tr(ko, "Revoke", "폐기")}</span></th></tr></thead>\n<tbody>\n");
+        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">{tr(lg, "Name", "이름", "名称", "名稱")}</th><th scope=\"col\">{tr(lg, "Packages", "패키지", "包", "套件")}</th><th scope=\"col\">{tr(lg, "May", "권한", "权限", "權限")}</th><th scope=\"col\">{tr(lg, "Created", "만든 날", "创建时间", "建立時間")}</th><th scope=\"col\">{tr(lg, "Expires", "만료", "过期时间", "到期時間")}</th><th scope=\"col\">{tr(lg, "Last used", "마지막 사용", "上次使用", "上次使用")}</th><th scope=\"col\"><span class=\"sr-only\">{tr(lg, "Revoke", "폐기", "吊销", "撤銷")}</span></th></tr></thead>\n<tbody>\n");
         let now = now_secs();
         let old = false;
         for t in mine {
-            let pk = if t.packages.is_empty() { f"<span class=\"muted\">{tr(ko, "all yours", "내 패키지 전부")}</span>" } else { esc(t.packages.join(", ")) };
-            let ex = if t.expires <= now { f"<span class=\"tag\">{tr(ko, "expired", "만료됨")}</span> {date(t.expires)}" } else { date(t.expires) };
-            let may = if t.scopes.is_empty() { tr(ko, "all but moderation <span class=\"tag\">made before scopes</span>", "관리를 뺀 전부 <span class=\"tag\">권한 범위 이전에 만듦</span>") } else { esc(t.scopes.join(", ")) };
+            let pk = if t.packages.is_empty() { f"<span class=\"muted\">{tr(lg, "all yours", "내 패키지 전부", "你的所有包", "你的所有套件")}</span>" } else { esc(t.packages.join(", ")) };
+            let ex = if t.expires <= now { f"<span class=\"tag\">{tr(lg, "expired", "만료됨", "已过期", "已到期")}</span> {date(t.expires)}" } else { date(t.expires) };
+            let may = if t.scopes.is_empty() { tr(lg, "all but moderation <span class=\"tag\">made before scopes</span>", "관리를 뺀 전부 <span class=\"tag\">권한 범위 이전에 만듦</span>", "除内容管理外的全部 <span class=\"tag\">在权限范围之前创建</span>", "除內容管理外的全部 <span class=\"tag\">在權限範圍之前建立</span>") } else { esc(t.scopes.join(", ")) };
             if t.scopes.is_empty() { old = true; }
-            b.push_str(f"<tr><td>{esc(t.name)}</td><td class=\"mono\">{pk}</td><td class=\"mono\">{may}</td><td>{date(t.created)}</td><td>{ex}</td><td>{day(t.last_used, ko)}</td><td><form method=\"post\" action=\"{lp(ko, f"/me/tokens/{esc(t.id)}/revoke")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(ko, "Revoke", "폐기")}</button></form></td></tr>\n");
+            b.push_str(f"<tr><td>{esc(t.name)}</td><td class=\"mono\">{pk}</td><td class=\"mono\">{may}</td><td>{date(t.created)}</td><td>{ex}</td><td>{day(t.last_used, lg)}</td><td><form method=\"post\" action=\"{lp(lg, f"/me/tokens/{esc(t.id)}/revoke")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(lg, "Revoke", "폐기", "吊销", "撤銷")}</button></form></td></tr>\n");
         }
         b.push_str("</tbody>\n</table></div>\n");
         if old {
-            b.push_str(if ko { f"<p class=\"t-small\">권한 범위가 생기기 전에 만든 토큰은 새 패키지와 새 버전을 공개하고, 철회하고, 소유자와 신뢰할 수 있는 게시자를 바꿀 수 있지만 관리는 할 수 없습니다{if admin { "(관리에는 admin 권한이 있는 토큰이 필요합니다)" } else { "" }}. 권한을 좁히려면 필요한 것만 고른 토큰을 새로 만들고 예전 토큰을 폐기하십시오.</p>\n" } else { f"<p class=\"t-small\">A token made before scopes may publish new packages and new versions, yank, and change owners and trusted publishers, but not moderate{if admin { " (moderation takes a token with the admin scope)" } else { "" }}. To narrow it, create a token with only what it needs and revoke the old one.</p>\n" });
+            b.push_str(tr(lg, f"<p class=\"t-small\">A token made before scopes may publish new packages and new versions, yank, and change owners and trusted publishers, but not moderate{if admin { " (moderation takes a token with the admin scope)" } else { "" }}. To narrow it, create a token with only what it needs and revoke the old one.</p>\n", f"<p class=\"t-small\">권한 범위가 생기기 전에 만든 토큰은 새 패키지와 새 버전을 공개하고, 철회하고, 소유자와 신뢰할 수 있는 게시자를 바꿀 수 있지만 관리는 할 수 없습니다{if admin { "(관리에는 admin 권한이 있는 토큰이 필요합니다)" } else { "" }}. 권한을 좁히려면 필요한 것만 고른 토큰을 새로 만들고 예전 토큰을 폐기하십시오.</p>\n", f"<p class=\"t-small\">在权限范围出现之前创建的令牌可以发布新包和新版本、撤回，以及更改所有者和可信发布者，但不能进行内容管理{if admin { "（内容管理需要带 admin 权限的令牌）" } else { "" }}。要缩小权限，创建一个只带所需权限的令牌，然后吊销旧令牌。</p>\n", f"<p class=\"t-small\">在權限範圍出現之前建立的權杖可以發布新套件和新版本、撤回，以及變更擁有者與受信任的發布者，但不能進行內容管理{if admin { "（內容管理需要具備 admin 權限的權杖）" } else { "" }}。要縮小權限，建立一個只具備所需權限的權杖，然後撤銷舊權杖。</p>\n"));
         }
     }
     let boxes = StrBuf::new();
     for (name, what) in scopes() {
         if name == SCOPE_ADMIN && !admin { continue; }
         let on = if default_scopes().contains(name) { " checked" } else { "" };
-        boxes.push_str(f"<label><input type=\"checkbox\" name=\"scope-{name}\" value=\"on\"{on}> {esc(scope_text(name, what, ko))} <code class=\"ic\">{name}</code></label> ");
+        boxes.push_str(f"<label><input type=\"checkbox\" name=\"scope-{name}\" value=\"on\"{on}> {esc(scope_text(name, what, lg))} <code class=\"ic\">{name}</code></label> ");
     }
-    let help = if ko { f"패키지: 쉼표로 구분한 이름을 적으면 토큰이 그 패키지에만 작동합니다. 비워 두면 내가 소유한 모든 패키지에 작동합니다. 토큰에는 그 일에 필요한 것만 주십시오. 릴리스 워크플로는 새 버전을 공개하고 철회합니다. 새 패키지나 소유자 권한은 그 일을 하는 토큰에만 체크하십시오. 토큰은 정한 날 수 동안 작동하며, 최대 {TOKEN_DAYS_MAX}일입니다." } else { f"Packages: names separated by commas, to let the token act only on those; empty, it acts for every package you own. Give a token only what its job needs: a release workflow publishes new versions and yanks; tick a new package or owners only for the token that does that. A token works for the number of days given, at most {TOKEN_DAYS_MAX}." };
-    b.push_str(f"<form method=\"post\" action=\"{lp(ko, "/me/tokens")}\" class=\"token-form\">{csrf_field(csrf)}<input type=\"hidden\" name=\"scopes\" value=\"1\"><label>{tr(ko, "Name", "이름")} <input name=\"name\" maxlength=\"64\" required></label> <label>{tr(ko, "Packages", "패키지")} <input name=\"packages\" maxlength=\"512\" placeholder=\"{tr(ko, "all yours", "내 패키지 전부")}\" aria-describedby=\"token-help\"></label> <label>{tr(ko, "Days", "일 수")} <input name=\"days\" type=\"number\" min=\"1\" max=\"{TOKEN_DAYS_MAX}\" value=\"{TOKEN_DAYS}\" required></label> <fieldset class=\"scopes\"><legend>{tr(ko, "It may", "권한")}</legend>{boxes.to_str()}</fieldset> <button class=\"btn btn-sm\" type=\"submit\">{tr(ko, "Create token", "토큰 만들기")}</button></form>\n<p class=\"t-small muted\" id=\"token-help\">{help}</p>\n");
-    trusted_section(b, csrf, trusted, ko);
-    owners_section(b, csrf, db, a.id, admin, ko);
-    versions_section(cfg, b, csrf, db, a.id, ko);
-    activity_section(b, db, a.id, ko);
-    if admin { moderation_section(b, db, ko); }
+    let help = tr(lg, f"Packages: names separated by commas, to let the token act only on those; empty, it acts for every package you own. Give a token only what its job needs: a release workflow publishes new versions and yanks; tick a new package or owners only for the token that does that. A token works for the number of days given, at most {TOKEN_DAYS_MAX}.", f"패키지: 쉼표로 구분한 이름을 적으면 토큰이 그 패키지에만 작동합니다. 비워 두면 내가 소유한 모든 패키지에 작동합니다. 토큰에는 그 일에 필요한 것만 주십시오. 릴리스 워크플로는 새 버전을 공개하고 철회합니다. 새 패키지나 소유자 권한은 그 일을 하는 토큰에만 체크하십시오. 토큰은 정한 날 수 동안 작동하며, 최대 {TOKEN_DAYS_MAX}일입니다.", f"包：填写以逗号分隔的名称，令牌就只作用于这些包；留空则作用于你拥有的所有包。令牌只给它的工作所需的权限：发布工作流发布新版本并撤回；只有做这些事的令牌才勾选新包或所有者。令牌在指定的天数内有效，最长 {TOKEN_DAYS_MAX} 天。", f"套件：填寫以逗號分隔的名稱，權杖就只作用於這些套件；留空則作用於你擁有的所有套件。權杖只給它的工作所需的權限：發行工作流程發布新版本並撤回；只有做這些事的權杖才勾選新套件或擁有者。權杖在指定的天數內有效，最長 {TOKEN_DAYS_MAX} 天。");
+    b.push_str(f"<form method=\"post\" action=\"{lp(lg, "/me/tokens")}\" class=\"token-form\">{csrf_field(csrf)}<input type=\"hidden\" name=\"scopes\" value=\"1\"><label>{tr(lg, "Name", "이름", "名称", "名稱")} <input name=\"name\" maxlength=\"64\" required></label> <label>{tr(lg, "Packages", "패키지", "包", "套件")} <input name=\"packages\" maxlength=\"512\" placeholder=\"{tr(lg, "all yours", "내 패키지 전부", "你的所有包", "你的所有套件")}\" aria-describedby=\"token-help\"></label> <label>{tr(lg, "Days", "일 수", "天数", "天數")} <input name=\"days\" type=\"number\" min=\"1\" max=\"{TOKEN_DAYS_MAX}\" value=\"{TOKEN_DAYS}\" required></label> <fieldset class=\"scopes\"><legend>{tr(lg, "It may", "권한", "权限", "權限")}</legend>{boxes.to_str()}</fieldset> <button class=\"btn btn-sm\" type=\"submit\">{tr(lg, "Create token", "토큰 만들기", "创建令牌", "建立權杖")}</button></form>\n<p class=\"t-small muted\" id=\"token-help\">{help}</p>\n");
+    trusted_section(b, csrf, trusted, lg);
+    owners_section(b, csrf, db, a.id, admin, lg);
+    versions_section(cfg, b, csrf, db, a.id, lg);
+    activity_section(b, db, a.id, lg);
+    if admin { moderation_section(b, db, lg); }
     page(site, path, title, b.to_str(), 200)
 }
 
 /// The versions of the account's packages it may still delete
 /// (delete::DELETE_SECS after their publish), each with Delete, which
 /// asks again before it deletes.
-fn versions_section(cfg: Cfg, b: StrBuf, csrf: str, db: Db, id: i64, ko: bool) {
+fn versions_section(cfg: Cfg, b: StrBuf, csrf: str, db: Db, id: i64, lg: Lang) {
     let list = delete::deletable(cfg, db, id, now_secs());
     let hours = delete::DELETE_SECS / 3600i64;
-    b.push_str(f"<h2 class=\"t-h3\" id=\"versions\">{tr(ko, "Recent versions", "최근 버전")}</h2>\n");
-    b.push_str(if ko { f"<p>소유자는 버전을 공개하고 {hours}시간 동안, 다른 패키지가 의존하지 않는 버전을 삭제할 수 있습니다. 삭제한 버전의 줄은 index에서 빠지고, 그 버전 번호는 다시 쓸 수 없습니다. 그 뒤에나 다른 패키지가 의존하게 된 뒤에는 철회하십시오. 그 버전을 고정한 프로젝트는 계속 빌드되고, 새 프로젝트는 건너뜁니다.</p>\n" } else { f"<p>For {hours} hours after its publish, an owner may delete a version that no other package depends on: its line leaves the index and its number is never used again. After that, or once another package depends on it, yank it instead: projects that pinned it keep building, new ones skip it.</p>\n" });
+    b.push_str(f"<h2 class=\"t-h3\" id=\"versions\">{tr(lg, "Recent versions", "최근 버전", "最近的版本", "最近的版本")}</h2>\n");
+    b.push_str(tr(lg, f"<p>For {hours} hours after its publish, an owner may delete a version that no other package depends on: its line leaves the index and its number is never used again. After that, or once another package depends on it, yank it instead: projects that pinned it keep building, new ones skip it.</p>\n", f"<p>소유자는 버전을 공개하고 {hours}시간 동안, 다른 패키지가 의존하지 않는 버전을 삭제할 수 있습니다. 삭제한 버전의 줄은 index에서 빠지고, 그 버전 번호는 다시 쓸 수 없습니다. 그 뒤에나 다른 패키지가 의존하게 된 뒤에는 철회하십시오. 그 버전을 고정한 프로젝트는 계속 빌드되고, 새 프로젝트는 건너뜁니다.</p>\n", f"<p>版本发布后的 {hours} 小时内，所有者可以删除没有其他包依赖的版本：它的行会从索引中移除，它的版本号也不能再使用。超过这个时间，或者已有其他包依赖它时，请改为撤回：已固定它的项目仍可构建，新项目会跳过它。</p>\n", f"<p>版本發布後的 {hours} 小時內，擁有者可以刪除沒有其他套件相依的版本：它的行會從索引中移除，它的版本號也不能再使用。超過這個時間，或者已有其他套件相依於它時，請改為撤回：已固定它的專案仍可建置，新專案會跳過它。</p>\n"));
     if list.is_empty() {
-        b.push_str(if ko { f"<p>최근 {hours}시간 안에 공개한 내 패키지의 버전이 없습니다.</p>\n" } else { f"<p>No version of your packages was published in the last {hours} hours.</p>\n" });
+        b.push_str(tr(lg, f"<p>No version of your packages was published in the last {hours} hours.</p>\n", f"<p>최근 {hours}시간 안에 공개한 내 패키지의 버전이 없습니다.</p>\n", f"<p>最近 {hours} 小时内，你的包没有发布任何版本。</p>\n", f"<p>最近 {hours} 小時內，你的套件沒有發布任何版本。</p>\n"));
         return;
     }
-    b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">{tr(ko, "Package", "패키지")}</th><th scope=\"col\">{tr(ko, "Version", "버전")}</th><th scope=\"col\">{tr(ko, "Published", "공개")}</th><th scope=\"col\">{tr(ko, "Deletable until", "삭제 가능 기한")}</th><th scope=\"col\"><span class=\"sr-only\">{tr(ko, "Delete", "삭제")}</span></th></tr></thead>\n<tbody>\n");
+    b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">{tr(lg, "Package", "패키지", "包", "套件")}</th><th scope=\"col\">{tr(lg, "Version", "버전", "版本", "版本")}</th><th scope=\"col\">{tr(lg, "Published", "공개", "发布时间", "發布時間")}</th><th scope=\"col\">{tr(lg, "Deletable until", "삭제 가능 기한", "可删除期限", "可刪除期限")}</th><th scope=\"col\"><span class=\"sr-only\">{tr(lg, "Delete", "삭제", "删除", "刪除")}</span></th></tr></thead>\n<tbody>\n");
     for v in list {
-        b.push_str(f"<tr><td>{esc(v.name)}</td><td class=\"mono\">{esc(v.version)}</td><td>{stamp(v.at)}</td><td>{stamp(v.at + delete::DELETE_SECS)}</td><td>{delete_form(csrf, v.name, v.version, false, tr(ko, "Delete", "삭제"), ko)}</td></tr>\n");
+        b.push_str(f"<tr><td>{esc(v.name)}</td><td class=\"mono\">{esc(v.version)}</td><td>{stamp(v.at)}</td><td>{stamp(v.at + delete::DELETE_SECS)}</td><td>{delete_form(csrf, v.name, v.version, false, tr(lg, "Delete", "삭제", "删除", "刪除"), lg)}</td></tr>\n");
     }
     b.push_str("</tbody>\n</table></div>\n");
 }
 
 /// The form that asks to delete `name` `version`; `confirm`: the one
 /// that deletes.
-fn delete_form(csrf: str, name: str, version: str, confirm: bool, label: str, ko: bool) -> str {
+fn delete_form(csrf: str, name: str, version: str, confirm: bool, label: str, lg: Lang) -> str {
     let yes = if confirm { "<input type=\"hidden\" name=\"confirm\" value=\"yes\">" } else { "" };
-    f"<form method=\"post\" action=\"{lp(ko, "/me/versions/delete")}\">{csrf_field(esc(csrf))}<input type=\"hidden\" name=\"package\" value=\"{esc(name)}\"><input type=\"hidden\" name=\"version\" value=\"{esc(version)}\">{yes}<button class=\"{if confirm { "btn" } else { "btn-2" }} btn-sm\" type=\"submit\">{esc(label)}</button></form>"
+    f"<form method=\"post\" action=\"{lp(lg, "/me/versions/delete")}\">{csrf_field(esc(csrf))}<input type=\"hidden\" name=\"package\" value=\"{esc(name)}\"><input type=\"hidden\" name=\"version\" value=\"{esc(version)}\">{yes}<button class=\"{if confirm { "btn" } else { "btn-2" }} btn-sm\" type=\"submit\">{esc(label)}</button></form>"
 }
 
 /// The page that asks once more before `name` `version` is deleted.
 fn confirm_delete(site: Site, path: str, csrf: str, name: str, version: str) -> Resp {
-    let ko = ko_path(path);
+    let lg = lang_path(path);
     let b = StrBuf::new();
-    let title = tr(ko, f"Delete {name} {version}?", f"{name} {version}을(를) 삭제할까요?");
+    let title = tr(lg, f"Delete {name} {version}?", f"{name} {version}을(를) 삭제할까요?", f"删除 {name} {version}？", f"刪除 {name} {version}？");
     b.push_str(f"<h1 class=\"t-h1\">{esc(title)}</h1>\n");
-    if ko {
+    if lg == Lang::ZhHans {
+        b.push_str(f"<p class=\"t-lead\">它在索引中的行会被移除，源代码压缩包、README 和文档也会从注册表中删除。此操作无法撤销，{esc(version)} 也不能再次发布：修复要以新版本发布。</p>\n");
+        b.push_str("<p>已锁定此版本的项目将无法再解析到它。如果想让这些项目继续构建、只阻止新项目使用，请改为撤回。</p>\n");
+    } else if lg == Lang::ZhHant {
+        b.push_str(f"<p class=\"t-lead\">它在索引中的行會被移除，原始碼壓縮檔、README 與文件也會從登錄庫中刪除。此操作無法復原，{esc(version)} 也不能再次發布：修正要以新版本發布。</p>\n");
+        b.push_str("<p>已鎖定此版本的專案將無法再解析到它。如果想讓這些專案繼續建置、只阻止新專案使用，請改為撤回。</p>\n");
+    } else if lg == Lang::Ko {
         b.push_str(f"<p class=\"t-lead\">그 줄은 index에서 빠지고, 소스 보관본, README, 문서는 레지스트리에서 지워집니다. 되돌릴 수 없고, {esc(version)}은(는) 다시 공개할 수 없습니다. 수정은 새 버전으로 내보냅니다.</p>\n");
         b.push_str("<p>이미 이 버전을 고정한 프로젝트는 더 이상 이 버전을 찾지 못합니다. 그런 프로젝트는 계속 빌드되게 두고 새 프로젝트만 막으려면 철회하십시오.</p>\n");
     } else {
         b.push_str(f"<p class=\"t-lead\">Its line leaves the index, and its source archive, README and docs leave the registry. This cannot be undone, and {esc(version)} cannot be published again: a fix goes out as a new version.</p>\n");
         b.push_str("<p>A project that already locked this version stops resolving it. To keep those building and only stop new ones, yank it instead.</p>\n");
     }
-    b.push_str(f"<div class=\"actions\">{delete_form(csrf, name, version, true, tr(ko, f"Delete {name} {version}", f"{name} {version} 삭제"), ko)} <a class=\"btn-2 btn-sm\" href=\"{lp(ko, "/me")}#versions\">{tr(ko, "Cancel", "취소")}</a></div>\n");
+    b.push_str(f"<div class=\"actions\">{delete_form(csrf, name, version, true, tr(lg, f"Delete {name} {version}", f"{name} {version} 삭제", f"删除 {name} {version}", f"刪除 {name} {version}"), lg)} <a class=\"btn-2 btn-sm\" href=\"{lp(lg, "/me")}#versions\">{tr(lg, "Cancel", "취소", "取消", "取消")}</a></div>\n");
     page(site, path, title, b.to_str(), 200)
 }
 
@@ -188,58 +193,58 @@ pub fn stamp(t: i64) -> str {
 
 /// The account's sessions, this one first, each with Log out, and Log
 /// out everywhere.
-fn sessions_section(b: StrBuf, csrf: str, db: Db, cur: Session, ko: bool) {
+fn sessions_section(b: StrBuf, csrf: str, db: Db, cur: Session, lg: Lang) {
     let idle = SESSION_IDLE / 86400i64;
     let most = SESSION_SECS / 86400i64;
-    b.push_str(if ko { f"<h2 class=\"t-h3\" id=\"sessions\">세션</h2>\n<p>이 계정에 로그인한 브라우저입니다. 세션은 {idle}일 동안 방문이 없으면 끝나고, 늦어도 로그인하고 {most}일 뒤에 끝납니다. 모르는 세션은 로그아웃한 뒤 토큰을 폐기하십시오.</p>\n" } else { f"<h2 class=\"t-h3\" id=\"sessions\">Sessions</h2>\n<p>Each browser logged in to this account. A session ends after {idle} days without a visit, and {most} days after its login at the latest. Log out one you do not know, then revoke your tokens.</p>\n" });
+    b.push_str(tr(lg, f"<h2 class=\"t-h3\" id=\"sessions\">Sessions</h2>\n<p>Each browser logged in to this account. A session ends after {idle} days without a visit, and {most} days after its login at the latest. Log out one you do not know, then revoke your tokens.</p>\n", f"<h2 class=\"t-h3\" id=\"sessions\">세션</h2>\n<p>이 계정에 로그인한 브라우저입니다. 세션은 {idle}일 동안 방문이 없으면 끝나고, 늦어도 로그인하고 {most}일 뒤에 끝납니다. 모르는 세션은 로그아웃한 뒤 토큰을 폐기하십시오.</p>\n", f"<h2 class=\"t-h3\" id=\"sessions\">会话</h2>\n<p>登录到此账户的每个浏览器。会话在 {idle} 天未访问后结束，最迟在登录 {most} 天后结束。遇到不认识的会话，请将其退出登录，然后吊销你的令牌。</p>\n", f"<h2 class=\"t-h3\" id=\"sessions\">工作階段</h2>\n<p>登入此帳戶的每個瀏覽器。工作階段在 {idle} 天未造訪後結束，最遲在登入 {most} 天後結束。遇到不認識的工作階段，請將其登出，然後撤銷你的權杖。</p>\n"));
     let mine: List<Session> = [cur];
     for x in db.sessions {
         if x.account == cur.account && x.hash != cur.hash { mine.push(x); }
     }
-    let out = tr(ko, "Log out", "로그아웃");
-    b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">{tr(ko, "Browser", "브라우저")}</th><th scope=\"col\">{tr(ko, "Logged in", "로그인")}</th><th scope=\"col\">{tr(ko, "Last seen", "마지막 방문")}</th><th scope=\"col\">{tr(ko, "Ends", "끝나는 날")}</th><th scope=\"col\"><span class=\"sr-only\">{out}</span></th></tr></thead>\n<tbody>\n");
+    let out = tr(lg, "Log out", "로그아웃", "退出登录", "登出");
+    b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">{tr(lg, "Browser", "브라우저", "浏览器", "瀏覽器")}</th><th scope=\"col\">{tr(lg, "Logged in", "로그인", "登录时间", "登入時間")}</th><th scope=\"col\">{tr(lg, "Last seen", "마지막 방문", "上次访问", "上次造訪")}</th><th scope=\"col\">{tr(lg, "Ends", "끝나는 날", "结束时间", "結束時間")}</th><th scope=\"col\"><span class=\"sr-only\">{out}</span></th></tr></thead>\n<tbody>\n");
     for x in mine {
-        let what = if x.agent.is_empty() || x.agent == "Unknown browser" { tr(ko, "Unknown browser", "알 수 없는 브라우저") } else { x.agent };
-        let here = if x.hash == cur.hash { f" <span class=\"tag\">{tr(ko, "this session", "현재 세션")}</span>" } else { "" };
-        let made = if x.created > 0i64 { date(x.created) } else { tr(ko, "unknown", "알 수 없음") };
-        b.push_str(f"<tr><td>{esc(what)}{here}</td><td>{made}</td><td>{day(seen_at(x), ko)}</td><td>{day(session_end(x), ko)}</td><td><form method=\"post\" action=\"{lp(ko, f"/me/sessions/{esc(session_id(x))}/logout")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{out}</button></form></td></tr>\n");
+        let what = if x.agent.is_empty() || x.agent == "Unknown browser" { tr(lg, "Unknown browser", "알 수 없는 브라우저", "未知浏览器", "不明的瀏覽器") } else { x.agent };
+        let here = if x.hash == cur.hash { f" <span class=\"tag\">{tr(lg, "this session", "현재 세션", "当前会话", "目前的工作階段")}</span>" } else { "" };
+        let made = if x.created > 0i64 { date(x.created) } else { tr(lg, "unknown", "알 수 없음", "未知", "不明") };
+        b.push_str(f"<tr><td>{esc(what)}{here}</td><td>{made}</td><td>{day(seen_at(x), lg)}</td><td>{day(session_end(x), lg)}</td><td><form method=\"post\" action=\"{lp(lg, f"/me/sessions/{esc(session_id(x))}/logout")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{out}</button></form></td></tr>\n");
     }
     b.push_str("</tbody>\n</table></div>\n");
-    b.push_str(f"<form method=\"post\" action=\"{lp(ko, "/me/sessions/logout-all")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(ko, "Log out everywhere", "모든 곳에서 로그아웃")}</button></form>\n");
+    b.push_str(f"<form method=\"post\" action=\"{lp(lg, "/me/sessions/logout-all")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(lg, "Log out everywhere", "모든 곳에서 로그아웃", "在所有设备上退出登录", "在所有裝置上登出")}</button></form>\n");
 }
 
 /// Where notices go and which kinds the account takes, with the form
 /// that changes them.
-fn notices_section(cfg: Cfg, b: StrBuf, csrf: str, a: Account, ko: bool) {
-    b.push_str(f"<h2 class=\"t-h3\" id=\"notices\">{tr(ko, "Notices by mail", "메일 알림")}</h2>\n");
+fn notices_section(cfg: Cfg, b: StrBuf, csrf: str, a: Account, lg: Lang) {
+    b.push_str(f"<h2 class=\"t-h3\" id=\"notices\">{tr(lg, "Notices by mail", "메일 알림", "邮件通知", "電子郵件通知")}</h2>\n");
     if a.email.is_empty() {
-        b.push_str(tr(ko, "<p>GitHub gave no verified primary email address for this account, so no notices are sent. Add one in <a href=\"https://github.com/settings/emails\">GitHub's email settings</a>, verify it and make it primary, then log in again.</p>\n", "<p>GitHub가 이 계정의 인증된 기본 메일 주소를 알려 주지 않아 알림을 보내지 않습니다. <a href=\"https://github.com/settings/emails\">GitHub 메일 설정</a>에서 주소를 추가하고 인증한 뒤 기본 주소로 정하고, 다시 로그인하십시오.</p>\n"));
+        b.push_str(tr(lg, "<p>GitHub gave no verified primary email address for this account, so no notices are sent. Add one in <a href=\"https://github.com/settings/emails\">GitHub's email settings</a>, verify it and make it primary, then log in again.</p>\n", "<p>GitHub가 이 계정의 인증된 기본 메일 주소를 알려 주지 않아 알림을 보내지 않습니다. <a href=\"https://github.com/settings/emails\">GitHub 메일 설정</a>에서 주소를 추가하고 인증한 뒤 기본 주소로 정하고, 다시 로그인하십시오.</p>\n", "<p>GitHub 没有提供此账户经过验证的主邮箱地址，所以不会发送通知。请在 <a href=\"https://github.com/settings/emails\">GitHub 的邮箱设置</a>中添加一个地址，验证后设为主地址，然后重新登录。</p>\n", "<p>GitHub 沒有提供此帳戶經過驗證的主要電子郵件地址，所以不會寄送通知。請在 <a href=\"https://github.com/settings/emails\">GitHub 的電子郵件設定</a>中新增一個地址，驗證後設為主要地址，然後重新登入。</p>\n"));
     } else {
-        b.push_str(if ko { f"<p>알림은 <strong>{esc(a.email)}</strong>로 보냅니다. 마지막 로그인 때 GitHub에 있던 기본 메일 주소입니다. 다른 주소를 쓰려면 GitHub에서 바꾼 뒤 다시 로그인하십시오.</p>\n" } else { f"<p>Sent to <strong>{esc(a.email)}</strong>, your primary email address on GitHub at your last login. To use another, change it on GitHub and log in again.</p>\n" });
+        b.push_str(tr(lg, f"<p>Sent to <strong>{esc(a.email)}</strong>, your primary email address on GitHub at your last login. To use another, change it on GitHub and log in again.</p>\n", f"<p>알림은 <strong>{esc(a.email)}</strong>로 보냅니다. 마지막 로그인 때 GitHub에 있던 기본 메일 주소입니다. 다른 주소를 쓰려면 GitHub에서 바꾼 뒤 다시 로그인하십시오.</p>\n", f"<p>通知发送到 <strong>{esc(a.email)}</strong>，即你上次登录时 GitHub 上的主邮箱地址。要使用其他地址，请在 GitHub 上更改后重新登录。</p>\n", f"<p>通知寄送到 <strong>{esc(a.email)}</strong>，即你上次登入時 GitHub 上的主要電子郵件地址。要使用其他地址，請在 GitHub 上變更後重新登入。</p>\n"));
     }
-    if !mail::on(cfg) { b.push_str(tr(ko, "<p class=\"t-small muted\">This server sends no mail: its notices are written to its log.</p>\n", "<p class=\"t-small muted\">이 서버는 메일을 보내지 않고, 알림을 로그에 남깁니다.</p>\n")); }
+    if !mail::on(cfg) { b.push_str(tr(lg, "<p class=\"t-small muted\">This server sends no mail: its notices are written to its log.</p>\n", "<p class=\"t-small muted\">이 서버는 메일을 보내지 않고, 알림을 로그에 남깁니다.</p>\n", "<p class=\"t-small muted\">此服务器不发送邮件：通知会写入它的日志。</p>\n", "<p class=\"t-small muted\">此伺服器不寄送電子郵件：通知會寫入它的記錄檔。</p>\n")); }
     let boxes = StrBuf::new();
     for (k, what) in mail::kinds() {
         let on = if a.notify_off.contains(k) { "" } else { " checked" };
-        boxes.push_str(f"<label><input type=\"checkbox\" name=\"kind-{k}\" value=\"on\"{on}> {esc(kind_text(k, what, ko))}</label> ");
+        boxes.push_str(f"<label><input type=\"checkbox\" name=\"kind-{k}\" value=\"on\"{on}> {esc(kind_text(k, what, lg))}</label> ");
     }
     let all = if a.notify { " checked" } else { "" };
-    b.push_str(f"<form method=\"post\" action=\"{lp(ko, "/me/notices")}\">{csrf_field(csrf)}<label><input type=\"checkbox\" name=\"notify\" value=\"on\"{all}> {tr(ko, "Send me notices", "알림 받기")}</label> <fieldset><legend>{tr(ko, "Mail me when", "다음 경우에 메일 받기")}</legend>{boxes.to_str()}</fieldset> <button class=\"btn-2 btn-sm\" type=\"submit\">{tr(ko, "Save", "저장")}</button></form>\n");
+    b.push_str(f"<form method=\"post\" action=\"{lp(lg, "/me/notices")}\">{csrf_field(csrf)}<label><input type=\"checkbox\" name=\"notify\" value=\"on\"{all}> {tr(lg, "Send me notices", "알림 받기", "接收通知", "接收通知")}</label> <fieldset><legend>{tr(lg, "Mail me when", "다음 경우에 메일 받기", "在以下情况给我发邮件", "在以下情況寄電子郵件給我")}</legend>{boxes.to_str()}</fieldset> <button class=\"btn-2 btn-sm\" type=\"submit\">{tr(lg, "Save", "저장", "保存", "儲存")}</button></form>\n");
 }
 
 /// The latest changes to the packages the account owns, by anyone.
-fn activity_section(b: StrBuf, db: Db, id: i64, ko: bool) {
+fn activity_section(b: StrBuf, db: Db, id: i64, lg: Lang) {
     let mine = owned_by(db, id);
     if mine.is_empty() { return; }
-    b.push_str(if ko { f"<h2 class=\"t-h3\" id=\"activity\">활동</h2>\n<p>내가 소유한 패키지의 최근 변경 {ACTIVITY}건입니다. 공개, 철회, 소유자, 신뢰할 수 있는 게시자, 토큰의 변경이 들어갑니다. 소유자만 볼 수 있습니다. 나나 공동 소유자가 하지 않은 일이 있으면 토큰을 폐기하고 모르는 세션을 로그아웃하십시오.</p>\n" } else { f"<h2 class=\"t-h3\" id=\"activity\">Activity</h2>\n<p>The latest {ACTIVITY} changes to the packages you own: publishes, yanks, owners, trusted publishers and tokens. Only their owners see this. If one was not you or a co-owner, revoke your tokens and log out the sessions you do not know.</p>\n" });
+    b.push_str(tr(lg, f"<h2 class=\"t-h3\" id=\"activity\">Activity</h2>\n<p>The latest {ACTIVITY} changes to the packages you own: publishes, yanks, owners, trusted publishers and tokens. Only their owners see this. If one was not you or a co-owner, revoke your tokens and log out the sessions you do not know.</p>\n", f"<h2 class=\"t-h3\" id=\"activity\">활동</h2>\n<p>내가 소유한 패키지의 최근 변경 {ACTIVITY}건입니다. 공개, 철회, 소유자, 신뢰할 수 있는 게시자, 토큰의 변경이 들어갑니다. 소유자만 볼 수 있습니다. 나나 공동 소유자가 하지 않은 일이 있으면 토큰을 폐기하고 모르는 세션을 로그아웃하십시오.</p>\n", f"<h2 class=\"t-h3\" id=\"activity\">动态</h2>\n<p>你拥有的包最近的 {ACTIVITY} 项变更：发布、撤回、所有者、可信发布者和令牌。只有所有者能看到这些。如果某项不是你或共同所有者做的，请吊销你的令牌，并退出不认识的会话。</p>\n", f"<h2 class=\"t-h3\" id=\"activity\">活動</h2>\n<p>你擁有的套件最近的 {ACTIVITY} 項變更：發布、撤回、擁有者、受信任的發布者和權杖。只有擁有者能看到這些。如果某項不是你或共同擁有者做的，請撤銷你的權杖，並登出不認識的工作階段。</p>\n"));
     let list = events_of(db, mine, ACTIVITY);
     if list.is_empty() {
-        b.push_str(tr(ko, "<p>Nothing recorded yet.</p>\n", "<p>아직 기록된 것이 없습니다.</p>\n"));
+        b.push_str(tr(lg, "<p>Nothing recorded yet.</p>\n", "<p>아직 기록된 것이 없습니다.</p>\n", "<p>还没有任何记录。</p>\n", "<p>還沒有任何紀錄。</p>\n"));
         return;
     }
-    b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">{tr(ko, "Package", "패키지")}</th><th scope=\"col\">{tr(ko, "When", "때")}</th><th scope=\"col\">{tr(ko, "Who", "누가")}</th><th scope=\"col\">{tr(ko, "What", "무엇을")}</th></tr></thead>\n<tbody>\n");
+    b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th scope=\"col\">{tr(lg, "Package", "패키지", "包", "套件")}</th><th scope=\"col\">{tr(lg, "When", "때", "时间", "時間")}</th><th scope=\"col\">{tr(lg, "Who", "누가", "操作者", "操作者")}</th><th scope=\"col\">{tr(lg, "What", "무엇을", "操作", "操作")}</th></tr></thead>\n<tbody>\n");
     for e in list {
-        b.push_str(f"<tr><td>{esc(e.package)}</td><td>{date(e.at)}</td><td>{esc(e.who)}</td><td>{esc(event_text(e, ko))}</td></tr>\n");
+        b.push_str(f"<tr><td>{esc(e.package)}</td><td>{date(e.at)}</td><td>{esc(e.who)}</td><td>{esc(event_text(e, lg))}</td></tr>\n");
     }
     b.push_str("</tbody>\n</table></div>\n");
 }
@@ -248,9 +253,28 @@ fn activity_section(b: StrBuf, db: Db, id: i64, ko: bool) {
 const ACTIVITY: usize = 30;
 
 /// What event `e` did, in words.
-pub fn event_text(e: Event, ko: bool = false) -> str {
+pub fn event_text(e: Event, lg: Lang = Lang::En) -> str {
     let d = e.detail;
-    if ko {
+    if lg == Lang::ZhHans || lg == Lang::ZhHant {
+        let h = lg == Lang::ZhHans;
+        let z = |hans: str, hant: str| if h { hans } else { hant };
+        return match e.action {
+            "publish" => f"{z("发布", "發布")} {d}",
+            "yank" => f"撤回 {d}",
+            "unyank" => f"取消撤回 {d}",
+            "owner-invite" => f"{z("邀请", "邀請")} {d} {z("成为所有者", "成為擁有者")}",
+            "owner-add" => f"{z("添加所有者", "新增擁有者")} {d}",
+            "owner-decline" => f"{d} {z("拒绝了邀请", "拒絕了邀請")}",
+            "owner-remove" => f"{z("移除所有者", "移除擁有者")} {d}",
+            "trusted-add" => f"{z("添加可信发布者", "新增受信任的發布者")} {d}",
+            "trusted-remove" => f"{z("移除可信发布者", "移除受信任的發布者")} {d}",
+            "token-create" => f"{z("创建令牌", "建立權杖")} {d}",
+            "token-revoke" => f"{z("吊销令牌", "撤銷權杖")} {d}",
+            "delete" => f"{z("删除", "刪除")} {d}",
+            _ => f"{e.action} {d}".trim(),
+        };
+    }
+    if lg == Lang::Ko {
         return match e.action {
             "publish" => f"{d} 공개",
             "yank" => f"{d} 철회",
@@ -290,44 +314,44 @@ pub fn event_text(e: Event, ko: bool = false) -> str {
 
 /// The account's open invitations to own a package, each with Accept and
 /// Decline.
-fn invites_section(b: StrBuf, csrf: str, db: Db, id: i64, ko: bool) {
+fn invites_section(b: StrBuf, csrf: str, db: Db, id: i64, lg: Lang) {
     let open = invites_of(db, id);
     if open.is_empty() { return; }
-    b.push_str(f"<h2 class=\"t-h3\">{tr(ko, "Invitations", "초대")}</h2>\n<p>{tr(ko, "An owner asked you to share these packages. Accept to publish and yank them and to manage their owners.", "소유자가 이 패키지를 함께 관리하자고 초대했습니다. 수락하면 공개하고 철회하며, 소유자를 관리할 수 있습니다.")}</p>\n<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>{tr(ko, "Package", "패키지")}</th><th>{tr(ko, "Invited by", "초대한 사람")}</th><th></th></tr></thead>\n<tbody>\n");
+    b.push_str(f"<h2 class=\"t-h3\">{tr(lg, "Invitations", "초대", "邀请", "邀請")}</h2>\n<p>{tr(lg, "An owner asked you to share these packages. Accept to publish and yank them and to manage their owners.", "소유자가 이 패키지를 함께 관리하자고 초대했습니다. 수락하면 공개하고 철회하며, 소유자를 관리할 수 있습니다.", "有所有者邀请你共同管理这些包。接受后，你可以发布和撤回它们，并管理它们的所有者。", "有擁有者邀請你共同管理這些套件。接受後，你可以發布和撤回它們，並管理它們的擁有者。")}</p>\n<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>{tr(lg, "Package", "패키지", "包", "套件")}</th><th>{tr(lg, "Invited by", "초대한 사람", "邀请人", "邀請人")}</th><th></th></tr></thead>\n<tbody>\n");
     for v in open {
         let by = account_of(db, v.by) ?? Account { id: v.by, login: "", created: 0i64 };
-        let form = |act: str, label: str, cls: str| f"<form method=\"post\" action=\"{lp(ko, "/me/invites/" + act)}\">{csrf_field(csrf)}<input type=\"hidden\" name=\"package\" value=\"{esc(v.name)}\"><button class=\"{cls} btn-sm\" type=\"submit\">{label}</button></form>";
-        b.push_str(f"<tr><td>{esc(v.name)}</td><td>{esc(by.login)}</td><td>{form("accept", tr(ko, "Accept", "수락"), "btn")} {form("decline", tr(ko, "Decline", "거절"), "btn-2")}</td></tr>\n");
+        let form = |act: str, label: str, cls: str| f"<form method=\"post\" action=\"{lp(lg, "/me/invites/" + act)}\">{csrf_field(csrf)}<input type=\"hidden\" name=\"package\" value=\"{esc(v.name)}\"><button class=\"{cls} btn-sm\" type=\"submit\">{label}</button></form>";
+        b.push_str(f"<tr><td>{esc(v.name)}</td><td>{esc(by.login)}</td><td>{form("accept", tr(lg, "Accept", "수락", "接受", "接受"), "btn")} {form("decline", tr(lg, "Decline", "거절", "拒绝", "拒絕"), "btn-2")}</td></tr>\n");
     }
     b.push_str("</tbody>\n</table></div>\n");
 }
 
 /// For an admin: the locked accounts, taken-down packages and approved
 /// names on record (changed through the admin API).
-fn moderation_section(b: StrBuf, db: Db, ko: bool) {
+fn moderation_section(b: StrBuf, db: Db, lg: Lang) {
     let routes = "<code class=\"ic\">/api/v1/admin/lock</code>, <code class=\"ic\">/api/v1/admin/takedown</code>";
-    b.push_str(if ko { f"<h2 class=\"t-h3\">관리</h2>\n<p>admin 권한이 있는 토큰으로 {routes}, <code class=\"ic\">/api/v1/admin/approve</code>를 통해 바꿉니다. 모든 변경은 <code class=\"ic\">audit.nabion</code>에 남습니다.</p>\n" } else { f"<h2 class=\"t-h3\">Moderation</h2>\n<p>Changed with an admin token through {routes} and <code class=\"ic\">/api/v1/admin/approve</code>; each change is kept in <code class=\"ic\">audit.nabion</code>.</p>\n" });
+    b.push_str(tr(lg, f"<h2 class=\"t-h3\">Moderation</h2>\n<p>Changed with an admin token through {routes} and <code class=\"ic\">/api/v1/admin/approve</code>; each change is kept in <code class=\"ic\">audit.nabion</code>.</p>\n", f"<h2 class=\"t-h3\">관리</h2>\n<p>admin 권한이 있는 토큰으로 {routes}, <code class=\"ic\">/api/v1/admin/approve</code>를 통해 바꿉니다. 모든 변경은 <code class=\"ic\">audit.nabion</code>에 남습니다.</p>\n", f"<h2 class=\"t-h3\">内容管理</h2>\n<p>使用带 admin 权限的令牌，通过 {routes} 和 <code class=\"ic\">/api/v1/admin/approve</code> 更改；每次更改都记录在 <code class=\"ic\">audit.nabion</code> 中。</p>\n", f"<h2 class=\"t-h3\">內容管理</h2>\n<p>使用具備 admin 權限的權杖，透過 {routes} 和 <code class=\"ic\">/api/v1/admin/approve</code> 變更；每次變更都記錄在 <code class=\"ic\">audit.nabion</code> 中。</p>\n"));
     let rows = StrBuf::new();
-    for l in db.locked { rows.push_str(f"<tr><td>{tr(ko, "account", "계정")} {l.id}</td><td>{tr(ko, "locked", "잠김")}</td><td>{esc(l.reason)}</td><td>{date(l.at)}</td></tr>\n"); }
+    for l in db.locked { rows.push_str(f"<tr><td>{tr(lg, "account", "계정", "账户", "帳戶")} {l.id}</td><td>{tr(lg, "locked", "잠김", "已锁定", "已鎖定")}</td><td>{esc(l.reason)}</td><td>{date(l.at)}</td></tr>\n"); }
     for x in db.removed {
         let what = if x.version.is_empty() { x.name } else { f"{x.name} {x.version}" };
-        rows.push_str(f"<tr><td>{esc(what)}</td><td>{tr(ko, "taken down", "게시 중단")}</td><td>{esc(x.reason)}</td><td>{date(x.at)}</td></tr>\n");
+        rows.push_str(f"<tr><td>{esc(what)}</td><td>{tr(lg, "taken down", "게시 중단", "已下架", "已下架")}</td><td>{esc(x.reason)}</td><td>{date(x.at)}</td></tr>\n");
     }
-    for n in db.approved { rows.push_str(f"<tr><td>{esc(n)}</td><td>{tr(ko, "name approved", "이름 승인")}</td><td></td><td></td></tr>\n"); }
+    for n in db.approved { rows.push_str(f"<tr><td>{esc(n)}</td><td>{tr(lg, "name approved", "이름 승인", "名称已批准", "名稱已核准")}</td><td></td><td></td></tr>\n"); }
     if rows.is_empty() {
-        b.push_str(tr(ko, "<p>Nothing on record.</p>\n", "<p>기록된 것이 없습니다.</p>\n"));
+        b.push_str(tr(lg, "<p>Nothing on record.</p>\n", "<p>기록된 것이 없습니다.</p>\n", "<p>没有任何记录。</p>\n", "<p>沒有任何紀錄。</p>\n"));
     } else {
-        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>{tr(ko, "What", "대상")}</th><th>{tr(ko, "Action", "조치")}</th><th>{tr(ko, "Reason", "이유")}</th><th>{tr(ko, "Since", "시작")}</th></tr></thead>\n<tbody>\n{rows.to_str()}</tbody>\n</table></div>\n");
+        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>{tr(lg, "What", "대상", "对象", "對象")}</th><th>{tr(lg, "Action", "조치", "措施", "措施")}</th><th>{tr(lg, "Reason", "이유", "原因", "原因")}</th><th>{tr(lg, "Since", "시작", "起始时间", "起始時間")}</th></tr></thead>\n<tbody>\n{rows.to_str()}</tbody>\n</table></div>\n");
     }
 }
 
 /// The owners of the packages the account manages (every package with owners
 /// on record, for an admin), a remove button on each, and the add form.
-fn owners_section(b: StrBuf, csrf: str, db: Db, id: i64, admin: bool, ko: bool) {
-    b.push_str(f"<h2 class=\"t-h3\">{tr(ko, "Owners", "소유자")}</h2>\n");
-    b.push_str(tr(ko, "<p>A package's owners publish and yank it and manage its trusted publishers and owners. A user logs in here once before being invited, and owns the package once they accept on their account page. An organization or team (<code class=\"ic\">org/team</code>) is shown on the package's page once one of its repositories is a trusted publisher of it; its members publish through trusted publishing.</p>\n", "<p>패키지의 소유자는 패키지를 공개하고 철회하며, 신뢰할 수 있는 게시자와 소유자를 관리합니다. 사용자는 초대받기 전에 여기에 한 번 로그인해야 하고, 자기 계정 페이지에서 수락하면 소유자가 됩니다. 조직이나 팀(<code class=\"ic\">org/team</code>)은 그 저장소 하나가 패키지의 신뢰할 수 있는 게시자가 되면 패키지 페이지에 보이며, 구성원은 신뢰할 수 있는 게시로 공개합니다.</p>\n"));
+fn owners_section(b: StrBuf, csrf: str, db: Db, id: i64, admin: bool, lg: Lang) {
+    b.push_str(f"<h2 class=\"t-h3\">{tr(lg, "Owners", "소유자", "所有者", "擁有者")}</h2>\n");
+    b.push_str(tr(lg, "<p>A package's owners publish and yank it and manage its trusted publishers and owners. A user logs in here once before being invited, and owns the package once they accept on their account page. An organization or team (<code class=\"ic\">org/team</code>) is shown on the package's page once one of its repositories is a trusted publisher of it; its members publish through trusted publishing.</p>\n", "<p>패키지의 소유자는 패키지를 공개하고 철회하며, 신뢰할 수 있는 게시자와 소유자를 관리합니다. 사용자는 초대받기 전에 여기에 한 번 로그인해야 하고, 자기 계정 페이지에서 수락하면 소유자가 됩니다. 조직이나 팀(<code class=\"ic\">org/team</code>)은 그 저장소 하나가 패키지의 신뢰할 수 있는 게시자가 되면 패키지 페이지에 보이며, 구성원은 신뢰할 수 있는 게시로 공개합니다.</p>\n", "<p>包的所有者负责发布和撤回包，并管理它的可信发布者和所有者。用户需要先在这里登录一次才能被邀请，在自己的账户页面接受后即成为所有者。组织或团队（<code class=\"ic\">org/team</code>）的某个仓库成为包的可信发布者后，会显示在包的页面上；其成员通过可信发布来发布。</p>\n", "<p>套件的擁有者負責發布和撤回套件，並管理它的受信任發布者和擁有者。使用者需要先在這裡登入一次才能被邀請，在自己的帳戶頁面接受後即成為擁有者。組織或團隊（<code class=\"ic\">org/team</code>）的某個儲存庫成為套件的受信任發布者後，會顯示在套件的頁面上；其成員透過受信任發布來發布。</p>\n"));
     let rows = StrBuf::new();
-    let action = lp(ko, "/me/owners/remove");
+    let action = lp(lg, "/me/owners/remove");
     for o in db.owners {
         if o.name.starts_with("native/") || !may_manage(db, o.name, id, admin) { continue; }
         let who: List<meta::Person> = List::new();
@@ -338,69 +362,69 @@ fn owners_section(b: StrBuf, csrf: str, db: Db, id: i64, admin: bool, ko: bool) 
         for p in who {
             // An account is removed by its id: its login may have changed.
             let id_field = if p.org { "" } else { f"<input type=\"hidden\" name=\"id\" value=\"{p.id}\">" };
-            rows.push_str(f"<tr><td>{esc(o.name)}</td><td>{layout::person_link(p, 20)}</td><td><form method=\"post\" action=\"{action}\">{csrf_field(csrf)}<input type=\"hidden\" name=\"package\" value=\"{esc(o.name)}\"><input type=\"hidden\" name=\"login\" value=\"{esc(p.login)}\">{id_field}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(ko, "Remove", "제거")}</button></form></td></tr>\n");
+            rows.push_str(f"<tr><td>{esc(o.name)}</td><td>{layout::person_link(p, 20)}</td><td><form method=\"post\" action=\"{action}\">{csrf_field(csrf)}<input type=\"hidden\" name=\"package\" value=\"{esc(o.name)}\"><input type=\"hidden\" name=\"login\" value=\"{esc(p.login)}\">{id_field}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(lg, "Remove", "제거", "移除", "移除")}</button></form></td></tr>\n");
         }
     }
     for v in db.invites {
         if v.package.starts_with("native/") || !may_manage(db, v.package, id, admin) { continue; }
         let u = account_of(db, v.account) ?? Account { id: v.account, login: "", created: 0i64 };
-        rows.push_str(f"<tr><td>{esc(v.package)}</td><td>{layout::person_link(meta::Person { login: u.login, name: u.name, id: u.id }, 20)} <span class=\"muted\">{tr(ko, "invited", "초대됨")}</span></td><td><form method=\"post\" action=\"{action}\">{csrf_field(csrf)}<input type=\"hidden\" name=\"package\" value=\"{esc(v.package)}\"><input type=\"hidden\" name=\"login\" value=\"{esc(u.login)}\"><input type=\"hidden\" name=\"id\" value=\"{u.id}\"><button class=\"btn-2 btn-sm\" type=\"submit\">{tr(ko, "Withdraw", "초대 취소")}</button></form></td></tr>\n");
+        rows.push_str(f"<tr><td>{esc(v.package)}</td><td>{layout::person_link(meta::Person { login: u.login, name: u.name, id: u.id }, 20)} <span class=\"muted\">{tr(lg, "invited", "초대됨", "已邀请", "已邀請")}</span></td><td><form method=\"post\" action=\"{action}\">{csrf_field(csrf)}<input type=\"hidden\" name=\"package\" value=\"{esc(v.package)}\"><input type=\"hidden\" name=\"login\" value=\"{esc(u.login)}\"><input type=\"hidden\" name=\"id\" value=\"{u.id}\"><button class=\"btn-2 btn-sm\" type=\"submit\">{tr(lg, "Withdraw", "초대 취소", "撤销邀请", "撤銷邀請")}</button></form></td></tr>\n");
     }
     if rows.is_empty() {
-        b.push_str(tr(ko, "<p>No owners on record yet.</p>\n", "<p>아직 기록된 소유자가 없습니다.</p>\n"));
+        b.push_str(tr(lg, "<p>No owners on record yet.</p>\n", "<p>아직 기록된 소유자가 없습니다.</p>\n", "<p>还没有所有者记录。</p>\n", "<p>還沒有擁有者紀錄。</p>\n"));
     } else {
-        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>{tr(ko, "Package", "패키지")}</th><th>{tr(ko, "Owner", "소유자")}</th><th></th></tr></thead>\n<tbody>\n{rows.to_str()}</tbody>\n</table></div>\n");
+        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>{tr(lg, "Package", "패키지", "包", "套件")}</th><th>{tr(lg, "Owner", "소유자", "所有者", "擁有者")}</th><th></th></tr></thead>\n<tbody>\n{rows.to_str()}</tbody>\n</table></div>\n");
     }
-    b.push_str(f"<form method=\"post\" action=\"{lp(ko, "/me/owners")}\">{csrf_field(csrf)}<label>{tr(ko, "Package", "패키지")} <input name=\"package\" maxlength=\"64\" required></label> <label>{tr(ko, "Owner", "소유자")} <input name=\"login\" placeholder=\"{tr(ko, "login, org or org/team", "로그인, 조직, org/team")}\" maxlength=\"80\" required></label> <button class=\"btn btn-sm\" type=\"submit\">{tr(ko, "Add", "추가")}</button></form>\n");
+    b.push_str(f"<form method=\"post\" action=\"{lp(lg, "/me/owners")}\">{csrf_field(csrf)}<label>{tr(lg, "Package", "패키지", "包", "套件")} <input name=\"package\" maxlength=\"64\" required></label> <label>{tr(lg, "Owner", "소유자", "所有者", "擁有者")} <input name=\"login\" placeholder=\"{tr(lg, "login, org or org/team", "로그인, 조직, org/team", "登录名、组织或 org/team", "登入名稱、組織或 org/team")}\" maxlength=\"80\" required></label> <button class=\"btn btn-sm\" type=\"submit\">{tr(lg, "Add", "추가", "添加", "新增")}</button></form>\n");
 }
 
 /// The trusted publishers of the packages the account manages, a remove
 /// button on each (not on PACKAGES_TRUSTED's), and the form to add one.
-fn trusted_section(b: StrBuf, csrf: str, list: List<TrustedPublisher>, ko: bool) {
-    b.push_str(f"<h2 class=\"t-h3\">{tr(ko, "Trusted publishers", "신뢰할 수 있는 게시자")}</h2>\n");
+fn trusted_section(b: StrBuf, csrf: str, list: List<TrustedPublisher>, lg: Lang) {
+    b.push_str(f"<h2 class=\"t-h3\">{tr(lg, "Trusted publishers", "신뢰할 수 있는 게시자", "可信发布者", "受信任的發布者")}</h2>\n");
     let mins = trust::TOKEN_SECS / 60i64;
-    b.push_str(if ko { f"<p>여기에 적은 GitHub Actions 워크플로는 어디에도 토큰을 두지 않고 패키지를 공개합니다. 작업의 OIDC 토큰을 {mins}분 동안 쓰는 토큰으로 바꿉니다. 워크플로는 <a href=\"/ko/publishing#패키지-공개\">패키지 공개</a>에 있습니다.</p>\n" } else { f"<p>A GitHub Actions workflow named here publishes its package with no token kept anywhere: it trades the job's OIDC token for one that lasts {mins} minutes. <a href=\"/publishing#trusted-publishing\">Publishing</a> has the workflow.</p>\n" });
+    b.push_str(tr(lg, f"<p>A GitHub Actions workflow named here publishes its package with no token kept anywhere: it trades the job's OIDC token for one that lasts {mins} minutes. <a href=\"/publishing#trusted-publishing\">Publishing</a> has the workflow.</p>\n", f"<p>여기에 적은 GitHub Actions 워크플로는 어디에도 토큰을 두지 않고 패키지를 공개합니다. 작업의 OIDC 토큰을 {mins}분 동안 쓰는 토큰으로 바꿉니다. 워크플로는 <a href=\"/ko/publishing#패키지-공개\">패키지 공개</a>에 있습니다.</p>\n", f"<p>这里列出的 GitHub Actions 工作流无需在任何地方保存令牌即可发布它的包：它用作业的 OIDC 令牌换取一个有效期 {mins} 分钟的令牌。工作流见<a href=\"/zh-hans/publishing#发布包\">发布包</a>。</p>\n", f"<p>這裡列出的 GitHub Actions 工作流程不必在任何地方保存權杖即可發布它的套件：它用工作的 OIDC 權杖換取一個有效期 {mins} 分鐘的權杖。工作流程請見<a href=\"/zh-hant/publishing#發布套件\">發布套件</a>。</p>\n"));
     if list.is_empty() {
-        b.push_str(tr(ko, "<p>No trusted publishers yet.</p>\n", "<p>아직 신뢰할 수 있는 게시자가 없습니다.</p>\n"));
+        b.push_str(tr(lg, "<p>No trusted publishers yet.</p>\n", "<p>아직 신뢰할 수 있는 게시자가 없습니다.</p>\n", "<p>还没有可信发布者。</p>\n", "<p>還沒有受信任的發布者。</p>\n"));
     } else {
-        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>{tr(ko, "Package", "패키지")}</th><th>{tr(ko, "Repository", "저장소")}</th><th>{tr(ko, "Workflow", "워크플로")}</th><th>{tr(ko, "Environment", "환경")}</th><th></th></tr></thead>\n<tbody>\n");
+        b.push_str(f"<div class=\"table-wrap\"><table class=\"tbl\">\n<thead><tr><th>{tr(lg, "Package", "패키지", "包", "套件")}</th><th>{tr(lg, "Repository", "저장소", "仓库", "儲存庫")}</th><th>{tr(lg, "Workflow", "워크플로", "工作流", "工作流程")}</th><th>{tr(lg, "Environment", "환경", "环境", "環境")}</th><th></th></tr></thead>\n<tbody>\n");
         for p in list {
-            let env = if p.environment.is_empty() { f"<span class=\"muted\">{tr(ko, "any", "제한 없음")}</span>" } else { esc(p.environment) };
-            let act = if p.seeded { f"<span class=\"muted\">{tr(ko, "server config", "서버 설정")}</span>" } else { f"<form method=\"post\" action=\"{lp(ko, f"/me/trusted/{esc(p.id)}/remove")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(ko, "Remove", "제거")}</button></form>" };
+            let env = if p.environment.is_empty() { f"<span class=\"muted\">{tr(lg, "any", "제한 없음", "不限", "不限")}</span>" } else { esc(p.environment) };
+            let act = if p.seeded { f"<span class=\"muted\">{tr(lg, "server config", "서버 설정", "服务器配置", "伺服器設定")}</span>" } else { f"<form method=\"post\" action=\"{lp(lg, f"/me/trusted/{esc(p.id)}/remove")}\">{csrf_field(csrf)}<button class=\"btn-2 btn-sm\" type=\"submit\">{tr(lg, "Remove", "제거", "移除", "移除")}</button></form>" };
             b.push_str(f"<tr><td>{esc(p.package)}</td><td>{esc(p.repository)}</td><td>{esc(p.workflow)}</td><td>{env}</td><td>{act}</td></tr>\n");
         }
         b.push_str("</tbody>\n</table></div>\n");
     }
-    b.push_str(f"<form method=\"post\" action=\"{lp(ko, "/me/trusted")}\">{csrf_field(csrf)}<label>{tr(ko, "Package", "패키지")} <input name=\"package\" maxlength=\"64\" required></label> <label>{tr(ko, "Repository", "저장소")} <input name=\"repository\" placeholder=\"owner/repo\" maxlength=\"140\" required></label> <label>{tr(ko, "Workflow", "워크플로")} <input name=\"workflow\" placeholder=\"publish.yml\" maxlength=\"255\" required></label> <label>{tr(ko, "Environment", "환경")} <input name=\"environment\" placeholder=\"{tr(ko, "optional", "선택")}\" maxlength=\"255\"></label> <button class=\"btn btn-sm\" type=\"submit\">{tr(ko, "Add", "추가")}</button></form>\n");
+    b.push_str(f"<form method=\"post\" action=\"{lp(lg, "/me/trusted")}\">{csrf_field(csrf)}<label>{tr(lg, "Package", "패키지", "包", "套件")} <input name=\"package\" maxlength=\"64\" required></label> <label>{tr(lg, "Repository", "저장소", "仓库", "儲存庫")} <input name=\"repository\" placeholder=\"owner/repo\" maxlength=\"140\" required></label> <label>{tr(lg, "Workflow", "워크플로", "工作流", "工作流程")} <input name=\"workflow\" placeholder=\"publish.yml\" maxlength=\"255\" required></label> <label>{tr(lg, "Environment", "환경", "环境", "環境")} <input name=\"environment\" placeholder=\"{tr(lg, "optional", "선택", "可选", "選填")}\" maxlength=\"255\"></label> <button class=\"btn btn-sm\" type=\"submit\">{tr(lg, "Add", "추가", "添加", "新增")}</button></form>\n");
 }
 
 /// `/me`, `/logout`, `/me/tokens..`, `/me/trusted..`, `/me/owners..` and
-/// `/me/invites..` (each also under `/ko`): the session's account pages.
+/// `/me/invites..` (each also under `/ko`, `/zh-hans`, ..): the session's account pages.
 /// The data file is read as it is; each change takes `LOCK` for its own
 /// read and write.
 pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
-    let ko = ko_path(r.path);
-    // The form's path without `/ko`; messages keep `r.path`, which says
-    // the language.
-    let path = unko(r.path);
-    let me = lp(ko, "/me");
+    let lg = lang_path(r.path);
+    // The form's path without its language; messages keep `r.path`,
+    // which says the language.
+    let path = unlang(r.path);
+    let me = lp(lg, "/me");
     let db = try load_db(cfg);
     let s = session_of(db, r) ?? Session { hash: "", account: 0i64, csrf: "", expires: 0i64 };
     if s.hash.is_empty() {
-        return if r.method == "GET" || r.method == "HEAD" { redirect(lp(ko, "/login"), []) } else { message(site, r.path, 401, "Not logged in", "Log in first, then send the form again from the account page.", "로그인하지 않았습니다", "먼저 로그인한 뒤, 계정 페이지에서 양식을 다시 보내십시오.") };
+        return if r.method == "GET" || r.method == "HEAD" { redirect(lp(lg, "/login"), []) } else { message(site, r.path, 401, tr(lg, "Not logged in", "로그인하지 않았습니다", "未登录", "尚未登入"), tr(lg, "Log in first, then send the form again from the account page.", "먼저 로그인한 뒤, 계정 페이지에서 양식을 다시 보내십시오.", "请先登录，然后从账户页面重新提交表单。", "請先登入，然後從帳戶頁面重新送出表單。")) };
     }
     if r.method == "GET" || r.method == "HEAD" { return me_page(cfg, site, r.path, db, s, ""); }
     if !limit::allow("ip:" + client, 2i64 * cfg.rate) || !limit::allow(f"acct:{s.account}", cfg.rate) {
-        let m = message(site, r.path, 429, "Too many changes", "Wait a minute, then send the form again.", "변경이 너무 많습니다", "1분 기다린 뒤 양식을 다시 보내십시오.");
+        let m = message(site, r.path, 429, tr(lg, "Too many changes", "변경이 너무 많습니다", "更改过多", "變更過多"), tr(lg, "Wait a minute, then send the form again.", "1분 기다린 뒤 양식을 다시 보내십시오.", "请等一分钟，然后重新提交表单。", "請等一分鐘，然後重新送出表單。"));
         m.headers.push("Retry-After: 60");
         return m;
     }
     if !r.header("content-type").starts_with("application/x-www-form-urlencoded") {
-        return message(site, r.path, 415, "Bad form", "Send the form from the account page.", "잘못된 양식", "계정 페이지에서 양식을 보내십시오.");
+        return message(site, r.path, 415, tr(lg, "Bad form", "잘못된 양식", "表单无效", "表單無效"), tr(lg, "Send the form from the account page.", "계정 페이지에서 양식을 보내십시오.", "请从账户页面提交表单。", "請從帳戶頁面送出表單。"));
     }
     let f = http::form(r.body);
     if !secret::same(f.get("csrf") ?? "", s.csrf) {
-        return message(site, r.path, 403, "Bad form", "The form expired; reload the account page.", "잘못된 양식", "양식이 만료되었습니다. 계정 페이지를 새로 고치십시오.");
+        return message(site, r.path, 403, tr(lg, "Bad form", "잘못된 양식", "表单无效", "表單無效"), tr(lg, "The form expired; reload the account page.", "양식이 만료되었습니다. 계정 페이지를 새로 고치십시오.", "表单已过期，请刷新账户页面。", "表單已過期，請重新整理帳戶頁面。"));
     }
     if path == "/logout" {
         using g = LOCK.lock() {
@@ -413,7 +437,7 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
             try save_db(cfg, d);
         }
         audit(cfg, Audit { at: now_secs(), by: s.account, action: "logout", target: session_id(s) });
-        return redirect(lp(ko, "/"), [cookie(SESSION_COOKIE, "", 0i64)]);
+        return redirect(lp(lg, "/"), [cookie(SESSION_COOKIE, "", 0i64)]);
     }
     // `/me/sessions/<id>/logout` and `/me/sessions/logout-all`.
     if let rest: str = path.strip_prefix("/me/sessions/") {
@@ -437,9 +461,9 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
                 try save_db(cfg, d);
             }
         }
-        if !found { return message(site, r.path, 404, "No such session", "It has ended already; reload the account page.", "그런 세션이 없습니다", "이미 끝난 세션입니다. 계정 페이지를 새로 고치십시오."); }
+        if !found { return message(site, r.path, 404, tr(lg, "No such session", "그런 세션이 없습니다", "没有这个会话", "沒有這個工作階段"), tr(lg, "It has ended already; reload the account page.", "이미 끝난 세션입니다. 계정 페이지를 새로 고치십시오.", "该会话已经结束，请刷新账户页面。", "該工作階段已經結束，請重新整理帳戶頁面。")); }
         audit(cfg, Audit { at: now_secs(), by: s.account, action: if all { "logout-all" } else { "logout" }, target: if all { "all" } else { which } });
-        return if this_one { redirect(lp(ko, "/"), [cookie(SESSION_COOKIE, "", 0i64)]) } else { redirect(me + "#sessions", []) };
+        return if this_one { redirect(lp(lg, "/"), [cookie(SESSION_COOKIE, "", 0i64)]) } else { redirect(me + "#sessions", []) };
     }
     let a = account_of(db, s.account) ?? Account { id: 0i64, login: "", created: 0i64 };
     if path == "/me/notices" {
@@ -464,21 +488,21 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
     if path == "/me/invites/accept" || path == "/me/invites/decline" {
         let package = (f.get("package") ?? "").trim();
         let yes = path == "/me/invites/accept";
-        try accept_invite(cfg, a, package, yes) catch e { return refusal(site, r.path, e.status, "Invitation", "초대", e.msg); };
+        try accept_invite(cfg, a, package, yes) catch e { return refusal(site, r.path, e.status, tr(lg, "Invitation", "초대", "邀请", "邀請"), e.msg); };
         return redirect(me, []);
     }
     let admin = is_admin(cfg, a.id);
     if !may_act(cfg, a.id) {
-        return message(site, r.path, 403, "Publishing is not open yet", "This account can log in, but cannot create tokens, add trusted publishers or owners, publish or yank yet.", "아직 공개가 열리지 않았습니다", "이 계정은 로그인할 수 있지만, 아직 토큰을 만들거나 신뢰할 수 있는 게시자나 소유자를 추가하거나, 공개하거나 철회할 수 없습니다.");
+        return message(site, r.path, 403, tr(lg, "Publishing is not open yet", "아직 공개가 열리지 않았습니다", "发布暂未开放", "發布尚未開放"), tr(lg, "This account can log in, but cannot create tokens, add trusted publishers or owners, publish or yank yet.", "이 계정은 로그인할 수 있지만, 아직 토큰을 만들거나 신뢰할 수 있는 게시자나 소유자를 추가하거나, 공개하거나 철회할 수 없습니다.", "此账户可以登录，但还不能创建令牌、添加可信发布者或所有者、发布或撤回。", "此帳戶可以登入，但還不能建立權杖、新增受信任的發布者或擁有者、發布或撤回。"));
     }
     if path == "/me/owners" || path == "/me/owners/remove" {
         let package = (f.get("package") ?? "").trim();
         let who = (f.get("login") ?? "").trim();
         if path == "/me/owners" {
-            try add_owner(cfg, a, admin, package, who) catch e { return refusal(site, r.path, e.status, "Owner not added", "소유자를 추가하지 못했습니다", e.msg); };
+            try add_owner(cfg, a, admin, package, who) catch e { return refusal(site, r.path, e.status, tr(lg, "Owner not added", "소유자를 추가하지 못했습니다", "未能添加所有者", "無法新增擁有者"), e.msg); };
         } else {
             let id = try (f.get("id") ?? "0").trim().parse::<i64>() catch _ { 0i64 };
-            try remove_owner(cfg, a, admin, package, who, id) catch e { return refusal(site, r.path, e.status, "Owner not removed", "소유자를 제거하지 못했습니다", e.msg); };
+            try remove_owner(cfg, a, admin, package, who, id) catch e { return refusal(site, r.path, e.status, tr(lg, "Owner not removed", "소유자를 제거하지 못했습니다", "未能移除所有者", "無法移除擁有者"), e.msg); };
         }
         return redirect(me, []);
     }
@@ -486,30 +510,30 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
         let package = (f.get("package") ?? "").trim();
         let version = (f.get("version") ?? "").trim();
         if (f.get("confirm") ?? "") != "yes" { return confirm_delete(site, r.path, s.csrf, package, version); }
-        try delete::delete_version(cfg, a, admin, package, version, f"{a.login} <{a.id}+{a.login}@users.noreply.github.com>", List::new()) catch e { return refusal(site, r.path, e.status, "Version not deleted", "버전을 삭제하지 못했습니다", e.msg, "삭제할 수 없는 버전입니다. 아래 이유를 확인하고, 필요하면 철회하십시오."); };
+        try delete::delete_version(cfg, a, admin, package, version, f"{a.login} <{a.id}+{a.login}@users.noreply.github.com>", List::new()) catch e { return refusal(site, r.path, e.status, tr(lg, "Version not deleted", "버전을 삭제하지 못했습니다", "未能删除版本", "無法刪除版本"), e.msg, tr(lg, "", "삭제할 수 없는 버전입니다. 아래 이유를 확인하고, 필요하면 철회하십시오.", "这个版本无法删除。请查看下面的原因，必要时改为撤回。", "這個版本無法刪除。請查看下面的原因，必要時改為撤回。")); };
         return redirect(me + "#versions", []);
     }
     if path == "/me/trusted" {
         let p = TrustedPublisher { package: (f.get("package") ?? "").trim(), repository: (f.get("repository") ?? "").trim(), workflow: (f.get("workflow") ?? "").trim(), environment: (f.get("environment") ?? "").trim() };
-        try add_trusted(cfg, a, admin, p) catch e { return refusal(site, r.path, e.status, "Trusted publisher not added", "신뢰할 수 있는 게시자를 추가하지 못했습니다", e.msg); };
+        try add_trusted(cfg, a, admin, p) catch e { return refusal(site, r.path, e.status, tr(lg, "Trusted publisher not added", "신뢰할 수 있는 게시자를 추가하지 못했습니다", "未能添加可信发布者", "無法新增受信任的發布者"), e.msg); };
         return redirect(me, []);
     }
     if let rest: str = path.strip_prefix("/me/trusted/") {
-        try remove_trusted(cfg, a, admin, rest.strip_suffix("/remove") ?? "") catch e { return refusal(site, r.path, e.status, "Trusted publisher not removed", "신뢰할 수 있는 게시자를 제거하지 못했습니다", e.msg); };
+        try remove_trusted(cfg, a, admin, rest.strip_suffix("/remove") ?? "") catch e { return refusal(site, r.path, e.status, tr(lg, "Trusted publisher not removed", "신뢰할 수 있는 게시자를 제거하지 못했습니다", "未能移除可信发布者", "無法移除受信任的發布者"), e.msg); };
         return redirect(me, []);
     }
     if path == "/me/tokens" {
         let name = (f.get("name") ?? "").trim();
         if name.is_empty() || name.char_count() > 64 {
-            return message(site, r.path, 400, "Bad token name", "A token name is 1 to 64 characters.", "잘못된 토큰 이름", "토큰 이름은 1자에서 64자까지입니다.");
+            return message(site, r.path, 400, tr(lg, "Bad token name", "잘못된 토큰 이름", "令牌名称无效", "權杖名稱無效"), tr(lg, "A token name is 1 to 64 characters.", "토큰 이름은 1자에서 64자까지입니다.", "令牌名称为 1 到 64 个字符。", "權杖名稱為 1 到 64 個字元。"));
         }
         let dt = (f.get("days") ?? "").trim();
         let days = if dt.is_empty() { TOKEN_DAYS } else { try dt.parse::<i64>() catch _ { 0i64 } };
         if days < 1i64 || days > TOKEN_DAYS_MAX {
-            return message(site, r.path, 400, "Bad token lifetime", f"A token lasts 1 to {TOKEN_DAYS_MAX} days; write a number of days, such as {TOKEN_DAYS}.", "잘못된 토큰 기간", f"토큰은 1일에서 {TOKEN_DAYS_MAX}일까지 씁니다. {TOKEN_DAYS}처럼 날 수를 적으십시오.");
+            return message(site, r.path, 400, tr(lg, "Bad token lifetime", "잘못된 토큰 기간", "令牌有效期无效", "權杖有效期無效"), tr(lg, f"A token lasts 1 to {TOKEN_DAYS_MAX} days; write a number of days, such as {TOKEN_DAYS}.", f"토큰은 1일에서 {TOKEN_DAYS_MAX}일까지 씁니다. {TOKEN_DAYS}처럼 날 수를 적으십시오.", f"令牌有效期为 1 到 {TOKEN_DAYS_MAX} 天；请填写天数，例如 {TOKEN_DAYS}。", f"權杖有效期為 1 到 {TOKEN_DAYS_MAX} 天；請填寫天數，例如 {TOKEN_DAYS}。"));
         }
         let only = token_packages(f.get("packages") ?? "") ?? {
-            return message(site, r.path, 400, "Bad package list", "Write package names separated by commas, such as `json, toml`, or leave it empty for all your packages.", "잘못된 패키지 목록", "`json, toml`처럼 패키지 이름을 쉼표로 구분해 적거나, 내 패키지 전부에 쓰려면 비워 두십시오.");
+            return message(site, r.path, 400, tr(lg, "Bad package list", "잘못된 패키지 목록", "包列表无效", "套件清單無效"), tr(lg, "Write package names separated by commas, such as `json, toml`, or leave it empty for all your packages.", "`json, toml`처럼 패키지 이름을 쉼표로 구분해 적거나, 내 패키지 전부에 쓰려면 비워 두십시오.", "填写以逗号分隔的包名，例如 `json, toml`；留空则用于你的所有包。", "填寫以逗號分隔的套件名稱，例如 `json, toml`；留空則用於你的所有套件。"));
         };
         // The page's form says it lists the scopes; without that (a
         // script, an old page) a token gets the defaults.
@@ -519,13 +543,13 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
         }
         if picked.is_empty() && (f.get("scopes") ?? "").is_empty() { picked = default_scopes(); }
         if picked.is_empty() {
-            return message(site, r.path, 400, "Nothing chosen", "Tick at least one thing the token may do, such as publishing new versions.", "고른 권한이 없습니다", "새 버전 공개처럼 토큰이 할 일을 하나 이상 체크하십시오.");
+            return message(site, r.path, 400, tr(lg, "Nothing chosen", "고른 권한이 없습니다", "没有选择权限", "沒有選擇權限"), tr(lg, "Tick at least one thing the token may do, such as publishing new versions.", "새 버전 공개처럼 토큰이 할 일을 하나 이상 체크하십시오.", "至少勾选一项令牌可以做的事，例如发布新版本。", "至少勾選一項權杖可以做的事，例如發布新版本。"));
         }
         if picked.contains(SCOPE_ADMIN) && !admin {
-            return message(site, r.path, 403, "Not an admin", "Only the registry admins give a token the admin scope; untick it.", "관리자가 아닙니다", "admin 권한은 레지스트리 관리자만 토큰에 줄 수 있습니다. 체크를 해제하십시오.");
+            return message(site, r.path, 403, tr(lg, "Not an admin", "관리자가 아닙니다", "不是管理员", "不是管理員"), tr(lg, "Only the registry admins give a token the admin scope; untick it.", "admin 권한은 레지스트리 관리자만 토큰에 줄 수 있습니다. 체크를 해제하십시오.", "只有注册表管理员才能给令牌 admin 权限，请取消勾选。", "只有登錄庫管理員才能給權杖 admin 權限，請取消勾選。"));
         }
         if picked.contains(SCOPE_ADMIN) && !only.is_empty() {
-            return message(site, r.path, 400, "Admin token limited to packages", "A token limited to some packages cannot moderate; leave Packages empty, or untick the admin scope.", "패키지가 제한된 관리 토큰", "일부 패키지로 제한한 토큰은 관리할 수 없습니다. 패키지를 비워 두거나 admin 권한의 체크를 해제하십시오.");
+            return message(site, r.path, 400, tr(lg, "Admin token limited to packages", "패키지가 제한된 관리 토큰", "限定了包的管理令牌", "限定了套件的管理權杖"), tr(lg, "A token limited to some packages cannot moderate; leave Packages empty, or untick the admin scope.", "일부 패키지로 제한한 토큰은 관리할 수 없습니다. 패키지를 비워 두거나 admin 권한의 체크를 해제하십시오.", "限定于部分包的令牌不能进行内容管理；请让“包”留空，或取消勾选 admin 权限。", "限定於部分套件的權杖不能進行內容管理；請讓「套件」留空，或取消勾選 admin 權限。"));
         }
         let tok = "pkg_" + try secret::random_hex(32);
         let id = try secret::random_hex(8);
@@ -536,7 +560,7 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
             for t in d.tokens {
                 if t.account == a.id { n += 1; }
             }
-            if n >= MAX_TOKENS { return message(site, r.path, 400, "Too many tokens", f"Revoke one first (at most {MAX_TOKENS}).", "토큰이 너무 많습니다", f"먼저 하나를 폐기하십시오(최대 {MAX_TOKENS}개)."); }
+            if n >= MAX_TOKENS { return message(site, r.path, 400, tr(lg, "Too many tokens", "토큰이 너무 많습니다", "令牌过多", "權杖過多"), tr(lg, f"Revoke one first (at most {MAX_TOKENS}).", f"먼저 하나를 폐기하십시오(최대 {MAX_TOKENS}개).", f"请先吊销一个（最多 {MAX_TOKENS} 个）。", f"請先撤銷一個（最多 {MAX_TOKENS} 個）。")); }
             let now = now_secs();
             d.tokens.push(Token { id: id, name: name, account: a.id, hash: secret::sha256_hex(tok), created: now, last_used: 0i64, expires: now + days * 86400i64, packages: only, scopes: picked });
             for k in token_keys(d, a.id, only) { record(ref d, Event { package: k, at: now, by: a.id, who: a.login, action: "token-create", detail: f"{name}: {picked.join(", ")}" }); }
@@ -557,7 +581,7 @@ pub fn account_route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Re
         for t in d.tokens {
             if t.id == id && t.account == a.id { gone = t; } else { keep.push(t); }
         }
-        let was = gone ?? { return message(site, r.path, 404, "No such token", "It was revoked already.", "그런 토큰이 없습니다", "이미 폐기한 토큰입니다."); };
+        let was = gone ?? { return message(site, r.path, 404, tr(lg, "No such token", "그런 토큰이 없습니다", "没有这个令牌", "沒有這個權杖"), tr(lg, "It was revoked already.", "이미 폐기한 토큰입니다.", "该令牌已被吊销。", "該權杖已被撤銷。")); };
         d.tokens = keep;
         for k in token_keys(d, a.id, was.packages) { record(ref d, Event { package: k, at: now_secs(), by: a.id, who: a.login, action: "token-revoke", detail: was.name }); }
         try save_db(cfg, d);
@@ -586,9 +610,9 @@ fn token_packages(text: str) -> List<str> | none {
 
 #[test]
 fn dates() {
-    assert(date(0i64) == "never" && date(1700000000i64) == "2023-11-14" && date(951782400i64) == "2000-02-29" && day(0i64, true) == "없음", "dates");
+    assert(date(0i64) == "never" && date(1700000000i64) == "2023-11-14" && date(951782400i64) == "2000-02-29" && day(0i64, Lang::Ko) == "없음" && day(0i64, Lang::ZhHant) == "從未", "dates");
     assert(event_text(Event { package: "geom", at: 0i64, by: 5i64, who: "ann", action: "yank", detail: "0.1.0: broken" }) == "yanked 0.1.0: broken" && event_text(Event { package: "geom", at: 0i64, by: 5i64, who: "ann", action: "new-thing" }) == "new-thing", "events");
-    assert(event_text(Event { package: "geom", at: 0i64, by: 5i64, who: "ann", action: "publish", detail: "0.1.0" }, true) == "0.1.0 공개", "korean events");
-    assert(scope_text("yank", "yank and unyank versions", true) == "버전 철회와 철회 취소" && scope_text("yank", "yank and unyank versions", false) == "yank and unyank versions", "scopes");
+    assert(event_text(Event { package: "geom", at: 0i64, by: 5i64, who: "ann", action: "publish", detail: "0.1.0" }, Lang::Ko) == "0.1.0 공개" && event_text(Event { package: "geom", at: 0i64, by: 5i64, who: "ann", action: "yank", detail: "0.1.0" }, Lang::ZhHans) == "撤回 0.1.0", "korean and chinese events");
+    assert(scope_text("yank", "yank and unyank versions", Lang::Ko) == "버전 철회와 철회 취소" && scope_text("yank", "yank and unyank versions", Lang::En) == "yank and unyank versions", "scopes");
     assert((token_packages("") ?? ["x"]).is_empty() && (token_packages("json, Nabi-Syntax,json") ?? List::new()).join(" ") == "json nabi_syntax" && token_packages("a b/c") is none, "token packages");
 }

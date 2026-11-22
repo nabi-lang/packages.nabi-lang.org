@@ -11,6 +11,7 @@
 use pkg::index;
 use pkg::index::ApiError;
 use pkg::json;
+use pkg::layout::{Lang, lang_root, tr};
 use pkg::packages;
 use pkg::server::account::date;
 use markdown::esc;
@@ -573,24 +574,26 @@ pub fn advisory_page(a: Advisory, base: str) -> str {
 
 /// The red banner of a package or version page: the live advisories of
 /// `xs` that affect `version` of `name`; "" for none.
-pub fn banner(xs: List<Advisory>, name: str, version: str, ko: bool = false) -> str {
+pub fn banner(xs: List<Advisory>, name: str, version: str, lg: Lang = Lang::En) -> str {
     let hit = affecting(xs, name, version);
     if hit.is_empty() { return ""; }
-    let lp = if ko { "/ko" } else { "" };
+    let lp = lang_root(lg);
     let links: List<str> = List::new();
     for a in hit { links.push(f"<a href=\"{lp}{esc(href(a.id))}\">{esc(a.id)}</a>: {esc(a.summary)}"); }
-    if ko {
-        return f"<div class=\"callout vuln\" role=\"alert\"><span class=\"lab\">보안</span><span>보안 권고 {hit.len()}건이 {esc(name)} {esc(version)}에 해당합니다. {links.join("; ")}. 수정된 버전으로 올리세요.</span></div>";
-    }
+    let nv = f"{esc(name)} {esc(version)}";
     let n = if hit.len() == 1 { "1 advisory affects" } else { f"{hit.len()} advisories affect" };
-    f"<div class=\"callout vuln\" role=\"alert\"><span class=\"lab\">security</span><span>{n} {esc(name)} {esc(version)}. {links.join("; ")}. Upgrade to a fixed version.</span></div>"
+    let text = tr(lg, f"{n} {nv}. {links.join("; ")}. Upgrade to a fixed version.", f"보안 권고 {hit.len()}건이 {nv}에 해당합니다. {links.join("; ")}. 수정된 버전으로 올리세요.", f"{hit.len()} 条安全公告影响 {nv}。{links.join("；")}。请升级到已修复的版本。", f"{hit.len()} 則安全性公告影響 {nv}。{links.join("；")}。請升級到已修正的版本。");
+    f"<div class=\"callout vuln\" role=\"alert\"><span class=\"lab\">{tr(lg, "security", "보안", "安全", "安全性")}</span><span>{text}</span></div>"
 }
 
 /// The side panel's line: each public advisory on `name`, those that
 /// affect `version` marked; none when there are none.
-pub fn side_kv(xs: List<Advisory>, name: str, version: str, ko: bool = false) -> str {
-    let lp = if ko { "/ko" } else { "" };
-    let (label, nothing, aff, aff_t) = if ko { ("보안 권고", "없음", "해당", "이 버전에 해당합니다") } else { ("Advisories", "None", "affects", "affects this version") };
+pub fn side_kv(xs: List<Advisory>, name: str, version: str, lg: Lang = Lang::En) -> str {
+    let lp = lang_root(lg);
+    let label = tr(lg, "Advisories", "보안 권고", "安全公告", "安全性公告");
+    let nothing = tr(lg, "None", "없음", "无", "無");
+    let aff = tr(lg, "affects", "해당", "受影响", "受影響");
+    let aff_t = tr(lg, "affects this version", "이 버전에 해당합니다", "影响此版本", "影響此版本");
     let k = index::key(name);
     let items: List<str> = List::new();
     for a in xs {
