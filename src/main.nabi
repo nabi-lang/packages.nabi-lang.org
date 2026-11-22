@@ -316,8 +316,6 @@ fn main() throws {
     files.insert("404.html", layout::page(site, "404.html", "Not found", layout::not_found()));
     // The policies, in English at /<name> and Korean at /ko/<name>.
     let policies: List<(str, str, str, str)> = [
-        ("terms", "Terms of use", "이용약관", "The terms of using the Nabi package registry."),
-        ("privacy", "Privacy notice", "개인정보 처리방침", "What the Nabi package registry keeps about you, and why."),
         ("policy", "Usage policy", "이용 정책", "What may be published in the Nabi package registry, and how reports are handled."),
     ];
     for (slug, en, ko, about) in policies {

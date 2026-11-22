@@ -197,6 +197,12 @@ expect_body 'href="/login">Log in' "login button logged out"
 req GET / -H "Cookie: __Host-pkg_session=$(printf 'ab%.0s' $(seq 32))"
 expect_body 'href="/login">Log in' "login button with a dead session"
 [ "$(header cache-control)" = "public, max-age=0, must-revalidate, s-maxage=86400" ] || fail "dead session cache: $(header cache-control)"
+req GET /.well-known/security.txt
+expect_code 200 "security.txt"
+expect_body 'Contact: mailto:security@nabi-lang.org' "security.txt contact"
+req GET /privacy
+expect_code 301 "privacy moved"
+[ "$(header location)" = https://nabi-lang.org/privacy ] || fail "privacy location: $(header location)"
 ok "static files"
 
 # CSP reports: anyone may send them, so an address's past 30 a minute

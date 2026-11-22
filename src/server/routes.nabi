@@ -91,6 +91,14 @@ fn missing_package(site: Site, p: str, rest: str, query: str) -> Resp | none {
 pub fn route(cfg: Cfg, site: Site, r: Request, client: str) throws -> Resp {
     let p = r.path;
     if p == "/api/health" && (r.method == "GET" || r.method == "HEAD") { return health(site); }
+    if p == "/.well-known/security.txt" && (r.method == "GET" || r.method == "HEAD") {
+        return Resp { status: 200, headers: ["Content-Type: text/plain; charset=utf-8", "Cache-Control: " + HTML_CACHE], body: web::chrome::security_txt(site.base_url), file: "" };
+    }
+    // One privacy notice and one set of terms for every Nabi site, on
+    // nabi-lang.org (web::chrome::legal_links).
+    for (from, to) in [("/privacy", "https://nabi-lang.org/privacy"), ("/terms", "https://nabi-lang.org/terms"), ("/ko/privacy", "https://nabi-lang.org/ko/privacy"), ("/ko/terms", "https://nabi-lang.org/ko/terms")] {
+        if p == from { return Resp { status: 301, headers: ["Location: " + to, "Cache-Control: public, max-age=86400"], body: "", file: "" }; }
+    }
     if p.starts_with("/api/") { return api_route(cfg, r, client); }
     if p == http::REPORT_PATH {
         if r.method != "POST" { return Resp { status: 405, headers: ["Content-Type: text/plain; charset=utf-8", "Cache-Control: no-store"], body: "POST only\n", file: "" }; }

@@ -117,20 +117,15 @@ fn search_box() -> str {
     f"<form class=\"search\" role=\"search\" action=\"/packages\">{icon_search()}<input class=\"q\" name=\"q\" type=\"search\" placeholder=\"Search packages\" aria-label=\"Search packages\" aria-keyshortcuts=\"/ Control+K Meta+K\" autocomplete=\"off\" spellcheck=\"false\" role=\"combobox\" aria-autocomplete=\"list\" aria-expanded=\"false\" aria-controls=\"results\"><kbd class=\"kbd\" aria-hidden=\"true\">/</kbd><ul id=\"results\" class=\"results appear\" role=\"listbox\" aria-label=\"Search results\" hidden></ul><p class=\"sr-only\" role=\"status\"></p></form>"
 }
 
-/// The footer of the Nabi sites (chrome.nabi), with this site's columns.
+/// The footer every Nabi site shares (chrome::site_cols, legal links in
+/// its bar).
 fn footer(site: Site) -> str {
-    let d = esc(site.docs) + "/latest";
-    let gh = "https://github.com/nabi-lang";
+    let l = chrome::Links { home: site.home + "/", docs: site.docs + "/latest/", docs_host: site.docs + "/", registry: "/", playground: site.playground + "/" };
     chrome::footer(chrome::Footer {
         home: site.home,
         logo: "/logo.svg",
         tagline: "Clear rules, free as a butterfly.",
-        cols: [
-            ("Learn", f"<a href=\"{d}/learn\">Guide</a><a href=\"{d}/examples\">Examples</a><a href=\"{esc(site.playground)}\">Playground</a>"),
-            ("Reference", f"<a href=\"{d}/spec\">Language spec</a><a href=\"{d}/std\">Std library</a><a href=\"{d}/learn/16-tools\">Tools</a>"),
-            ("Ecosystem", f"<a href=\"/\">Packages</a><a href=\"/publishing\">Publishing</a><a href=\"/policy\">Usage policy</a><a href=\"/terms\">Terms</a><a href=\"/privacy\">Privacy</a>"),
-            ("Project", f"<a href=\"{esc(site.home)}/roadmap\">Roadmap</a><a href=\"{gh}\">GitHub</a><a href=\"{chrome::SECURITY}\">Security</a><a href=\"{gh}/nabi/blob/main/CODE_OF_CONDUCT.md\">Code of conduct</a>"),
-        ],
+        cols: chrome::site_cols(l, false),
         sites: chrome::Sites { home: site.home, docs: site.docs + "/latest", registry: "/", playground: site.playground, current: "registry" },
         release: site.release,
     })
@@ -198,7 +193,7 @@ pub fn page_desc(site: Site, out: str, title: str, about: str, body: str, img: s
 <div class=\"frame in\">
 <a class=\"brand\" href=\"/\">{web::chrome::wordmark("Nabi")}<span class=\"sl\" aria-hidden=\"true\">/</span><span class=\"site\">packages</span></a>
 {search_box()}
-<nav id=\"nav\" class=\"nav\" aria-label=\"Registry\"><a href=\"/packages\"{browse}>Browse</a><a href=\"/publishing\"{publish}>Publishing</a><a href=\"{esc(site.docs)}/latest\" title=\"The guide, the language reference and the standard library, on docs.nabi-lang.org\">Nabi docs</a></nav>
+<nav id=\"nav\" class=\"nav\" aria-label=\"Registry\"><a href=\"/packages\"{browse}>Browse</a><a href=\"/publishing\"{publish}>Publishing</a><a href=\"{esc(site.docs)}/latest\" title=\"The guide, the language reference and the standard library, on docs.nabi-lang.org\">Nabi docs</a><a href=\"{esc(site.playground)}\">Playground</a></nav>
 {chrome::theme_button(false)}
 {LOGIN_BUTTON}
 <button class=\"ib menu\" type=\"button\" aria-label=\"Menu\" aria-expanded=\"false\" aria-controls=\"nav\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M4 7h16M4 12h16M4 17h16\"/></svg></button>
