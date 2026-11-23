@@ -1,6 +1,6 @@
 # Usage policy
 
-> **Draft.** This text has not been reviewed by a lawyer yet. It will change before the registry opens to the public.
+Effective 2026-11-23.
 
 The registry is shared by everyone who writes Nabi. This policy says what may be published and how problems are handled.
 
@@ -8,10 +8,21 @@ The registry is shared by everyone who writes Nabi. This policy says what may be
 
 - Names are first come, first served. A name belongs to the account that first publishes it, and to the owners it adds.
 - Do not take names you do not use. A package that holds no real code (a placeholder, a name kept for later) may be removed and its name given to someone who will use it.
-- Some names are reserved for the Nabi project: the toolchain's names (`nabi`, `nabic`, ...) and names that start with `nabi-`, `std-` or `core-`. The standard library's `std`, `core` and `bare` are the Nabi project's own entries.
+- Some names are reserved for the Nabi project: the toolchain's names (`nabi`, `nabic`, ...), words a reader would take for the language's or the registry's own (`test`, `prelude`, `registry`, `official`, `security`, ...), and names that start with `nabi-`, `std-` or `core-`. The standard library's `std`, `core` and `bare` are the Nabi project's own entries.
 - A new name that reads the same as a name already in the registry once `0` and `o`, `1`, `l` and `i`, `5` and `s`, `rn` and `m`, `vv` and `w`, case, `-` and `_` are folded is refused.
 - Some names are protected from look-alikes as well: a new name one letter apart from one of them (four characters or more), or reading the same, is refused. Protected are the names of official packages (the ones published from the nabi-lang organization, which share the same name space), the toolchain's names (`nabi`, `nabic`, ...), and popular packages: those with 1,000 downloads or more. A name one letter apart from any other package is fine.
 - If your name is refused but is a real, different project, ask the admins to approve it.
+
+## Owners
+
+- Owners publish, yank and delete versions, and manage the package's owners and trusted publishers. Owners invite other accounts, or add a GitHub organization or team; an invitation not accepted within 30 days lapses.
+- To hand a package over, invite the new owner and remove yourself once they have accepted. The admins do not move a package from its owners on request; they may only remove a placeholder (see Names).
+
+## Accounts and tokens
+
+- You log in with GitHub, and only with an account that has two-factor authentication on.
+- A publish token does only what its scopes allow (publishing a new package, publishing new versions, yanking, changing owners) and, if you choose, only for some packages. It lasts 90 days unless you pick another length, at most 365, and you can revoke it on your account page at any time. The registry keeps only its hash, so it cannot show it again.
+- What is published with your account or your tokens is your responsibility. If a token leaks, revoke it and write to security@nabi-lang.org.
 
 ## Deleting a version
 
@@ -29,6 +40,11 @@ The registry is shared by everyone who writes Nabi. This policy says what may be
 ## Using the API
 
 Each account and each address may make a limited number of changes a minute, and an account takes at most 10 new names a day. Do not try to get around the limits.
+
+## Security advisories
+
+- An owner may draft an advisory for a vulnerability in their package; the admins review it and publish it. Published advisories are listed on [/advisories](/advisories), shown on the package's pages and reported by `nabi audit`.
+- The admins may publish an advisory themselves, and withdraw one that turns out to be wrong, saying why.
 
 ## Reports and takedowns
 
