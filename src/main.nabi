@@ -233,7 +233,9 @@ fn main() throws {
         return;
     }
     if args.len() >= 2 && (args[1] == "backup" || args[1] == "export") { process::exit(server::data_cmd(args)); }
-    if args.len() == 6 && args[1] == "docs" { process::exit(docs::scan_cmd(args[2], args[3], args[4], args[5])); }
+    if args.len() == 7 && args[1] == "docs" { process::exit(docs::scan_cmd(args[2], args[3], args[4], args[5], args[6])); }
+    // From a server older than the binary at its path, mid-deploy.
+    if args.len() == 6 && args[1] == "docs" { process::exit(docs::scan_cmd(args[2], args[3], args[4], args[5], args[5] + "/scan.nabion")); }
     let strict = false;
     let demo = false;
     let offline = false;

@@ -84,6 +84,9 @@ pub fn stored(store: str, key: str, version: str) -> Docs | none {
     Docs { status: st, api: api }
 }
 
+/// Numbers each scan's status file (make()).
+static SCANS: Atomic<i64> = Atomic::new(0i64);
+
 /// `text` into `path` by way of a file beside it, so a reader never sees
 /// half of it.
 fn put(path: str, text: str) throws {
@@ -113,9 +116,11 @@ pub fn make(store: str, key: str, version: str, db: str, rev: str, krate: str) -
     let d = dir_of(store, key, version);
     try fs::create_dir_all(d) catch e { return failed(f"cannot keep docs: {e}"); };
     let exe = try env::current_exe() catch e { return save(d, failed(f"cannot start the scan: {e}")); };
-    let out = d + "/scan.nabion";
+    // One status file per scan: a publish and a site rebuild may scan the
+    // same version at once, and must not read or remove each other's.
+    let out = f"{d}/scan.{process::id()}-{SCANS.fetch_add(1i64)}.nabion";
     if fs::exists(out) { try fs::remove_file(out) catch _ {}; }
-    let child = try Command::new(exe.as_str()).args(["docs", db, rev, krate, d]).stdin(Stdio::Null).stdout(Stdio::Null).spawn() catch e {
+    let child = try Command::new(exe.as_str()).args(["docs", db, rev, krate, d, out]).stdin(Stdio::Null).stdout(Stdio::Null).spawn() catch e {
         return save(d, failed(f"cannot start the scan: {e}"));
     };
     let t0 = Instant::now();
@@ -124,8 +129,8 @@ pub fn make(store: str, key: str, version: str, db: str, rev: str, krate: str) -
         if let es: ExitStatus = done {
             if !es.success() { return save(d, failed(f"the scan stopped ({es})")); }
             let text = try fs::read_to_str(out) catch _ { return save(d, failed("the scan wrote no status")); };
-            let st: Status = try nabion::from_str(text) catch _ { return save(d, failed("the scan wrote a bad status")); };
             try fs::remove_file(out) catch _ {};
+            let st: Status = try nabion::from_str(text) catch _ { return save(d, failed("the scan wrote a bad status")); };
             return save(d, st);
         }
         if t0.elapsed().as_ms() >= SCAN_MS {
@@ -161,9 +166,9 @@ fn sources(db: str, rev: str) throws (DocsError) -> Dict<str, i64> {
     out
 }
 
-/// The `docs <db> <rev> <krate> <dir>` command: scan, write
-/// `<dir>/api.nabion` and the status to `<dir>/scan.nabion` for make().
-pub fn scan_cmd(db: str, rev: str, krate: str, d: str) -> i32 {
+/// The `docs <db> <rev> <krate> <dir> <out>` command: scan, write
+/// `<dir>/api.nabion` and the status to `<out>` for make().
+pub fn scan_cmd(db: str, rev: str, krate: str, d: str, out: str) -> i32 {
     let st = Status { state: "ok", at: now(), gen: GEN };
     let files = try sources(db, rev) catch e {
         st = failed(e.msg);
@@ -179,7 +184,7 @@ pub fn scan_cmd(db: str, rev: str, krate: str, d: str) -> i32 {
             try put(d + "/api.nabion", text) catch e { st = failed(f"cannot keep docs: {e}"); };
         }
     }
-    try put(d + "/scan.nabion", (try! nabion::to_str(st)) + "\n") catch e {
+    try put(out, (try! nabion::to_str(st)) + "\n") catch e {
         eprintln(f"docs: {d}: {e}");
         return 1;
     };
