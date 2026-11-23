@@ -300,7 +300,7 @@ Edit `site.nabion` (NABION). Key fields: `title`, `tagline`, `description`, `ind
 | `tests/`         | `e2e.sh` and the fake GitHub it runs (OAuth with PKCE, `/user`, `/user/emails`, `/repos`, an OIDC issuer that signs test tokens, AWS's IMDSv2 and SES SendEmail, and images for the proxy) |
 | `pages/publishing.md` | Publishing guide text |
 | `pages/api.md` | The public API's reference, at `/api` |
-| `pages/policy.md`, `pages/ko/`, `pages/zh-hans/`, `pages/zh-hant/` | The usage policy (a draft, not yet reviewed) at `/policy`, and the guide, API reference and policy in Korean, Simplified and Traditional Chinese under `/ko/`, `/zh-hans/`, `/zh-hant/`; terms and privacy are nabi-lang.org's (`/terms`, `/privacy` redirect there) |
+| `pages/policy.md`, `pages/ko/`, `pages/zh-hans/`, `pages/zh-hant/` | The usage policy at `/policy`, and the guide, API reference and policy in Korean, Simplified and Traditional Chinese under `/ko/`, `/zh-hans/`, `/zh-hant/`; terms and privacy are nabi-lang.org's (`/terms`, `/privacy` redirect there) |
 | `pages/publish.yml` | The trusted publishing workflow for a package's repository |
 | `static/`        | `style.css`, `search.tsx` and its `ui/*.tsx` components, `og.png` |
 | `web/`           | the web kit (submodule): `nabi.css`, `theme.js`, `keys.js`, marks and icons, and the `web` library (HTTP, addresses, header and footer markup) |
