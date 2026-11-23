@@ -393,12 +393,15 @@ app_rev=$(source_repo app main.nabi)
 line="Package { name: \"geom\", version: \"0.1.0\", deps: [], source: Dep::git(\"https://example.invalid/geom\", rev: \"$rev\"), tree: \"$tree\", yanked: false, nabi_version: \"0.2.0\" }"
 meta='{ description: "Shapes", license: "MIT", authors: ["Ann <ann@example.org>"], keywords: ["geometry"], categories: ["mathematics"], metadata: { docs: { all: true } } }'
 # publish LINE [META]: the body `nabi publish` sends.
+# The body goes through a file: Linux caps one argument at 128 KiB, and
+# the readme cap test sends more.
 publish() {
     if [ $# -gt 1 ]; then
-        req POST /api/v1/publish "${auth[@]}" --data-binary "Publish { entry: $1, meta: $2 }"
+        printf '%s' "Publish { entry: $1, meta: $2 }" >"$T/publish.body"
     else
-        req POST /api/v1/publish "${auth[@]}" --data-binary "Publish { entry: $1 }"
+        printf '%s' "Publish { entry: $1 }" >"$T/publish.body"
     fi
+    req POST /api/v1/publish "${auth[@]}" --data-binary "@$T/publish.body"
 }
 publish "$line" "$meta"
 expect_code 200 "publish"
