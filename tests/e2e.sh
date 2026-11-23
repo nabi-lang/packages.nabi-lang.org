@@ -21,6 +21,10 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; echo "--- server log" >&2; tail -30 "$T/server.log" >&2 || true; exit 1; }
 ok() { echo "ok: $*"; }
+# has [grep args..]: grep -q at the end of a pipe. grep -q quits at the
+# first match and kills the command before it, which pipefail then counts
+# as a failure; this reads to the end.
+has() { grep "$@" >/dev/null; }
 
 (cd "$repo" && nabi build >/dev/null)
 (cd "$repo/tests/fake-github" && nabi build >/dev/null)
@@ -120,9 +124,7 @@ req() {
 mails() { curl -s "http://127.0.0.1:$gh_port/_mails"; }
 mail_to() {
     for _ in $(seq 50); do
-        # no grep -q: quitting early kills the grep before it, and
-        # pipefail then fails a match
-        mails | grep -F "\"ToAddresses\":[\"$1\"]" | grep -F -- "$2" >/dev/null && return 0
+        mails | grep -F "\"ToAddresses\":[\"$1\"]" | has -F -- "$2" && return 0
         sleep 0.1
     done
     fail "no mail to $1 with $2: $(mails | tail -3)"
@@ -133,6 +135,16 @@ header() { grep -i "^$1:" "$T/h" | head -1 | sed -e 's/^[^:]*: *//' -e 's/\r$//'
 cookie_of() { grep -i "^set-cookie: $1=" "$T/h" | head -1 | sed -e "s/^[^=]*=//" -e 's/;.*//'; }
 expect_code() { [ "$code" = "$1" ] || fail "$2: HTTP $code, want $1: $(head -c 300 "$T/b")"; }
 expect_body() { grep -q -- "$1" "$T/b" || fail "$2: body lacks $1: $(head -c 300 "$T/b")"; }
+# await_page PATH TEXT: GET PATH until its body has TEXT (fixed string), for
+# up to 20 s. A rebuild writes its pages one by one, so a page may lag
+# the one checked before it.
+await_page() {
+    for _ in $(seq 100); do
+        req GET "$1"
+        [ "$code" = 200 ] && has -F -- "$2" "$T/b" && return 0
+        sleep 0.2
+    done
+}
 
 # authorize CODE: starts a login and has the fake GitHub authorize it as
 # CODE, which keeps the PKCE challenge for the token exchange; sets $state.
@@ -146,7 +158,7 @@ authorize() {
         "http://127.0.0.1:$gh_port/login/oauth/authorize?client_id=test-client&"*"&state=$state&code_challenge="*"&code_challenge_method=S256&scope=read:user%20user:email") ;;
         *) fail "authorize url: $loc" ;;
     esac
-    header set-cookie | grep -q "^__Host-pkg_state=[0-9a-f]*; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax" || fail "state cookie flags: $(header set-cookie)"
+    header set-cookie | has "^__Host-pkg_state=[0-9a-f]*; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax" || fail "state cookie flags: $(header set-cookie)"
     back=$(curl -s -o /dev/null -w '%{redirect_url}' "$loc&as=$1")
     case "$back" in
         *"?code=$1&state=$state") ;;
@@ -179,7 +191,7 @@ expect_code 200 "home page"
 [ "$(header content-type)" = "text/html; charset=utf-8" ] || fail "html type"
 [ "$(header strict-transport-security)" = "max-age=63072000; includeSubDomains" ] || fail "hsts: $(header strict-transport-security)"
 [ "$(header referrer-policy)" = "strict-origin-when-cross-origin" ] || fail "referrer policy"
-header permissions-policy | grep -q 'camera=()' || fail "permissions policy"
+header permissions-policy | has 'camera=()' || fail "permissions policy"
 req GET /style.css
 [ "$(header content-type)" = "text/css; charset=utf-8" ] || fail "css type"
 mkdir -p "$T/site/public/empty"
@@ -611,7 +623,7 @@ expect_code 200 "yank"
 expect_body 'Yanked { name: "geom", version: "0.1.0", yanked: true }' "yank body"
 mail_to alice@example.com 'alice yanked geom 0.1.0.\nReason: wrong areas'
 [ "$(git -C "$T/remote.git" log -1 --format=%s)" = "Yank geom 0.1.0" ] || fail "yank commit"
-git -C "$T/remote.git" show HEAD:ge/om/geom | grep -q 'yanked: true' || fail "yanked line"
+git -C "$T/remote.git" show HEAD:ge/om/geom | has 'yanked: true' || fail "yanked line"
 req GET /api/v1/packages/geom
 expect_body 'version: "0.1.0", yanked: true, yank_message: "wrong areas"' "yank message"
 req POST /api/v1/yank "${auth[@]}" --data-binary 'Yank { name: "geom", version: "0.1.0", undo: true, message: "x" }'
@@ -641,7 +653,7 @@ req DELETE /api/v1/packages/geom/0.1.5 "${auth[@]}"
 expect_code 200 "delete"
 expect_body 'Deleted { name: "geom", version: "0.1.5" }' "delete body"
 [ "$(git -C "$T/remote.git" log -1 --format=%s)" = "Delete geom 0.1.5" ] || fail "delete commit"
-git -C "$T/remote.git" show HEAD:ge/om/geom | grep -q '"0.1.5"' && fail "deleted line still in the index"
+git -C "$T/remote.git" show HEAD:ge/om/geom | has '"0.1.5"' && fail "deleted line still in the index"
 grep -q 'action: "delete", target: "geom 0.1.5"' "$T/data/audit.nabion" || fail "delete audited"
 mail_to alice@example.com 'alice deleted geom 0.1.5.'
 publish "${line//0.1.0/0.1.5}"
@@ -659,7 +671,7 @@ req POST /me/versions/delete -H "Cookie: __Host-pkg_session=$sess" --data "csrf=
 expect_code 200 "delete asks first"
 expect_body 'Delete geom 0.1.6?' "confirm page"
 expect_body 'name="confirm" value="yes"' "confirm form"
-git -C "$T/remote.git" show HEAD:ge/om/geom | grep -q '"0.1.6"' || fail "deleted before the confirmation"
+git -C "$T/remote.git" show HEAD:ge/om/geom | has '"0.1.6"' || fail "deleted before the confirmation"
 req POST /me/versions/delete -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&package=geom&version=0.1.6&confirm=yes"
 expect_code 303 "delete from the account page"
 [ "$(header location)" = "/me#versions" ] || fail "delete location: $(header location)"
@@ -692,7 +704,7 @@ expect_code 200 "package json"
 [ "$(header content-type)" = "application/json" ] || fail "package json type: $(header content-type)"
 expect_body '^{"name":"geom","native":false,"owners":\[{"id":1001,"login":"alice"}\],.*"versions":\[{"version":"0.1.0","yanked":false,"yank_message":null,' "package json body"
 [ "$(header access-control-allow-origin)" = "*" ] || fail "cors on a public read"
-header vary | grep -q 'Accept' || fail "vary: $(header vary)"
+header vary | has 'Accept' || fail "vary: $(header vary)"
 req GET "/api/v1/packages/geom?format=json" -H 'Accept: application/nabion'
 expect_body '^{"name":"geom"' "format=json wins"
 req GET /api/v1/packages/geom -H 'Accept: text/html,*/*;q=0.8'
@@ -724,7 +736,7 @@ expect_code 404 "unknown sub-route"
 req GET /api/v1/packages/geom/0.1.0/download
 expect_code 200 "archive download"
 [ "$(header content-type)" = "application/gzip" ] || fail "archive type: $(header content-type)"
-tar -tzf "$T/b" | grep -qx 'geom-0.1.0/src/lib.nabi' || fail "archive paths: $(tar -tzf "$T/b" | head -3)"
+tar -tzf "$T/b" | has -x 'geom-0.1.0/src/lib.nabi' || fail "archive paths: $(tar -tzf "$T/b" | head -3)"
 [ "$(shasum -a 256 "$T/b" | cut -d' ' -f1)" = "$(grep -o 'archive: "[0-9a-f]\{64\}"' <(db) | head -1 | cut -d'"' -f2)" ] || fail "archive digest"
 # Downloads: a GET sent whole counts; a HEAD, a 304 and a 404 do not.
 etag=$(header etag)
@@ -950,9 +962,9 @@ expect_code 503 "push refused"
 rm "$T/remote.git/hooks/pre-receive"
 ok "push failure"
 
-# The site follows the index.
-for _ in $(seq 100); do [ -f "$T/site/public/packages/geom.html" ] && break; sleep 0.2; done
-req GET /packages/geom
+# The site follows the index: wait for the rebuild that has the
+# publisher, not just any page (an earlier rebuild may have written it).
+await_page /packages/geom 'by <a class="who" href="https://github.com/alice"'
 expect_code 200 "package page after publish"
 alice_av='<img class="av" src="https://avatars.githubusercontent.com/u/1001?s=48&v=4" width="24" height="24" alt="" loading="lazy" decoding="async">'
 acme_av='<img class="av org" src="https://avatars.githubusercontent.com/u/4242?s=48&v=4" width="24" height="24" alt="" loading="lazy" decoding="async">'
@@ -979,7 +991,7 @@ for _ in $(seq 100); do
 done
 expect_body '<dt>Category</dt><dd class="kws"><a href="/categories/mathematics">mathematics</a></dd>' "categories on the page"
 expect_body '<p>Shapes, <strong>fast</strong>.</p>' "published README rendered"
-req GET /packages/geom/dependencies
+await_page /packages/geom/dependencies 'href="/packages/ge-om">ge-om</a>'
 expect_body 'href="/packages/ge-om">ge-om</a> <span class="muted">as</span> <span class="mono">shapes</span> <span class="tag" title="only for this target">cfg(unix)</span>' "rename and target on the page"
 req GET /packages/geom/0.1.0
 expect_code 200 "version page"
@@ -1026,7 +1038,8 @@ expect_code 200 "keywords"
 expect_body '<h1 class="t-h2">Keywords</h1>' "keywords title"
 req GET /packages/geom/0.1.0
 expect_body '<a href="/packages?q=geometry">geometry</a>' "an old version's keyword searches"
-grep -q '<loc>https://packages.nabi-lang.org/categories/mathematics</loc>' "$T/site/public/sitemap.xml" || fail "category in the sitemap"
+await_page /sitemap.xml '<loc>https://packages.nabi-lang.org/categories/mathematics</loc>'
+expect_body '<loc>https://packages.nabi-lang.org/categories/mathematics</loc>' "category in the sitemap"
 grep -Eq '<loc>https://packages.nabi-lang.org/packages/geom</loc><lastmod>20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z</lastmod>' "$T/site/public/sitemap.xml" || fail "lastmod in the sitemap"
 grep -q '<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareSourceCode","name":"geom","url":"https://packages.nabi-lang.org/packages/geom"' "$T/site/public/packages/geom.html" || fail "SoftwareSourceCode"
 grep -q '"@type":"BreadcrumbList","itemListElement":\[{"@type":"ListItem","position":1,"name":"Packages"' "$T/site/public/packages/geom/versions.html" || fail "BreadcrumbList"
@@ -1035,7 +1048,7 @@ req GET /packages/app
 expect_code 200 "executable page"
 expect_body '>nabi install</button>' "install tab"
 expect_body '<span class="p" aria-hidden="true">$ </span>nabi install app</code>' "install command"
-grep -o 'aria-label="Package sections">.*</nav>' "$T/b" | grep -q '>Docs<' && fail "Docs tab of an executable"
+grep -o 'aria-label="Package sections">.*</nav>' "$T/b" | has '>Docs<' && fail "Docs tab of an executable"
 grep -q 'nabi add app' "$T/b" && fail "nabi add of an executable"
 expect_body '<span class="tag" title="[^"]*">not verified</span>' "source not verified"
 req GET /packages/app
@@ -1065,15 +1078,15 @@ req GET "$logo" -H "Cookie: __Host-pkg_session=$sess" -H "Referer: https://packa
 expect_code 200 "proxied image"
 [ "$(header content-type)" = "image/svg+xml" ] || fail "image type: $(header content-type)"
 [ "$(header cache-control)" = "public, max-age=31536000, immutable" ] || fail "image cache: $(header cache-control)"
-header content-security-policy | grep -q "sandbox" || fail "image csp: $(header content-security-policy)"
+header content-security-policy | has "sandbox" || fail "image csp: $(header content-security-policy)"
 [ -z "$(header set-cookie)" ] || fail "the image host's cookie passed on"
 expect_body '<svg xmlns' "image body"
 seen=$(curl -s "http://127.0.0.1:$gh_port/_img" | grep -c 'GET /img/logo.svg')
 req GET "$logo"
 expect_code 200 "cached image"
 [ "$(curl -s "http://127.0.0.1:$gh_port/_img" | grep -c 'GET /img/logo.svg')" = "$seen" ] || fail "a cached image fetched again"
-curl -s "http://127.0.0.1:$gh_port/_img" | grep 'GET /img/logo.svg' | grep -qi 'cookie:\|referer:' && fail "cookie or referrer sent to the image host"
-ls "$T/data/img-cache" | grep -q '\.type$' || fail "image cache on disk"
+curl -s "http://127.0.0.1:$gh_port/_img" | grep 'GET /img/logo.svg' | has -i 'cookie:\|referer:' && fail "cookie or referrer sent to the image host"
+ls "$T/data/img-cache" | has '\.type$' || fail "image cache on disk"
 req GET "$(img_at http://img.invalid/img/moved.svg)"
 expect_code 200 "redirected image"
 req GET "$(img_at http://img.invalid/img/page)"
@@ -1087,7 +1100,7 @@ expect_body 'has no address on the public internet' "internal image body"
 req GET "/img/$(printf '0%.0s' $(seq 32))/$(hexof http://img.invalid/img/logo.svg)"
 expect_code 404 "unsigned image address"
 req GET /packages/pics
-header content-security-policy | grep -q "img-src 'self' data: https://avatars.githubusercontent.com;" || fail "page csp with the proxy: $(header content-security-policy)"
+header content-security-policy | has "img-src 'self' data: https://avatars.githubusercontent.com;" || fail "page csp with the proxy: $(header content-security-policy)"
 ok "image proxy"
 
 # Korean: every page at /ko/.., its chrome in Korean, the package's own
@@ -1231,7 +1244,7 @@ expect_code 200 "unlock"
 req POST /api/v1/admin/takedown "${auth[@]}" --data-binary 'Takedown { name: "ge-om", reason: "malware" }'
 expect_code 200 "take a package down"
 expect_body 'TakenDown { name: "ge-om", version: "", removed: true, yanked: 1 }' "takedown body"
-git -C "$T/remote.git" show HEAD:ge/-o/ge-om | grep -q 'yanked: true' || fail "taken down and yanked"
+git -C "$T/remote.git" show HEAD:ge/-o/ge-om | has 'yanked: true' || fail "taken down and yanked"
 req GET /api/v1/packages/ge-om
 expect_code 451 "taken down api"
 expect_body "taken down by the registry: malware" "taken down api body"
@@ -1247,7 +1260,7 @@ expect_code 200 "restored api"
 grep -q 'action: "takedown", target: "ge_om", reason: "malware"' "$T/data/audit.nabion" || fail "audit: $(cat "$T/data/audit.nabion")"
 # Five moderation steps; the accounts' own changes are logged beside them.
 [ "$(grep '^Audit' "$T/data/audit.nabion" | grep -cvE 'action: "(login|logout|logout-all|notices|token-[a-z]+|owner-[a-z]+|invite-[a-z]+|trusted-[a-z]+|delete)"')" = 5 ] || fail "audit lines: $(cat "$T/data/audit.nabion")"
-ls "$T/data/backup/" | grep -q '^registry-[0-9]\{10\}\.sqlite3$' || fail "db snapshot"
+ls "$T/data/backup/" | has '^registry-[0-9]\{10\}\.sqlite3$' || fail "db snapshot"
 ok "moderation"
 
 # Official packages: a version is official when a trusted publisher in
@@ -1281,13 +1294,13 @@ expect_code 200 "publish from the organization"
 req GET /api/v1/packages/units
 expect_body 'unyanked_by: none, official: true }\], official: true, downloads: 0, recent_downloads: 0 }' "official in the api"
 expect_body 'published_by: Actor { id: 5151, login: "nabi-lang"' "an official version is the organization's"
-sed -n '/name: "units",/,/^        Release {/p' <(db) | grep -q 'official: true' || fail "official release record"
+sed -n '/name: "units",/,/^        Release {/p' <(db) | has 'official: true' || fail "official release record"
 # An admin's publish is not the organization's.
 auth=("${aauth[@]}")
 publish "$(entry units 0.1.1)"
 expect_code 200 "admin publishes units"
-git -C "$T/remote.git" show HEAD:un/it/units | tail -1 | grep -q official && fail "a version from outside the organization marked official"
-git -C "$T/remote.git" show HEAD:un/it/units | head -1 | grep -q ', official: true }$' || fail "earlier version changed"
+git -C "$T/remote.git" show HEAD:un/it/units | tail -1 | has official && fail "a version from outside the organization marked official"
+git -C "$T/remote.git" show HEAD:un/it/units | head -1 | has ', official: true }$' || fail "earlier version changed"
 req GET /api/v1/packages/units
 expect_body 'official: false }\], official: false, downloads: 0, recent_downloads: 0 }' "the latest version decides"
 trusted_token nabi-lang/units 5151
@@ -1310,7 +1323,7 @@ expect_code 200 "approve a look-alike"
 auth=("${qauth[@]}")
 publish "$(entry linalq 0.1.0)"
 expect_code 200 "approved look-alike"
-git -C "$T/remote.git" show HEAD:li/na/linalq | grep -q official && fail "a third-party line marked official"
+git -C "$T/remote.git" show HEAD:li/na/linalq | has official && fail "a third-party line marked official"
 # Moved into the organization: its next version is official, the first keeps its line.
 trusted_token nabi-lang/linalq 5151
 publish "$(entry linalq 0.2.0)"
@@ -1386,10 +1399,10 @@ req POST /me/tokens -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf&nam
 expect_code 200 "token while mail is off"
 for _ in $(seq 20); do grep -q 'publish token offline created' "$T/server.log" && break; sleep 0.1; done
 grep -q 'mail (off; set PACKAGES_MAIL_FROM and PACKAGES_SES_REGION to send) to account 1001: \[packages.test\] publish token offline created' "$T/server.log" || fail "mail logged while off"
-mails | grep -qF 'publish token offline created' && fail "mail sent while off"
+mails | has -F 'publish token offline created' && fail "mail sent while off"
 # The hourly cap, and publish notices stayed off.
 [ "$(mails | grep -cF '"ToAddresses":["alice@example.com"]')" -le 20 ] || fail "more than 20 mails an hour"
-mails | grep -F '"ToAddresses":["alice@example.com"]' | grep -qF 'published ge-om' && fail "publish notice while off"
+mails | grep -F '"ToAddresses":["alice@example.com"]' | has -F 'published ge-om' && fail "publish notice while off"
 grep 'mail: not sent' "$T/server.log" && fail "a mail was not sent"
 grep -q 'mail: sent to account 1002: \[packages.test\] Bob invited to own geom' "$T/server.log" || fail "sent mails logged by account"
 
@@ -1431,7 +1444,7 @@ expect_code 403 "log out everywhere with a wrong csrf"
 req POST /me/sessions/logout-all -H "Cookie: __Host-pkg_session=$sess" --data "csrf=$csrf"
 expect_code 303 "log out everywhere"
 [ "$(header location)" = "/" ] || fail "log out everywhere location: $(header location)"
-cookie_of __Host-pkg_session | grep -q . && fail "session cookie kept"
+cookie_of __Host-pkg_session | has . && fail "session cookie kept"
 for c in "$first" "$sess"; do
     req GET /me -H "Cookie: __Host-pkg_session=$c"
     expect_code 303 "logged out everywhere"
