@@ -120,7 +120,9 @@ req() {
 mails() { curl -s "http://127.0.0.1:$gh_port/_mails"; }
 mail_to() {
     for _ in $(seq 50); do
-        mails | grep -F "\"ToAddresses\":[\"$1\"]" | grep -qF -- "$2" && return 0
+        # no grep -q: quitting early kills the grep before it, and
+        # pipefail then fails a match
+        mails | grep -F "\"ToAddresses\":[\"$1\"]" | grep -F -- "$2" >/dev/null && return 0
         sleep 0.1
     done
     fail "no mail to $1 with $2: $(mails | tail -3)"
